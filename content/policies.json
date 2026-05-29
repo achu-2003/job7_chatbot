@@ -1,0 +1,32 @@
+[
+  {
+    "id": "policy-eligibility",
+    "title": "Eligibility Policy",
+    "category": "eligibility",
+    "body": "Applicants must meet the minimum qualifications listed in each job posting and be legally authorised to work in the role's location. Some roles may have specific experience, certification, or notice-period requirements stated in the posting. We assess every application on merit against the role's requirements."
+  },
+  {
+    "id": "policy-equal-opportunity",
+    "title": "Equal Opportunity Policy",
+    "category": "equal_opportunity",
+    "body": "We are an equal opportunity employer. We do not discriminate on the basis of gender, age, religion, caste, ethnicity, disability, marital status, or any other protected characteristic. Hiring decisions are based solely on qualifications, skills, and fit for the role."
+  },
+  {
+    "id": "policy-privacy",
+    "title": "Candidate Privacy Policy",
+    "category": "privacy",
+    "body": "The personal details you share when applying (name, email, phone, experience, resume) are used only to process your application and contact you about opportunities. We do not sell your data. You can ask us to update or delete your candidate record at any time by requesting it in chat."
+  },
+  {
+    "id": "policy-process",
+    "title": "Interview Process Policy",
+    "category": "process",
+    "body": "After you apply, your application is screened against the role's requirements. Shortlisted candidates are contacted to schedule interviews, which may include a recruiter conversation, a technical or role-specific round, and a final discussion. A recruiter handles scheduling and final decisions; the assistant cannot confirm hiring outcomes."
+  },
+  {
+    "id": "policy-withdrawal",
+    "title": "Application Withdrawal Policy",
+    "category": "withdrawal",
+    "body": "You may withdraw an application at any time before a final decision. Just ask in chat and we'll connect you with a recruiter to mark it withdrawn. Withdrawing one application does not affect any other applications you have."
+  }
+]

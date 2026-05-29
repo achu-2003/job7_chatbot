@@ -1,0 +1,32 @@
+[
+  {
+    "id": "faq-how-to-apply",
+    "question": "How do I apply for a job?",
+    "answer": "Just tell me the role you're interested in and I'll walk you through it right here. I'll collect a few details (your name, email, years of experience) and submit your application. You can also ask me to list open roles.",
+    "tags": ["apply", "application", "how"]
+  },
+  {
+    "id": "faq-status",
+    "question": "How can I check my application status?",
+    "answer": "Share your application reference (it looks like APP-XXXXXX) and I'll look it up, or ask 'what's the status of my application' and I'll find your most recent one. Statuses are: submitted, screening, interview, offer, rejected, or withdrawn.",
+    "tags": ["status", "application"]
+  },
+  {
+    "id": "faq-timeline",
+    "question": "How long does the hiring process take?",
+    "answer": "Most roles move from application to first interview within 1-2 weeks. After interviews, you can typically expect a decision within another week. Timelines vary by role and team.",
+    "tags": ["timeline", "process"]
+  },
+  {
+    "id": "faq-documents",
+    "question": "What information do I need to apply?",
+    "answer": "To submit an application I'll need your full name, an email address, and your years of relevant experience. A resume link is optional but helps. You can also add a short note about why you're a fit.",
+    "tags": ["documents", "resume", "requirements"]
+  },
+  {
+    "id": "faq-multiple",
+    "question": "Can I apply to more than one role?",
+    "answer": "Yes, you can apply to multiple open roles. Each application is tracked separately with its own reference number. Applying again to the same role won't create a duplicate.",
+    "tags": ["multiple", "application"]
+  }
+]

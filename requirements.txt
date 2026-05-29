@@ -1,0 +1,64 @@
+# --- web framework ---
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+gunicorn==23.0.0
+
+# --- async db ---
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+
+# --- redis ---
+redis[hiredis]==5.2.1
+
+# --- vector store ---
+# Qdrant: multi-tenant payload filtering, gRPC, native async client.
+qdrant-client==1.12.1
+
+# --- embeddings / reranker (local, ONNX/CPU) ---
+# fastembed provides the dense (TextEmbedding), sparse/BM25 (SparseTextEmbedding),
+# CLIP image (ImageEmbedding), and cross-encoder rerank (TextCrossEncoder) models
+# used by app/vector/{embeddings,reranker}.py. Pulls Pillow + onnxruntime transitively.
+fastembed==0.8.0
+
+# --- orchestration ---
+# LangGraph builds the StateGraph in app/chatbot/graph.py (parallel fan-out
+# retrieval + conditional template/llm routing). Pulls langchain-core transitively.
+langgraph==1.2.0
+
+# --- llm ---
+openai==1.57.4
+tiktoken==0.8.0
+
+# --- mcp (model context protocol) ---
+# Official SDK. Provides FastMCP for the standalone server (app/mcp/server.py)
+# that exposes the store's tools to external agents (Claude Desktop, etc.).
+# The in-process WhatsApp agent (app/chatbot/agent.py) shares the same tool
+# definitions via app/mcp/tools.py. Requires pydantic >= 2.11 (see below).
+mcp==1.27.1
+
+# --- validation / config ---
+# Bumped from 2.10.3: the mcp SDK requires pydantic >= 2.11. Verified against
+# the existing suite + fastapi/pydantic-settings.
+pydantic==2.13.4
+pydantic-settings==2.7.0
+
+# --- observability ---
+structlog==24.4.0
+prometheus-client==0.21.1
+prometheus-fastapi-instrumentator==7.0.2
+
+# --- security & misc ---
+python-multipart==0.0.20
+httpx==0.28.1
+tenacity==9.0.0
+orjson==3.10.12
+
+# --- testing UI ---
+# Pinned: streamlit >= 1.50 requires starlette >= 0.46, which conflicts with FastAPI 0.115.
+streamlit==1.40.2
+
+# --- dev / test ---
+pytest==8.3.4
+pytest-asyncio==0.25.0
+respx==0.22.0
