@@ -49,7 +49,9 @@ async def test_name_remembered_after_name_prompt():
     assert gw.semantic.facts["full_name"] == "Sandhanapandiyanmurugan"
 
 
-async def test_known_name_not_overwritten():
+async def test_non_identity_message_writes_nothing():
+    # An intent phrase isn't a name and has no email → no fact churn, even with
+    # a name already on file.
     gw = _FakeGateway()
     state = _state(
         "I need a python developer job",
@@ -57,8 +59,41 @@ async def test_known_name_not_overwritten():
         facts={"full_name": "Already Known"},
     )
     await persist(state, gateway=gw)
-    # already had the name → nothing written, and the intent phrase is never a name
-    assert "full_name" not in gw.semantic.facts
+    assert gw.semantic.facts == {}
+
+
+async def test_new_email_overwrites_old():
+    # Regression for the verify-loop: candidate gives a different email → it
+    # replaces the stored one instead of being ignored.
+    gw = _FakeGateway()
+    state = _state(
+        "eachudhan2003@gmail.com",
+        facts={"email": "sandhanapandiyanmurugan@outlook.com"},
+    )
+    await persist(state, gateway=gw)
+    assert gw.semantic.facts["email"] == "eachudhan2003@gmail.com"
+
+
+async def test_same_email_not_rewritten():
+    # No change → no write (avoids needless fact churn / updated_at bumps).
+    gw = _FakeGateway()
+    state = _state(
+        "eachudhan2003@gmail.com",
+        facts={"email": "eachudhan2003@gmail.com"},
+    )
+    await persist(state, gateway=gw)
+    assert gw.semantic.facts == {}
+
+
+async def test_new_name_overwrites_old_after_prompt():
+    gw = _FakeGateway()
+    state = _state(
+        "Achuthan E",
+        short_term=[{"role": "assistant", "content": "Need your full name again?"}],
+        facts={"full_name": "Sandhanapandiyanmurugan"},
+    )
+    await persist(state, gateway=gw)
+    assert gw.semantic.facts["full_name"] == "Achuthan E"
 
 
 async def test_intent_phrase_never_stored_as_name():

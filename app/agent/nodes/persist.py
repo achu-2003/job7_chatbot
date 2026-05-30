@@ -24,8 +24,8 @@ async def persist(state: AgentState, *, gateway: MemoryGateway) -> dict[str, Any
     )
 
     # Remember name/email the candidate gave conversationally, so the next turn
-    # already has them (via customer_facts) instead of asking again. Only write
-    # facts not already known — never overwrite a stored value with a guess.
+    # already has them (via customer_facts) instead of asking again. A new value
+    # stated this turn OVERWRITES the old one (handles "actually it's <new>").
     await _remember_identity(state, gateway)
     # Pin the product shown this turn as the "current product" for next turn.
     if state.get("last_product_id"):
@@ -65,15 +65,18 @@ async def _remember_identity(state: AgentState, gateway: MemoryGateway) -> None:
     if not customer_id:
         return
 
+    # extract_email / extract_name only return on an EXPLICIT statement (a valid
+    # email, "my name is X", or a name-shaped reply right after we asked) — so a
+    # returned value is confident enough to store. Write it whenever it's new or
+    # differs from what's on file; this is what lets a correction ("actually use
+    # my gmail") replace the stored value instead of looping on the mismatch.
     to_store: list[tuple[str, str, float]] = []
-    if not known.get("email"):
-        email = extract_email(text)
-        if email:
-            to_store.append(("email", email, 0.9))
-    if not known.get("full_name"):
-        name = extract_name(text, assistant_prompt=_last_assistant_turn(state))
-        if name:
-            to_store.append(("full_name", name, 0.8))
+    email = extract_email(text)
+    if email and email != (known.get("email") or "").lower():
+        to_store.append(("email", email, 0.9))
+    name = extract_name(text, assistant_prompt=_last_assistant_turn(state))
+    if name and name != known.get("full_name"):
+        to_store.append(("full_name", name, 0.8))
 
     for key, value, confidence in to_store:
         try:

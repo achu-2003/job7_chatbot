@@ -17,6 +17,21 @@ from app.mcp.tools import ToolRegistry
 
 log = get_logger("agent_planner")
 
+# Tools that need free-text search input; if the model forgot the query (or
+# named it q/search/text), fall back to the candidate's own message so the
+# search still runs against what they actually asked for.
+_QUERY_TOOLS = {"search_jobs", "search_policies", "search_faq"}
+
+
+def _normalise_args(tool: str, args: dict[str, Any], state: AgentState) -> dict[str, Any]:
+    if tool in _QUERY_TOOLS:
+        q = args.get("query") or args.get("q") or args.get("search") or args.get("text")
+        if not (q and str(q).strip()):
+            args = {**args, "query": state.get("inbound_text", "")}
+        elif "query" not in args:
+            args = {**args, "query": str(q).strip()}
+    return args
+
 
 async def plan(
     state: AgentState, *, llm: Any, registry: ToolRegistry, memory_context: str | None
@@ -62,7 +77,8 @@ async def plan(
     direct = bool(obj.get("direct_answer"))
     valid = set(registry.names())
     steps = [
-        new_step(rs["tool"], tool=rs["tool"], args=rs.get("args") or {})
+        new_step(rs["tool"], tool=rs["tool"],
+                 args=_normalise_args(rs["tool"], rs.get("args") or {}, state))
         for rs in (obj.get("steps") or [])
         if isinstance(rs, dict) and rs.get("tool") in valid
     ]

@@ -142,27 +142,25 @@ async def test_submit_application_requires_name_and_email():
     assert "email" in out["need"] and "full_name" in out["need"]
 
 
-async def test_submit_application_happy_path(monkeypatch):
+async def test_submit_application_disabled_confirms_job_without_writing(monkeypatch):
+    # Apply is disabled on the live job board (jobs7uat): the tool must confirm
+    # the role is real (grounded reply) but NOT write, and never touch the
+    # candidate/application write repos (which raise NotImplementedError now).
     async def fake_get_by_ref(ref, *, tenant_id=None):
-        return {"id": "j1", "job_ref": "JOB-AB1001", "title": "Senior Backend Engineer"}
-
-    async def fake_candidate_upsert(**kw):
-        return {"id": "c1"}
-
-    async def fake_submit(*, tenant_id, candidate_id, job_id, cover_note=None):
-        return {"app_ref": "APP-EF9012", "status": "SUBMITTED"}, True
+        return {"id": "j1", "job_ref": "senior-backend-engineer",
+                "title": "Senior Backend Engineer"}
 
     monkeypatch.setattr(JobRepository, "get_by_ref", staticmethod(fake_get_by_ref))
-    monkeypatch.setattr(CandidateRepository, "upsert", staticmethod(fake_candidate_upsert))
-    monkeypatch.setattr(ApplicationRepository, "submit", staticmethod(fake_submit))
     out = await _registry().dispatch(
         "submit_application",
-        {"job_ref": "JOB-AB1001", "full_name": "Asha Rao", "email": "asha@example.com"},
+        {"job_ref": "senior-backend-engineer", "full_name": "Asha Rao",
+         "email": "asha@example.com"},
         _ctx(),
     )
-    assert out["submitted"] is True
-    assert out["already_applied"] is False
-    assert out["application_ref"] == "APP-EF9012"
+    assert out["submitted"] is False
+    assert out["apply_unavailable"] is True
+    assert out["job_title"] == "Senior Backend Engineer"
+    assert "message" in out
 
 
 async def test_submit_application_unknown_job(monkeypatch):

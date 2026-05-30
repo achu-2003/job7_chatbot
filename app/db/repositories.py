@@ -72,12 +72,15 @@ def assert_safe_select(sql: str) -> None:
 # Filter mapping
 # ---------------------------------------------------------------
 
+# Maps a candidate's free-text employment type onto the jobs7uat ``JobType``
+# enum: FULL_TIME | PART_TIME | CONTRACT | INTERNSHIP | FREELANCE.
 _EMPLOYMENT_MAP = {
-    "full time": "full_time", "fulltime": "full_time", "full-time": "full_time",
-    "permanent": "full_time",
-    "part time": "part_time", "parttime": "part_time", "part-time": "part_time",
-    "contract": "contract", "contractor": "contract", "freelance": "contract",
-    "intern": "intern", "internship": "intern",
+    "full time": "FULL_TIME", "fulltime": "FULL_TIME", "full-time": "FULL_TIME",
+    "permanent": "FULL_TIME",
+    "part time": "PART_TIME", "parttime": "PART_TIME", "part-time": "PART_TIME",
+    "contract": "CONTRACT", "contractor": "CONTRACT",
+    "freelance": "FREELANCE", "freelancer": "FREELANCE",
+    "intern": "INTERNSHIP", "internship": "INTERNSHIP",
 }
 
 
@@ -93,21 +96,46 @@ def _map_employment_type(value: str | None) -> str | None:
 
 
 class JobRepository:
-    """Read-only search against jobs + departments.
+    """Read-only search against the live ``jobs7uat`` job board.
+
+    The real job data lives in the ``private_*`` table family (``private_jobs``,
+    ``private_job_categories``, ``private_companies``) — NOT the empty plain
+    ``jobs`` table. We read those real columns but ALIAS them back to the key
+    names the rest of the agent expects (``job_ref`` ← ``slug``,
+    ``department_name`` ← category name, ``location`` ← ``locationDetails``,
+    ``salary_min`` ← ``salaryMin`` …), so nothing downstream (``_compact_job``,
+    the validator, the responder) had to change.
+
+    "Open to candidates" = any genuinely-open posting: ``status IN
+    ('LIVE','APPROVED','PENDING')``, not soft-deleted, and not past its expiry.
+    This deliberately excludes DRAFT (unpublished) and EXPIRED/CLOSED/REJECTED so
+    candidates never see half-written or dead listings. The candidate-facing
+    reference is the human-readable ``slug``.
 
     WHERE clauses are appended dynamically based on which filters are present,
     so we never evaluate dead ``IS NULL`` branches and avoid bind-vs-cast
     ambiguity.
     """
 
+    # statuses a candidate is allowed to see, excluding soft-deleted + expired.
+    _LIVE = (
+        "j.status IN ('LIVE','APPROVED','PENDING') "
+        'AND j."deletedAt" IS NULL '
+        'AND (j."expiresAt" IS NULL OR j."expiresAt" > now())'
+    )
+
     _SELECT = (
-        "SELECT "
-        "  j.id, j.job_ref, j.title, j.description, j.location, "
-        "  j.employment_type, j.seniority, j.salary_min, j.salary_max, "
-        "  j.salary_currency, j.skills, j.status, "
-        "  d.name AS department_name "
-        "FROM jobs j "
-        "LEFT JOIN departments d ON d.id = j.department_id "
+        'SELECT '
+        '  j.id, j.slug AS job_ref, j.title, j.description, '
+        '  j."locationDetails" AS location, '
+        '  j."jobType"::text AS employment_type, '
+        '  NULL::text AS seniority, '
+        '  j."salaryMin" AS salary_min, j."salaryMax" AS salary_max, '
+        "  'INR' AS salary_currency, "
+        '  j.skills, j.status::text AS status, '
+        '  cat.name AS department_name '
+        'FROM private_jobs j '
+        'LEFT JOIN private_job_categories cat ON cat.id = j."categoryId" '
     )
 
     @staticmethod
@@ -123,38 +151,37 @@ class JobRepository:
         limit: int = 10,
         tenant_id: str | None = None,
     ) -> tuple[list[dict[str, Any]], str]:
-        where: list[str] = ["j.status = 'OPEN'"]
+        where: list[str] = [JobRepository._LIVE]
         params: dict[str, Any] = {"limit": limit}
         tenant_sql = _tenant_clause("j", params, tenant_id)
         if tenant_sql:
             where.append(tenant_sql.lstrip(" AND "))
 
         if department is not None:
-            where.append("LOWER(d.name) LIKE LOWER(:dept_like)")
+            where.append("LOWER(cat.name) LIKE LOWER(:dept_like)")
             params["dept_like"] = f"%{department}%"
         if location is not None:
-            where.append("LOWER(j.location) LIKE LOWER(:loc_like)")
+            where.append('LOWER(j."locationDetails") LIKE LOWER(:loc_like)')
             params["loc_like"] = f"%{location}%"
         mapped_type = _map_employment_type(employment_type)
         if mapped_type is not None:
-            where.append("j.employment_type = :etype")
+            where.append('j."jobType" = CAST(:etype AS "PrivateJobType")')
             params["etype"] = mapped_type
-        if seniority is not None:
-            where.append("LOWER(j.seniority) = LOWER(:seniority)")
-            params["seniority"] = seniority
+        # private_jobs has no seniority/experienceLevel column — experience is a
+        # numeric min/max range, so we don't filter on a seniority label here.
         # Salary overlap: keep a job if its band could satisfy the candidate's
         # bound (NULL salary fields are treated as "unspecified", not excluded).
         if min_salary is not None:
-            where.append("(j.salary_max IS NULL OR j.salary_max >= :min_salary)")
+            where.append('(j."salaryMax" IS NULL OR j."salaryMax" >= :min_salary)')
             params["min_salary"] = float(min_salary)
         if max_salary is not None:
-            where.append("(j.salary_min IS NULL OR j.salary_min <= :max_salary)")
+            where.append('(j."salaryMin" IS NULL OR j."salaryMin" <= :max_salary)')
             params["max_salary"] = float(max_salary)
 
         sql = (
             JobRepository._SELECT
             + f"WHERE {' AND '.join(where)} "
-            + "ORDER BY j.created_at DESC LIMIT :limit"
+            + 'ORDER BY j."createdAt" DESC LIMIT :limit'
         )
 
         start = time.perf_counter()
@@ -176,7 +203,7 @@ class JobRepository:
         tenant_sql = _tenant_clause("j", params, tenant_id)
         sql = text(
             JobRepository._SELECT
-            + f"WHERE j.id = ANY(:ids) AND j.status = 'OPEN'{tenant_sql}"
+            + f"WHERE j.id = ANY(:ids) AND {JobRepository._LIVE}{tenant_sql}"
         )
         start = time.perf_counter()
         async with session_scope() as session:
@@ -195,12 +222,15 @@ class JobRepository:
         *,
         tenant_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """Resolve a human-facing JOB-XXXX reference to its row (for apply)."""
-        params: dict[str, Any] = {"ref": job_ref.upper()}
+        """Resolve a candidate-facing job reference (the ``slug``) to its row,
+        for apply. Slugs are lowercase, so match case-insensitively and also
+        accept the raw ``id`` as a fallback (in case the model echoes it)."""
+        params: dict[str, Any] = {"ref": job_ref.strip(), "ref_l": job_ref.strip().lower()}
         tenant_sql = _tenant_clause("j", params, tenant_id)
         sql = text(
             JobRepository._SELECT
-            + f"WHERE UPPER(j.job_ref) = :ref AND j.status = 'OPEN'{tenant_sql}"
+            + f"WHERE (LOWER(j.slug) = :ref_l OR j.id = :ref) "
+            + f"AND {JobRepository._LIVE}{tenant_sql}"
         )
         async with session_scope() as session:
             res = await session.execute(sql, params)
@@ -212,12 +242,12 @@ class JobRepository:
         *,
         tenant_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Pull all OPEN jobs for the reindex flow."""
+        """Pull all live (ACTIVE/APPROVED) jobs for the reindex flow."""
         params: dict[str, Any] = {}
         tenant_sql = _tenant_clause("j", params, tenant_id)
         sql = text(
             JobRepository._SELECT
-            + f"WHERE j.status = 'OPEN'{tenant_sql}"
+            + f"WHERE {JobRepository._LIVE}{tenant_sql}"
         )
         async with session_scope() as session:
             res = await session.execute(sql, params)
@@ -241,11 +271,16 @@ class CandidateRepository:
         current_role: str | None = None,
         resume_url: str | None = None,
     ) -> dict[str, Any]:
-        """Create or update the candidate keyed by (tenant, phone). Only
-        non-NULL fields overwrite — partial details captured over several turns
-        accumulate rather than clobbering each other (COALESCE keeps the old
-        value when a new one isn't supplied)."""
-        sql = text(
+        """DISABLED on jobs7uat. Candidates are ``users`` rows in the live job
+        board; creating one from a WhatsApp chat (role/status/password, dedup,
+        notifications) needs a design we haven't built, so the apply flow is
+        turned off in ``submit_application_core``. This method is intentionally
+        unreachable — raise loudly if anything calls it, rather than run the old
+        SQL below against a ``candidates`` table that doesn't exist here."""
+        raise NotImplementedError(
+            "candidate writes are disabled on jobs7uat; apply via portal/handoff"
+        )
+        sql = text(  # noqa: F841  (kept as a reference for re-enabling apply)
             """
             INSERT INTO candidates
                 (tenant_id, phone, full_name, email, years_experience,
@@ -272,14 +307,18 @@ class CandidateRepository:
 
     @staticmethod
     async def get(*, tenant_id: str, phone: str) -> dict[str, Any] | None:
+        """Find the candidate by phone in ``private_job_seekers`` (the job-board's
+        job-seeker records). Aliased to the keys the agent expects so the rest of
+        the code is schema-agnostic."""
         async with session_scope() as session:
             res = await session.execute(
                 text(
-                    "SELECT id, tenant_id, phone, full_name, email, "
-                    "years_experience, current_role, resume_url "
-                    "FROM candidates WHERE tenant_id = :tid AND phone = :phone"
+                    'SELECT js.id, js.phone, js."fullName" AS full_name, js.email '
+                    'FROM private_job_seekers js '
+                    'WHERE js.phone = :phone '
+                    'LIMIT 1'
                 ),
-                {"tid": tenant_id, "phone": phone},
+                {"phone": phone},
             )
             row = res.first()
             return dict(row._mapping) if row else None
@@ -303,14 +342,16 @@ class ApplicationRepository:
         job_id: str,
         cover_note: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
-        """Create an application, idempotently.
-
-        The (tenant, candidate, job) uniqueness constraint makes a retried
-        submit a no-op: ON CONFLICT we return the existing row. Returns
-        ``(application, created)`` where ``created`` is False if it already
-        existed — so the agent can say "you've already applied" honestly.
+        """DISABLED on jobs7uat — see ``CandidateRepository.upsert``. Writing an
+        application means inserting into the live job board's ``applications``
+        table (FK to a ``users`` candidate), which the apply flow intentionally
+        doesn't do yet. Raise loudly rather than run the old SQL below, whose
+        columns (``app_ref``, ``tenant_id``, ``candidate_id``) don't exist here.
         """
-        sql = text(
+        raise NotImplementedError(
+            "application writes are disabled on jobs7uat; apply via portal/handoff"
+        )
+        sql = text(  # noqa: F841  (kept as a reference for re-enabling apply)
             """
             INSERT INTO applications
                 (tenant_id, app_ref, candidate_id, job_id, cover_note)
@@ -343,20 +384,23 @@ class ApplicationRepository:
         """Look up one application by its APP-XXXX reference. When
         ``candidate_id`` is given, the application must belong to that candidate
         — used to scope a candidate to their own applications."""
-        params: dict[str, Any] = {"tid": tenant_id, "ref": app_ref.upper()}
+        params: dict[str, Any] = {"ref": app_ref.strip()}
         scope = ""
         if candidate_id is not None:
-            scope = " AND a.candidate_id = :cid"
+            scope = ' AND a."jobSeekerId" = :cid'
             params["cid"] = candidate_id
         sql = text(
             f"""
             SELECT
-                a.app_ref, a.status, a.cover_note, a.created_at, a.updated_at,
-                j.job_ref, j.title AS job_title, j.location, d.name AS department_name
-            FROM applications a
-            JOIN jobs j ON j.id = a.job_id
-            LEFT JOIN departments d ON d.id = j.department_id
-            WHERE a.tenant_id = :tid AND UPPER(a.app_ref) = :ref{scope}
+                a.id AS app_ref, a.status::text AS status,
+                a."coverLetter" AS cover_note,
+                a."appliedAt" AS created_at, a."updatedAt" AS updated_at,
+                j.slug AS job_ref, j.title AS job_title,
+                j."locationDetails" AS location, cat.name AS department_name
+            FROM private_job_applications a
+            JOIN private_jobs j ON j.id = a."jobId"
+            LEFT JOIN private_job_categories cat ON cat.id = j."categoryId"
+            WHERE a.id = :ref{scope}
             """
         )
         start = time.perf_counter()
@@ -376,16 +420,18 @@ class ApplicationRepository:
         sql = text(
             """
             SELECT
-                a.app_ref, a.status, a.created_at,
-                j.job_ref, j.title AS job_title, j.location
-            FROM applications a
-            JOIN jobs j ON j.id = a.job_id
-            WHERE a.tenant_id = :tid AND a.candidate_id = :cid
-            ORDER BY a.created_at DESC
+                a.id AS app_ref, a.status::text AS status,
+                a."appliedAt" AS created_at,
+                j.slug AS job_ref, j.title AS job_title,
+                j."locationDetails" AS location
+            FROM private_job_applications a
+            JOIN private_jobs j ON j.id = a."jobId"
+            WHERE a."jobSeekerId" = :cid
+            ORDER BY a."appliedAt" DESC
             LIMIT :limit
             """
         )
-        params = {"tid": tenant_id, "cid": candidate_id, "limit": limit}
+        params = {"cid": candidate_id, "limit": limit}
         start = time.perf_counter()
         async with session_scope() as session:
             res = await session.execute(sql, params)

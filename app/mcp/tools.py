@@ -90,6 +90,21 @@ def _phone_variants(raw: str) -> list[str]:
     return out
 
 
+def _arg_query(args: dict[str, Any]) -> str:
+    """The search text from a tool call, tolerant of a weak planner.
+
+    The schema names it ``query``, but small models sometimes emit ``q`` /
+    ``search`` / ``text`` instead, or omit it entirely. Return the first
+    non-empty alias (stringified, trimmed) rather than KeyError the turn — an
+    empty string is a harmless "no results" search, not a crash.
+    """
+    for key in ("query", "q", "search", "text"):
+        v = args.get(key)
+        if v not in (None, ""):
+            return str(v).strip()
+    return ""
+
+
 def _jsonable(value: Any) -> Any:
     """Make repository rows JSON-serialisable (Decimal/datetime → primitives)."""
     if isinstance(value, Decimal):
@@ -198,16 +213,19 @@ async def submit_application_core(
     job_ref: str,
     full_name: str | None = None,
     email: str | None = None,
-    years_experience: float | None = None,
-    cover_note: str | None = None,
+    years_experience: float | None = None,  # noqa: ARG001 — kept for when real apply is re-enabled
+    cover_note: str | None = None,           # noqa: ARG001 — kept for when real apply is re-enabled
 ) -> dict[str, Any]:
-    """Create the calling candidate's application to a job, idempotently.
+    """Acknowledge an apply request without writing to the DB.
 
-    Requires the authenticated phone (identity is injected, not model-set) plus
-    at least a name + email captured conversationally. Resolves the human-facing
-    JOB-XXXX ref to the posting, upserts the candidate record, then submits.
-    A repeat submit for the same (candidate, job) returns the existing
-    application rather than duplicating it.
+    Submitting via WhatsApp would INSERT into the production ``users`` +
+    ``applications`` tables of the live job board (jobs7uat), which needs a
+    proper design (new-user role/status, dedup, notifications) we haven't built.
+    Until then we don't write: we confirm the role is real (so the reply is
+    grounded and specific) and point the candidate to apply on the portal.
+
+    Still validates phone + name/email so the conversational flow that gathers
+    them is unchanged for when real submission is enabled.
     """
     if not phone:
         return {"error": "no candidate identity on this channel"}
@@ -219,25 +237,17 @@ async def submit_application_core(
         }
     job = await JobRepository.get_by_ref(job_ref, tenant_id=tenant_id)
     if not job:
-        return {"error": "job_not_found", "job_ref": job_ref.upper()}
+        return {"error": "job_not_found", "job_ref": job_ref}
 
-    candidate = await CandidateRepository.upsert(
-        tenant_id=tenant_id, phone=phone, full_name=full_name, email=email,
-        years_experience=years_experience,
-    )
-    application, created = await ApplicationRepository.submit(
-        tenant_id=tenant_id,
-        candidate_id=str(candidate["id"]),
-        job_id=str(job["id"]),
-        cover_note=cover_note,
-    )
     return {
-        "submitted": True,
-        "already_applied": not created,
-        "application_ref": application["app_ref"],
-        "status": application["status"],
+        "submitted": False,
+        "apply_unavailable": True,
         "job_ref": job["job_ref"],
         "job_title": job["title"],
+        "message": (
+            f"I found the {job['title']} role for you. Applying straight from "
+            "chat isn't available yet — I can connect you with our team to apply."
+        ),
     }
 
 
@@ -407,7 +417,9 @@ class ToolRegistry:
             return await search_jobs_core(
                 self.vector,
                 tenant_id=ctx.tenant_id,
-                query=args["query"],
+                # A weak planner sometimes omits `query` or names it q/search/text
+                # — accept any of those rather than KeyError the whole turn.
+                query=_arg_query(args),
                 location=args.get("location"),
                 employment_type=args.get("employment_type"),
                 min_salary=args.get("min_salary"),
@@ -440,7 +452,7 @@ class ToolRegistry:
                 self.vector,
                 tenant_id=ctx.tenant_id,
                 collection=get_settings().vector_collection_policies,
-                query=args["query"],
+                query=_arg_query(args),
             )
 
         async def _search_faq(args: dict[str, Any], ctx: ToolContext) -> Any:
@@ -448,14 +460,19 @@ class ToolRegistry:
                 self.vector,
                 tenant_id=ctx.tenant_id,
                 collection=get_settings().vector_collection_faq,
-                query=args["query"],
+                query=_arg_query(args),
             )
 
         async def _handoff(args: dict[str, Any], ctx: ToolContext) -> Any:
+            # `reason`/`summary` are schema-required, but a weak model sometimes
+            # calls the tool with neither — don't KeyError the handoff (the one
+            # path that exists to rescue a stuck turn). Fall back to the summary,
+            # then a generic reason, so the escalation still goes through.
+            reason = args.get("reason") or args.get("summary") or "unspecified"
             return await request_human_handoff_core(
                 self.escalation,
-                reason=args["reason"],
-                summary=args.get("summary", ""),
+                reason=reason,
+                summary=args.get("summary") or reason,
                 severity=args.get("severity", "normal"),
                 context={
                     "tenant_id": ctx.tenant_id,
