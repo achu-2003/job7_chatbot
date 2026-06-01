@@ -40,6 +40,15 @@ async def respond(
 ) -> dict[str, Any]:
     results = (state.get("working") or {}).get("tool_results") or []
 
+    # Deterministic short-circuit for application status: the candidate is
+    # already identified by their number, so when the lookup returned data we
+    # format the reply ourselves rather than letting a weak model wander off and
+    # ask for name/email (it does so inconsistently). Grounded by construction.
+    direct = _application_status_reply(results)
+    if direct is not None:
+        conv.note("respond", f"app-status {len(direct)} chars")
+        return {"draft_response": direct, "used_llm": False}
+
     parts: list[str] = []
     if memory_context:
         parts.append(f"MEMORY:\n{memory_context}")
@@ -83,6 +92,34 @@ async def respond(
         HALLUCINATION_COUNTER.labels(result="valid").inc()
     conv.note("respond", f"{len(text)} chars")
     return {"draft_response": text, "used_llm": True}
+
+
+def _application_status_reply(results: list[dict[str, Any]]) -> str | None:
+    """If this turn looked up the candidate's applications, build the reply
+    deterministically: list each "Job — Status", or a clear "no applications"
+    line. Returns None when there's no application-status result, so normal
+    (job search / chat) turns fall through to the LLM responder."""
+    app_res = next(
+        (r.get("result") for r in results if r.get("tool") == "get_application_status"),
+        None,
+    )
+    if not isinstance(app_res, dict):
+        return None
+
+    apps = app_res.get("applications")
+    if not isinstance(apps, list):
+        one = app_res.get("application")
+        apps = [one] if isinstance(one, dict) else []
+
+    if not apps:
+        return "You don't have any applications on record yet. Want me to find you some jobs?"
+
+    lines = []
+    for a in apps[:5]:
+        title = a.get("job_title") or a.get("job_ref") or "a role"
+        status = str(a.get("status") or "submitted").replace("_", " ").title()
+        lines.append(f"• {title} — {status}")
+    return "\n".join(lines)
 
 
 def _cached_grounding(state: AgentState) -> list[dict[str, Any]]:

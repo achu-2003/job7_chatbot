@@ -71,7 +71,7 @@ async def test_search_jobs_returns_compact_rows(monkeypatch):
             "department_name": "Engineering", "location": "Bengaluru",
             "employment_type": "full_time", "seniority": "senior",
             "salary_min": 2500000, "salary_max": 4000000, "salary_currency": "INR",
-            "skills": ["python", "fastapi"],
+            "skills": ["python", "fastapi"], "status": "LIVE",
         }]
 
     monkeypatch.setattr(JobRepository, "get_by_ids", staticmethod(fake_get_by_ids))
@@ -81,8 +81,42 @@ async def test_search_jobs_returns_compact_rows(monkeypatch):
         "department": "Engineering", "location": "Bengaluru",
         "employment_type": "full_time", "seniority": "senior",
         "salary_min": 2500000.0, "salary_max": 4000000.0, "salary_currency": "INR",
-        "skills": ["python", "fastapi"],
+        "skills": ["python", "fastapi"], "availability": "open",
     }]
+
+
+async def test_search_jobs_labels_expired_availability(monkeypatch):
+    # Non-open jobs are shown but flagged so the bot won't tell a candidate to
+    # apply to a dead listing.
+    async def fake_get_by_ids(ids, *, tenant_id=None):
+        return [{"id": "j2", "job_ref": "old-role", "title": "Old Role",
+                 "status": "EXPIRED", "salary_min": 1000, "salary_max": 2000}]
+
+    monkeypatch.setattr(JobRepository, "get_by_ids", staticmethod(fake_get_by_ids))
+    out = await _registry().dispatch("search_jobs", {"query": "old"}, _ctx())
+    assert out[0]["availability"] == "expired"
+
+
+async def test_search_jobs_hits_without_metadata_job_id(monkeypatch):
+    # Regression: real vector hits may carry the job id only as `id` (no
+    # metadata.job_id). The old filter required metadata.job_id and silently
+    # dropped every hit → "no jobs found" even though search matched. Now the
+    # hit's own id is used as a fallback.
+    async def fake_get_by_ids(ids, *, tenant_id=None):
+        assert ids == ["job-xyz"]  # the hit id was used
+        return [{
+            "id": "job-xyz", "job_ref": "office-staff", "title": "Office Staff",
+            "department_name": "Administration", "location": None,
+            "employment_type": "FULL_TIME", "seniority": None,
+            "salary_min": 20000, "salary_max": 45000, "salary_currency": "INR",
+            "skills": [],
+        }]
+
+    monkeypatch.setattr(JobRepository, "get_by_ids", staticmethod(fake_get_by_ids))
+    # hit has NO metadata.job_id — just id + a stray metadata field
+    vector = _FakeVector(hits=[{"id": "job-xyz", "metadata": {"title": "Office Staff"}}])
+    out = await _registry(vector).dispatch("search_jobs", {"query": "office"}, _ctx())
+    assert len(out) == 1 and out[0]["title"] == "Office Staff"
 
 
 async def test_search_jobs_facet_filter_excludes_mismatch(monkeypatch):

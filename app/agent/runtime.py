@@ -272,6 +272,15 @@ class AgentRuntime:
             # planner, so the planner only needs customer facts here.
             return ("Customer: " + ", ".join(f"{k}={v}" for k, v in facts.items())) if facts else None
 
+        # When this turn fetched fresh jobs/applications, answer from THOSE — drop
+        # the rolling summary + recall so a stale topic (e.g. a job mentioned in an
+        # earlier, since-corrected turn) can never leak back into a live answer.
+        has_fresh_results = any(
+            r.get("tool") in {"search_jobs", "get_application_status", "list_jobs_overview"}
+            and r.get("result")
+            for r in (state.get("working") or {}).get("tool_results") or []
+        )
+
         bits: list[str] = []
         if cached.get("doc"):
             bits.append(
@@ -282,7 +291,7 @@ class AgentRuntime:
         if facts:
             bits.append("Customer: " + ", ".join(f"{k}={v}" for k, v in facts.items()))
 
-        if not followup:
+        if not followup and not has_fresh_results:
             if state.get("rolling_summary"):
                 bits.append(f"Earlier in the chat: {state['rolling_summary']}")
             recalled = state.get("semantic_hits") or []

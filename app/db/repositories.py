@@ -106,23 +106,20 @@ class JobRepository:
     ``salary_min`` ← ``salaryMin`` …), so nothing downstream (``_compact_job``,
     the validator, the responder) had to change.
 
-    "Open to candidates" = any genuinely-open posting: ``status IN
-    ('LIVE','APPROVED','PENDING')``, not soft-deleted, and not past its expiry.
-    This deliberately excludes DRAFT (unpublished) and EXPIRED/CLOSED/REJECTED so
-    candidates never see half-written or dead listings. The candidate-facing
-    reference is the human-readable ``slug``.
+    "Shown to candidates" = every PUBLISHED posting: anything that isn't a
+    half-written ``DRAFT`` and isn't soft-deleted. Expired/closed/suspended jobs
+    ARE shown (the reply labels their status, e.g. "(expired)") so candidates see
+    the full board and know which are still open. The candidate-facing reference
+    is the human-readable ``slug``.
 
     WHERE clauses are appended dynamically based on which filters are present,
     so we never evaluate dead ``IS NULL`` branches and avoid bind-vs-cast
     ambiguity.
     """
 
-    # statuses a candidate is allowed to see, excluding soft-deleted + expired.
-    _LIVE = (
-        "j.status IN ('LIVE','APPROVED','PENDING') "
-        'AND j."deletedAt" IS NULL '
-        'AND (j."expiresAt" IS NULL OR j."expiresAt" > now())'
-    )
+    # Shown = published (not DRAFT) and not soft-deleted. Expired/closed/etc. are
+    # included on purpose and labelled in the reply.
+    _LIVE = "j.status <> 'DRAFT' AND j.\"deletedAt\" IS NULL"
 
     _SELECT = (
         'SELECT '
@@ -252,6 +249,28 @@ class JobRepository:
         async with session_scope() as session:
             res = await session.execute(sql, params)
             return [dict(r._mapping) for r in res]
+
+    @staticmethod
+    async def category_summary(
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Total open-job count + counts per category, for answering "list all
+        jobs" with a count and a category menu instead of a wall of postings."""
+        params: dict[str, Any] = {}
+        tenant_sql = _tenant_clause("j", params, tenant_id)
+        sql = text(
+            'SELECT COALESCE(cat.name, \'Other\') AS category, COUNT(*) AS n '
+            'FROM private_jobs j '
+            'LEFT JOIN private_job_categories cat ON cat.id = j."categoryId" '
+            f'WHERE {JobRepository._LIVE}{tenant_sql} '
+            'GROUP BY cat.name ORDER BY n DESC'
+        )
+        async with session_scope() as session:
+            res = await session.execute(sql, params)
+            rows = [dict(r._mapping) for r in res]
+        total = sum(r["n"] for r in rows)
+        return {"total": total, "categories": rows}
 
 
 # ---------------------------------------------------------------

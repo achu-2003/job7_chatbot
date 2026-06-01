@@ -33,6 +33,45 @@ async def test_price_grounded_in_pinned_product_passes():
     assert "999" in out["draft_response"]      # cached price grounds it → not replaced
 
 
+async def test_application_status_is_reported_not_asked_for_identity():
+    # Regression: "My application" lookups returned data but the weak model
+    # sometimes asked for name/email instead. The responder now reports status
+    # deterministically (no LLM), so identity is never wrongly requested.
+    state = {
+        "inbound_text": "My application",
+        "working": {"tool_results": [{
+            "tool": "get_application_status",
+            "result": {"found": True, "applications": [
+                {"job_title": "Kt developer", "status": "REJECTED"},
+            ]},
+        }]},
+        "short_term": [], "cached_product": {},
+    }
+    # LLM would have asked for email — but the deterministic guard wins.
+    out = await respond(
+        state, llm=_CannedLLM("Need a bit more — what's your email?"),
+        validator=HallucinationValidator(), memory_context=None,
+    )
+    assert "Kt developer" in out["draft_response"]
+    assert "Rejected" in out["draft_response"]
+    assert "email" not in out["draft_response"].lower()
+
+
+async def test_no_applications_gives_friendly_line():
+    state = {
+        "inbound_text": "my applications",
+        "working": {"tool_results": [{
+            "tool": "get_application_status", "result": {"found": False},
+        }]},
+        "short_term": [], "cached_product": {},
+    }
+    out = await respond(
+        state, llm=_CannedLLM("whatever"),
+        validator=HallucinationValidator(), memory_context=None,
+    )
+    assert "don't have any applications" in out["draft_response"].lower()
+
+
 async def test_job_refs_grounded_by_search_jobs_pass():
     # Regression: search_jobs results must feed the grounding check. Without the
     # search_jobs branch in _grounding_rows, every JOB-XXXX the model quotes is

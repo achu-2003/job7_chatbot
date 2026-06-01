@@ -17,9 +17,9 @@ from __future__ import annotations
 # relevant entry whenever you edit a prompt below.
 PROMPT_VERSIONS = {
     "persona": "v6",    # v6 = candidate owns their name/email; accept corrections, don't re-ask
-    "planner": "v5",    # v5 = searching needs no identity; apply-only gating on name/email
+    "planner": "v6",    # v6 = "list all jobs" → list_jobs_overview (count+categories)
     "reflection": "v2",
-    "responder": "v6",  # v6 = no job-ref codes (real data uses slugs); title/location/salary only
+    "responder": "v10", # v10 = "list all" → count + category invite (open_jobs_total/job_categories)
     "summarizer": "v1",
 }
 
@@ -53,6 +53,9 @@ Tools:
 {tools}
 
 Rules:
+- "list all jobs" / "show all jobs" / "what jobs do you have" (no specific role)
+  → list_jobs_overview (returns a count + categories). Naming a role/skill/
+  location ("sales jobs", "office staff", "jobs in Chennai") → search_jobs.
 - find/browse/search jobs → search_jobs. apply to a job → submit_application
   (needs job_ref + full_name + email). check an application →
   get_application_status. policy/FAQ → search_policies / search_faq.
@@ -88,13 +91,29 @@ RESPONDER_SYSTEM = (
 Write the reply now from MEMORY + CONTEXT. Hard rules on length:
 - MAX 3 short lines. Like a quick WhatsApp text. NEVER a paragraph.
 - Just the key facts (role / salary / location) + a short nudge. No preamble.
-- Listing jobs: one per line as "• Title — Location — ₹salary". Use ONLY the
+- If CONTEXT has "open_jobs_total" + "job_categories": give the total and the top
+  categories, then invite them to pick one. E.g. "We have 69 open jobs — Sales (15),
+  IT (18), Admin (3)… Which area interests you?" Do NOT list individual jobs here.
+- Listing specific jobs: one per line as "• Title — Location — ₹salary". Use ONLY the
   title, location and salary from CONTEXT. If a field is missing, omit it.
+- If a job's availability in CONTEXT is NOT "open" (e.g. expired/closed), add that
+  in brackets, e.g. "• Old Role — Chennai (expired)", and never tell the candidate
+  to apply to it. Show open jobs first.
 - NEVER invent or show a job code/reference. Do NOT write "JOB-XXXX" or any made-up
   id. Quote ONLY values present in CONTEXT, exactly as given.
+- Application status: if CONTEXT has an "applications" table, just report it,
+  one per line as "• Job Title — Status" (e.g. "• Kt developer — Rejected").
+  NEVER ask for name or email to check status — the candidate is already
+  identified by their number. If found is false / no applications, say so plainly.
+- ONLY ask for name/email when the candidate is actually APPLYING to a job and it
+  is missing. NEVER ask for name/email when listing jobs, showing application
+  status, answering a question, or replying to thanks/greetings/chit-chat.
+- Thanks/greeting/chit-chat → a brief friendly reply, nothing more. Do NOT run a
+  search or ask for details (e.g. "Thanks" → "You're welcome! Anything else?").
 - Nothing found → one short honest line ("I couldn't find any matching roles right now.").
 - No emojis.
-Example: "Office Staff — Administration — ₹20,000-45,000/month. Want to know more?"
-Don't say "Please provide more details" — say "Need a bit more — what's your email?"\
+Format example (placeholders — fill ONLY from CONTEXT, never copy these words):
+  "<title> — <department> — ₹<salary>. Want to know more?"
+When applying and email is missing, say "Need a bit more — what's your email?" — otherwise never.\
 """
 )

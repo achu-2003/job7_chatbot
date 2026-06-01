@@ -118,10 +118,31 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+# Map the raw job status to a candidate-friendly availability label. Only the
+# explicitly-open statuses are "open"; everything else is surfaced so the reply
+# can flag it (e.g. "(expired)") and the candidate isn't misled into applying.
+# An UNKNOWN status defaults to "unavailable" (NOT "open") — failing safe, so a
+# new status value the schema adds later never silently looks applyable.
+_OPEN_STATUSES = {"LIVE", "APPROVED", "PENDING"}
+_AVAILABILITY = {
+    "EXPIRED": "expired", "CLOSED": "closed", "PAUSED": "paused",
+    "SUSPENDED": "unavailable", "REJECTED": "unavailable", "DRAFT": "unavailable",
+}
+
+
+def _availability(status: str) -> str:
+    if status in _OPEN_STATUSES:
+        return "open"
+    return _AVAILABILITY.get(status, "unavailable")
+
+
 def _compact_job(row: dict[str, Any]) -> dict[str, Any]:
     """The fields the model needs to answer, nothing more (keeps tokens low).
     ``id`` is included so the caller can re-hydrate; ``job_ref`` is the
-    human-facing id the candidate uses to apply."""
+    human-facing id the candidate uses to apply. ``availability`` lets the model
+    flag jobs that aren't open (expired/closed) so it never tells a candidate to
+    apply to a dead listing."""
+    status = (row.get("status") or "").upper()
     return {
         "id": str(row["id"]) if row.get("id") is not None else None,
         "job_ref": row.get("job_ref"),
@@ -134,6 +155,7 @@ def _compact_job(row: dict[str, Any]) -> dict[str, Any]:
         "salary_max": _jsonable(row.get("salary_max")),
         "salary_currency": row.get("salary_currency"),
         "skills": row.get("skills") or [],
+        "availability": _availability(status),
     }
 
 
@@ -189,9 +211,14 @@ async def search_jobs_core(
     hits = await vector.query(
         s.vector_collection_products, query, tenant_id=tenant_id,
     )
+    # Prefer the explicit metadata.job_id, but fall back to the hit's own id —
+    # which IS the job id (reindex stores each job under id=row["id"]). Requiring
+    # metadata.job_id silently dropped every hit when that key wasn't present,
+    # making search return nothing even though the vectors matched.
     job_ids = [
-        h["id"] for h in hits
-        if h.get("id") and (h.get("metadata") or {}).get("job_id")
+        (h.get("metadata") or {}).get("job_id") or h.get("id")
+        for h in hits
+        if (h.get("metadata") or {}).get("job_id") or h.get("id")
     ]
     if not job_ids:
         return []
@@ -204,6 +231,18 @@ async def search_jobs_core(
         )
     ]
     return [_compact_job(r) for r in filtered[:limit]]
+
+
+async def list_jobs_overview_core(*, tenant_id: str) -> dict[str, Any]:
+    """A count + category menu of open jobs — the answer to "list all jobs" so
+    the candidate can pick a category instead of getting a wall of postings."""
+    summary = await JobRepository.category_summary(tenant_id=tenant_id)
+    # keep the top categories (by count) to keep the reply short
+    cats = [
+        {"category": c["category"], "count": c["n"]}
+        for c in summary["categories"][:8]
+    ]
+    return {"total_open_jobs": summary["total"], "categories": cats}
 
 
 async def submit_application_core(
@@ -427,6 +466,9 @@ class ToolRegistry:
                 limit=int(args.get("limit") or 5),
             )
 
+        async def _list_jobs_overview(args: dict[str, Any], ctx: ToolContext) -> Any:
+            return await list_jobs_overview_core(tenant_id=ctx.tenant_id)
+
         async def _submit_application(args: dict[str, Any], ctx: ToolContext) -> Any:
             return await submit_application_core(
                 tenant_id=ctx.tenant_id,
@@ -524,6 +566,23 @@ class ToolRegistry:
                     "additionalProperties": False,
                 },
                 handler=_search_jobs,
+            ),
+            ToolSpec(
+                name="list_jobs_overview",
+                description=(
+                    "Use when the candidate asks to LIST or SEE ALL jobs / what "
+                    "jobs are available, without naming a role. Returns the total "
+                    "number of open jobs and a breakdown by category, so you can "
+                    "give a count and invite them to pick a category — instead of "
+                    "dumping every posting. Prefer search_jobs when they name a "
+                    "specific role/skill/location."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                handler=_list_jobs_overview,
             ),
             ToolSpec(
                 name="submit_application",

@@ -63,9 +63,13 @@ def toon_context(results: list[dict[str, Any]]) -> str:
     """Flatten tool results into uniform tables, then TOON-encode. Returns ''
     when there's nothing to show."""
     products: list[dict[str, Any]] = []
+    jobs: list[dict[str, Any]] = []
+    applications: list[dict[str, Any]] = []
     orders: list[dict[str, Any]] = []
     docs: list[dict[str, Any]] = []
     other: list[dict[str, Any]] = []
+    overview: dict[str, Any] = {}
+    overview_cats: list[dict[str, Any]] = []
 
     for r in results or []:
         tool, res = r.get("tool"), r.get("result")
@@ -81,6 +85,27 @@ def toon_context(results: list[dict[str, Any]]) -> str:
                         "sizes": ", ".join(p.get("sizes") or []) or "-",
                         "stock": p.get("stock"),
                     })
+        elif tool == "search_jobs" and isinstance(res, list):
+            for j in res:
+                if isinstance(j, dict):
+                    jobs.append(_flat_job(j))
+        elif tool == "list_jobs_overview" and isinstance(res, dict):
+            # Count + per-category breakdown for "list all jobs". The model turns
+            # this into "We have N open jobs across A, B, C — which interests you?"
+            overview["total_open_jobs"] = res.get("total_open_jobs")
+            for c in (res.get("categories") or []):
+                if isinstance(c, dict) and c.get("category"):
+                    overview_cats.append({"category": c["category"], "count": c.get("count")})
+        elif tool == "get_application_status" and isinstance(res, dict):
+            # Either {"applications": [...]} or {"application": {...}}; flatten
+            # both into uniform rows so the model can read each status cleanly.
+            apps = res.get("applications")
+            if isinstance(apps, list):
+                applications.extend(_flat_app(a) for a in apps if isinstance(a, dict))
+            elif isinstance(res.get("application"), dict):
+                applications.append(_flat_app(res["application"]))
+            elif res.get("found") is False:
+                applications.append({"job_title": "-", "status": "no applications found", "applied": "-"})
         elif tool == "get_order_status" and isinstance(res, dict) and isinstance(res.get("order"), dict):
             orders.append(_flat_order(res["order"]))
         elif tool == "get_recent_orders" and isinstance(res, list):
@@ -93,8 +118,16 @@ def toon_context(results: list[dict[str, Any]]) -> str:
             other.append({"tool": tool, "result": _scalar(res)})
 
     ctx: dict[str, Any] = {}
+    if overview:
+        ctx["open_jobs_total"] = overview.get("total_open_jobs")
+    if overview_cats:
+        ctx["job_categories"] = overview_cats
     if products:
         ctx["products"] = products
+    if jobs:
+        ctx["jobs"] = jobs
+    if applications:
+        ctx["applications"] = applications
     if orders:
         ctx["orders"] = orders
     if docs:
@@ -102,6 +135,23 @@ def toon_context(results: list[dict[str, Any]]) -> str:
     if other:
         ctx["other"] = other
     return toon_encode(ctx) if ctx else ""
+
+
+# Uniform job row for the LLM context (scalar-only → TOON table form).
+_JOB_FIELDS = ("title", "location", "employment_type", "department",
+               "salary_min", "salary_max", "availability")
+
+
+def _flat_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {k: (job.get(k) if job.get(k) not in (None, "") else "-") for k in _JOB_FIELDS}
+
+
+def _flat_app(app: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_title": app.get("job_title") or app.get("job_ref") or "-",
+        "status": app.get("status") or "-",
+        "applied": (str(app.get("created_at"))[:10] if app.get("created_at") else "-"),
+    }
 
 
 def _flat_order(order: dict[str, Any]) -> dict[str, Any]:

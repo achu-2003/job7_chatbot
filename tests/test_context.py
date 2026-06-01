@@ -1,5 +1,5 @@
 """is_followup — distinguishes a question about the pinned product from a new one."""
-from app.agent.context import is_followup
+from app.agent.context import is_followup, toon_context
 
 
 def test_pronoun_references_are_followups():
@@ -33,3 +33,30 @@ def test_naming_a_new_product_is_not_a_followup():
 def test_greeting_is_not_a_followup():
     assert is_followup("hi") is False
     assert is_followup("hello there") is False
+
+
+def test_application_status_renders_in_context():
+    # Regression: get_application_status results must reach the responder as a
+    # clean table, not a truncated blob — otherwise the bot ignores them and
+    # wrongly asks for name/email on a "show my application" request.
+    results = [{
+        "tool": "get_application_status",
+        "result": {"found": True, "applications": [
+            {"job_title": "Kt developer", "status": "REJECTED",
+             "created_at": "2026-03-21T11:02:53"},
+        ]},
+    }]
+    ctx = toon_context(results)
+    assert "Kt developer" in ctx
+    assert "REJECTED" in ctx
+    assert "applications" in ctx
+
+
+def test_search_jobs_renders_in_context_with_availability():
+    results = [{"tool": "search_jobs", "result": [
+        {"title": "Office Staff", "availability": "open", "salary_min": 20000},
+        {"title": "Old Role", "availability": "expired"},
+    ]}]
+    ctx = toon_context(results)
+    assert "Office Staff" in ctx and "Old Role" in ctx
+    assert "expired" in ctx
