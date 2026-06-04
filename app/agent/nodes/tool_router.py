@@ -41,7 +41,7 @@ async def execute(state: AgentState, *, registry: ToolRegistry) -> dict[str, Any
         step["result"] = result
         step["status"] = "failed" if failed else "done"
         results.append({"tool": step["tool"], "args": step.get("args"), "result": result})
-        if step["tool"] == "search_products" and isinstance(result, list) and result:
+        if step["tool"] == "search_jobs" and isinstance(result, list) and result:
             products = result
         AGENT_TOOL_CALLS.labels(tool=step["tool"], result="error" if failed else "ok").inc()
         if step["tool"] == "schedule_followup" and not failed:
