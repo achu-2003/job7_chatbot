@@ -186,6 +186,11 @@ class AgentRuntime:
         if _ORDER_HINT_RX.search(state.get("inbound_text", "")):
             return None
         jobs = state.get("catalog_hits") or []
+        if not jobs:
+            for r in (state.get("working") or {}).get("tool_results") or []:
+                if r.get("tool") == "search_jobs" and isinstance(r.get("result"), list):
+                    jobs = r["result"]
+                    break
         if not jobs or not jobs[0].get("id"):
             return None
         return str(jobs[0]["id"]), self._product_doc(jobs[0])

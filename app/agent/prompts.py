@@ -17,7 +17,7 @@ from __future__ import annotations
 # relevant entry whenever you edit a prompt below.
 PROMPT_VERSIONS = {
     "persona": "v6",    # v6 = candidate owns their name/email; accept corrections, don't re-ask
-    "planner": "v6",    # v6 = "list all jobs" → list_jobs_overview (count+categories)
+    "planner": "v7",    # v7 = picking a category (e.g. "Admin(3)") routes to search_jobs with clean query
     "reflection": "v2",
     "responder": "v10", # v10 = "list all" → count + category invite (open_jobs_total/job_categories)
     "summarizer": "v1",
@@ -53,22 +53,29 @@ Tools:
 {tools}
 
 Rules:
+Rules for tool selection and argument generation:
+- Always prioritize using the provided tools to fulfill the user's request.
 - "list all jobs" / "show all jobs" / "what jobs do you have" (no specific role)
   → list_jobs_overview (returns a count + categories). Naming a role/skill/
-  location ("sales jobs", "office staff", "jobs in Chennai") → search_jobs.
+  location ("sales jobs", "office staff", "jobs in Chennai") or picking a
+  category from a previous list (e.g. "Admin", "Admin(3)", "IT") → search_jobs.
 - find/browse/search jobs → search_jobs. apply to a job → submit_application
   (needs job_ref + full_name + email). check an application →
   get_application_status. policy/FAQ → search_policies / search_faq.
+  get_application_status. policy/FAQ → search_policies / search_faq. For specific
+  job titles like "admin", "sales", "engineer", always use search_jobs.
   withdraw/complaint/hiring-decision → request_human_handoff. promise to check
   back later → schedule_followup.
 - greeting / thanks / chit-chat, or answerable from memory → direct_answer true, steps [].
 - SEARCHING needs NO personal details. If the message is about finding/browsing
-  jobs (e.g. "python developer job", "show me jobs", "any sales roles"), call
-  search_jobs immediately — do NOT ask for name or email first. Name/email are
-  ONLY needed to APPLY (submit_application), never to search.
+  jobs (e.g. "python developer job", "show me jobs", "any sales roles", or choosing
+  a category), call search_jobs immediately — do NOT ask for name or email first.
+  Name/email are ONLY needed to APPLY (submit_application), never to search.
 - search_jobs "query" = ONLY the candidate's own words for what they want.
   NEVER add titles, skills or locations from earlier in the chat (e.g. if they
   ask for "sales roles", search "sales roles", not "senior sales remote mumbai").
+  If they reply with a category like "Admin (3)" or "Admin(3)", the query should
+  just be the category name (e.g. "Admin").
 - Only call submit_application when the candidate clearly wants to APPLY to a
   specific job AND you already have job_ref + full_name + email (from memory or
   this message). If applying and something's missing, direct_answer true and ask

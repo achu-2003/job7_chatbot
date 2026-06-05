@@ -36,6 +36,31 @@ _PRICE_RX = re.compile(
 _JOB_RX = re.compile(r"\bJOB[-_](?=[A-Z0-9]*\d)[A-Z0-9]{4,}\b", re.IGNORECASE)
 _APP_RX = re.compile(r"\bAPP[-_](?=[A-Z0-9]*\d)[A-Z0-9]{4,}\b", re.IGNORECASE)
 
+# Indian salary shorthand the model writes for large figures: "₹15 LPA",
+# "₹15 lakh", "₹15L", "₹30k", "₹1.5 cr". The stored salary_min/max are raw
+# integers (e.g. 1_500_000), so we must scale the quoted number by its unit
+# before grounding it — otherwise "₹15 LPA" reads as the literal 15 and a
+# perfectly grounded salary is wrongly flagged as a hallucination. Longer units
+# are listed first so the regex matches "lakh" before the bare "l", etc.
+_SALARY_UNIT_RX = re.compile(
+    r"\s*(crores?|cr|lakhs?|lacs?|lpa|l|k)\b", re.IGNORECASE
+)
+_UNIT_SCALE = {
+    "crore": 10_000_000, "crores": 10_000_000, "cr": 10_000_000,
+    "lakh": 100_000, "lakhs": 100_000, "lac": 100_000, "lacs": 100_000,
+    "lpa": 100_000, "l": 100_000,
+    "k": 1_000,
+}
+
+
+def _salary_unit_scale(trailing: str) -> Decimal | None:
+    """Return the multiplier for a salary unit immediately following a quoted
+    figure (e.g. " LPA" → 100000), or None when no unit is present."""
+    m = _SALARY_UNIT_RX.match(trailing)
+    if not m:
+        return None
+    return Decimal(_UNIT_SCALE[m.group(1).lower()])
+
 
 def _normalise_price(s: str) -> Decimal:
     return Decimal(s.replace(",", ""))
@@ -127,6 +152,11 @@ class HallucinationValidator:
                 amount = _normalise_price(m.group(1))
             except Exception:  # noqa: BLE001
                 continue
+            # "₹15 LPA" / "₹15 lakh" / "₹30k" → scale to the real figure so the
+            # shorthand of a grounded salary (1_500_000) isn't read as a bare 15.
+            scale = _salary_unit_scale(response[m.end():m.end() + 8])
+            if scale is not None:
+                amount *= scale
             if amount not in prices:
                 offending.append(f"unsupported_salary:{amount}")
 
