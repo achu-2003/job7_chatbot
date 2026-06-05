@@ -152,8 +152,23 @@ async def receive_webhook(
     # Production AgentRuntime path: paced, human-like multi-bubble delivery.
     delivery_plan = result.get("delivery_plan")
     if delivery_plan:
-        sent = await wa_delivery.deliver(settings, customer_number, delivery_plan)
-        conv.note("reply to", f"{customer_number} ({sent} bubble(s))")
+        # An interactive payload (e.g. the onboarding cta_url "Open form" button)
+        # takes priority over the text bubbles. If Meta rejects it (cta_url not
+        # enabled / non-https URL), fall back to the bubbles — whose text carries
+        # the same link inline, so the candidate never loses it.
+        interactive = result.get("whatsapp_interactive")
+        if interactive:
+            status = await _post_whatsapp_message(settings, customer_number, interactive)
+            if status in (200, 201):
+                sent = 1
+                conv.note("reply to", f"{customer_number} (cta button)")
+            else:
+                log.warning("wa_cta_rejected_fallback_text", status=status)
+                sent = await wa_delivery.deliver(settings, customer_number, delivery_plan)
+                conv.note("reply to", f"{customer_number} ({sent} bubble(s), cta fallback)")
+        else:
+            sent = await wa_delivery.deliver(settings, customer_number, delivery_plan)
+            conv.note("reply to", f"{customer_number} ({sent} bubble(s))")
         await _push_live_feed(
             request, tenant_id=tenant.id, payload=payload, phone=customer_number,
             inbound=incoming_text, reply=bot_reply,

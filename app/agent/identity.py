@@ -29,11 +29,15 @@ _ASKED_FOR_NAME_RX = re.compile(r"\b(full name|your name|name to proceed)\b", re
 _NAME_ONLY_RX = re.compile(r"^[A-Za-z][A-Za-z .'\-]{1,60}$")
 
 # Words that look like a name reply but are really chit-chat / intent, so we
-# must NOT store them as a name. Lowercased, whole-string match.
+# must NOT store them as a name. Lowercased, whole-string match. (Common
+# affirmations like "interested"/"fine" land here — otherwise a reply to
+# "what's your name?" gets stored as the name, e.g. the "Hi instrested!" bug.)
 _NOT_A_NAME = {
     "hi", "hello", "hey", "yes", "no", "ok", "okay", "thanks", "thank you",
     "yeah", "yep", "nope", "sure", "please", "help", "bye", "good morning",
     "good evening", "good afternoon", "namaste",
+    "interested", "not interested", "fine", "good", "great", "cool", "nice",
+    "hmm", "hello there", "test", "testing",
 }
 # If a "name-shaped" reply contains any of these tokens it's an intent/question,
 # not a name ("I need a python developer job" is letters-only but not a name).
@@ -68,6 +72,21 @@ def extract_name(text: str, *, assistant_prompt: str | None = None) -> str | Non
     if asked and _NAME_ONLY_RX.match(text) and _looks_like_name(text):
         return _clean_name(text)
     return None
+
+
+def is_plausible_name(value: str | None) -> bool:
+    """True if a value actually looks like a person's name.
+
+    Used to validate a *stored* ``full_name`` before trusting it — legacy junk
+    like ``"Searching Python Developer Job"`` (captured by an earlier, buggier
+    version) should not greet the candidate or make a number look onboarded.
+    Self-heals that whole class on the next turn: an implausible cached name is
+    dropped and the sender is re-asked.
+    """
+    if not value:
+        return False
+    value = value.strip()
+    return bool(_NAME_ONLY_RX.match(value)) and _looks_like_name(value)
 
 
 def _looks_like_name(text: str) -> bool:

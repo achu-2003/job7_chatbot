@@ -118,6 +118,25 @@ class MemoryGateway:
             # loaded from the DB — see app/agent/nodes/planner.py.
         }
 
+    # ---- onboarding form (Redis-only new-candidate profile) ---------
+
+    async def onboarding(
+        self, *, tenant_id: str, conversation_id: str
+    ) -> dict[str, Any] | None:
+        """The submitted onboarding form for this conversation (the gate), or
+        None if the new candidate hasn't completed it yet."""
+        return await self.short_term.get_onboarding(
+            conversation_id, tenant_id=tenant_id
+        )
+
+    async def onboarding_token(
+        self, *, tenant_id: str, customer_id: str, conversation_id: str, name: str | None
+    ) -> str:
+        """Get/create this conversation's form token, used to build the link."""
+        return await self.short_term.ensure_onboarding_token(
+            conversation_id, tenant_id=tenant_id, customer_id=customer_id, name=name,
+        )
+
     async def set_focus_product(
         self, *, conversation_id: str, tenant_id: str, product_id: str, doc: str
     ) -> None:

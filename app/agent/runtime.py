@@ -29,7 +29,7 @@ from typing import Any, Literal
 from langgraph.graph import END, START, StateGraph
 
 from app.agent.context import is_followup
-from app.agent.identity import extract_email, extract_name
+from app.agent.identity import extract_name, is_plausible_name
 from app.agent.nodes.humanizer import build_delivery_plan
 from app.agent.nodes.load_context import load_context
 from app.agent.nodes.persist import persist
@@ -39,6 +39,7 @@ from app.agent.nodes.responder import respond
 from app.agent.nodes.summarizer import summarize_if_needed
 from app.agent.nodes.tool_router import execute
 from app.agent.state import AgentState
+from app.chatbot import wa_format as wa
 from app.chatbot.memory import ConversationMemory
 from app.chatbot.validator import HallucinationValidator
 from app.db.repositories import CandidateRepository
@@ -73,10 +74,12 @@ _CLOSER_RX = re.compile(
 )
 
 # ---- new-candidate onboarding copy --------------------------------------
-# A number we've never seen (not in the job board AND no name/email captured
-# yet) is asked to introduce itself before we help with roles. The name prompt
-# MUST contain "full name"/"your name" so app.agent.identity.extract_name treats
-# the bare reply as the answer (see _ASKED_FOR_NAME_RX).
+# A number we've never seen (not in the job board AND not onboarded yet) is
+# asked to introduce itself before we help with roles: first the name in chat,
+# then a short self-hosted web form (email/experience/role) we keep in Redis.
+# The name prompt MUST contain "full name"/"your name" so
+# app.agent.identity.extract_name treats the bare reply as the answer
+# (see _ASKED_FOR_NAME_RX).
 _ONBOARD_ASK_NAME = (
     "Hi, and welcome! I don't think we've spoken before. "
     "Before I help you find roles, could you share your full name?"
@@ -87,14 +90,26 @@ def _first_name(name: str | None) -> str:
     return name.split()[0] if name else ""
 
 
-def _onboard_ask_email(name: str | None) -> str:
+def _onboard_ask_form(name: str | None, link: str) -> str:
+    """Text version (with the raw link inline) — used for web and as the
+    fallback if WhatsApp rejects the cta_url button."""
     who = f", {_first_name(name)}" if name else ""
-    return f"Thanks{who}! What's the best email address to reach you on?"
+    return (
+        f"Thanks{who}! One quick step to finish setting up your profile — please "
+        f"fill this short form (email, experience, preferred role/location):\n{link}"
+        "\n\nOnce you've submitted it, message me here and we'll find you some roles."
+    )
 
 
-def _onboard_welcome(name: str | None) -> str:
+def _onboard_form_cta_body(name: str | None) -> str:
+    """Body text for the WhatsApp cta_url button (the URL lives on the button, so
+    it's omitted here)."""
     who = f", {_first_name(name)}" if name else ""
-    return f"Great{who}, you're all set. What kind of role are you looking for?"
+    return (
+        f"Thanks{who}! One quick step to finish setting up your profile — tap "
+        "below to fill a short form (email, experience, preferred role/location). "
+        "Once you're done, message me here and we'll find you some roles."
+    )
 
 
 def _trim_result(res: Any) -> Any:
@@ -152,15 +167,24 @@ class AgentRuntime:
         """Decide whether the sender is a known person or a new number to onboard.
 
         Known = a registered job-seeker in the job board (lookup by phone) OR a
-        number we've already captured BOTH name + email for (in customer_facts).
-        Unknown numbers are routed to the onboarding response, which asks for the
-        name then the email before any normal handling. Capture/storage itself is
-        the persist node's job — we reuse the SAME extractors here so the field we
-        decide to ask for is exactly the one persist will (or won't) store.
+        new number that has completed onboarding: their name (captured in chat)
+        plus a short self-hosted web form (email/experience/role) whose data is
+        kept in Redis only. Until both are done the sender is routed to the
+        onboarding response — first asked for the name, then handed the form
+        link — and all normal job help is gated. Name capture/storage is the
+        persist node's job; we reuse the SAME name extractor here so the field we
+        ask for is exactly the one persist will (or won't) store.
         """
         facts = dict(state.get("customer_facts") or {})
         phone = (state.get("customer_id") or "").strip()
         text = state.get("inbound_text", "") or ""
+
+        # Self-heal: a previously-stored full_name that isn't actually name-shaped
+        # (legacy junk like "Searching Python Developer Job") must not greet the
+        # sender or make them look already-onboarded — drop it and re-ask.
+        if facts.get("full_name") and not is_plausible_name(facts["full_name"]):
+            log.info("dropping_implausible_cached_name", value=str(facts["full_name"])[:40])
+            facts.pop("full_name", None)
 
         # No phone (HTTP chat / non-WhatsApp callers) → we can't key on a number,
         # so don't gate — let the turn flow normally.
@@ -187,23 +211,41 @@ class AgentRuntime:
                 "customer_facts": facts,
             }
 
-        # 2) NOT in the active table → a new number. The cache here only tracks
-        # onboarding progress (so we don't re-ask), it never makes someone
-        # "existing". Merge anything stated THIS turn to ask the next missing
-        # field (and welcome them the moment both exist).
-        had_both = bool(facts.get("full_name")) and bool(facts.get("email"))
+        # 2) NOT in the active table → a new number we must ONBOARD. Step one is
+        # the name (captured in chat); step two is a short self-hosted web form
+        # (email, experience, preferred role/location) whose data we keep in
+        # Redis only — never the business DB. Job help is gated until that form
+        # is submitted.
         name = facts.get("full_name") or extract_name(
             text, assistant_prompt=self._last_assistant(state)
         )
-        email = facts.get("email") or extract_email(text)
-
-        if name and email:
-            if had_both:
-                return {"is_known": True}            # returning, already onboarded
-            return {"is_known": False, "onboarding_prompt": _onboard_welcome(name)}
         if not name:
             return {"is_known": False, "onboarding_prompt": _ONBOARD_ASK_NAME}
-        return {"is_known": False, "onboarding_prompt": _onboard_ask_email(name)}
+
+        form = await self.gateway.onboarding(
+            tenant_id=state["tenant_id"], conversation_id=state["conversation_id"],
+        )
+        if form:
+            return {"is_known": True}   # form submitted → fully onboarded
+
+        token = await self.gateway.onboarding_token(
+            tenant_id=state["tenant_id"], customer_id=phone,
+            conversation_id=state["conversation_id"], name=name,
+        )
+        link = f"{get_settings().public_base_url.rstrip('/')}/onboard/form?token={token}"
+        out: dict[str, Any] = {
+            "is_known": False,
+            # text-with-link kept as the web reply + WhatsApp fallback
+            "onboarding_prompt": _onboard_ask_form(name, link),
+        }
+        # Send a tappable "Open form" cta_url button on WhatsApp — but only for an
+        # https link (Meta rejects cta_url with http/localhost). For a non-https
+        # base URL we fall back to the inline-link text above.
+        if link.startswith("https://"):
+            out["whatsapp_interactive"] = wa.cta_url_message(
+                body=_onboard_form_cta_body(name), display_text="Open form", url=link,
+            )
+        return out
 
     async def _onboarding_response(self, state: AgentState) -> dict[str, Any]:
         """0-LLM reply that asks a new number for their name/email (or welcomes
@@ -522,6 +564,9 @@ class AgentRuntime:
             "latency_ms": final.get("latency_ms", 0),
             # agent extras (ignored by ChatResponse; used by the WhatsApp route)
             "delivery_plan": final.get("delivery_plan") or [],
+            # interactive payload (e.g. onboarding cta_url button) — route sends
+            # this instead of the text bubbles when present
+            "whatsapp_interactive": final.get("whatsapp_interactive"),
             "session_id": final.get("session_id"),
             "session_status": final.get("session_status"),
             "used_llm": final.get("used_llm", True),

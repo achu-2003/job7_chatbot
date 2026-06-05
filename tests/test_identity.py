@@ -1,6 +1,17 @@
 """Identity extraction — name/email pulled from a turn so the bot stops
 re-asking (regression for the WhatsApp name-loop)."""
-from app.agent.identity import extract_email, extract_name
+from app.agent.identity import extract_email, extract_name, is_plausible_name
+
+
+def test_is_plausible_name_accepts_real_names():
+    assert is_plausible_name("Ravi Kumar")
+    assert is_plausible_name("Asha")
+
+
+def test_is_plausible_name_rejects_junk():
+    # Legacy junk + chit-chat must not be trusted as a stored name.
+    for bad in ("Searching Python Developer Job", "interested", "", None, "find me jobs"):
+        assert not is_plausible_name(bad), bad
 
 
 def test_extracts_plain_email():
@@ -43,6 +54,13 @@ def test_intent_phrase_not_stored_as_name():
 
 def test_greeting_not_stored_as_name():
     assert extract_name("Hi", assistant_prompt="what's your full name?") is None
+
+
+def test_affirmation_not_stored_as_name():
+    # Regression for "Hi instrested!": a chit-chat reply to the name prompt must
+    # not be captured as the candidate's name.
+    for reply in ("interested", "Interested", "fine", "great", "test"):
+        assert extract_name(reply, assistant_prompt="what's your full name?") is None, reply
 
 
 def test_email_reply_not_stored_as_name():

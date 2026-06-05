@@ -11,6 +11,8 @@ memory cost.
 from __future__ import annotations
 
 import json
+import time
+import uuid
 from typing import Any
 
 import redis.asyncio as redis
@@ -181,3 +183,99 @@ class ConversationMemory:
             except json.JSONDecodeError:
                 continue
         return out
+
+    # ------------------------------------------------------------------
+    # onboarding form (new-candidate profile captured via a self-hosted
+    # web form — stored in Redis ONLY, never the business DB)
+    # ------------------------------------------------------------------
+    #
+    # Three keys per onboarding:
+    #   t:{tid}:conv:{conv}:onboard        → the submitted form data (the gate)
+    #   t:{tid}:conv:{conv}:onboard_token  → this conversation's current token
+    #   onboard:token:{token}              → token → {tenant, customer, conv,
+    #                                         name}  (NOT tenant-prefixed: the
+    #                                         form POST only carries the token)
+
+    def _onboard_key(self, conv_id: str, *, tenant_id: str | None = None) -> str:
+        tid = tenant_id or get_current_tenant_id()
+        return f"t:{tid}:conv:{conv_id}:onboard"
+
+    def _onboard_token_fwd_key(self, conv_id: str, *, tenant_id: str | None = None) -> str:
+        tid = tenant_id or get_current_tenant_id()
+        return f"t:{tid}:conv:{conv_id}:onboard_token"
+
+    @staticmethod
+    def _onboard_token_key(token: str) -> str:
+        return f"onboard:token:{token}"
+
+    async def get_onboarding(
+        self, conv_id: str, *, tenant_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """The submitted onboarding form for this conversation, or None if the
+        candidate hasn't completed it yet (the 'is onboarded?' gate)."""
+        assert self._redis is not None
+        raw = await self._redis.get(self._onboard_key(conv_id, tenant_id=tenant_id))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    async def ensure_onboarding_token(
+        self, conv_id: str, *, tenant_id: str, customer_id: str, name: str | None
+    ) -> str:
+        """Return this conversation's form token, minting one (and the reverse
+        token→identity map the form POST resolves) on first use. Reused across
+        turns so the candidate keeps getting the same link; TTL/name refreshed."""
+        assert self._redis is not None
+        ttl = get_settings().onboarding_ttl_seconds
+        identity = json.dumps({
+            "tenant_id": tenant_id, "customer_id": customer_id,
+            "conversation_id": conv_id, "name": name or "",
+        })
+        fwd = self._onboard_token_fwd_key(conv_id, tenant_id=tenant_id)
+        token = await self._redis.get(fwd)
+        if not token:
+            token = uuid.uuid4().hex
+            await self._redis.setex(fwd, ttl, token)
+        # (Re)write the reverse map so the token resolves and keeps a fresh TTL.
+        await self._redis.setex(self._onboard_token_key(token), ttl, identity)
+        await self._redis.expire(fwd, ttl)
+        return token
+
+    async def get_onboarding_identity(self, token: str) -> dict[str, Any] | None:
+        """Resolve a form token back to its candidate identity (for the form
+        page + submission). None if the token is unknown or expired."""
+        assert self._redis is not None
+        raw = await self._redis.get(self._onboard_token_key(token))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    async def save_onboarding(
+        self, token: str, data: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Store a form submission against the token's conversation (Redis only).
+        Returns the resolved identity, or None when the token is invalid."""
+        assert self._redis is not None
+        identity = await self.get_onboarding_identity(token)
+        if not identity:
+            return None
+        record = {
+            "name": identity.get("name", ""),
+            "email": (data.get("email") or "").strip(),
+            "years_experience": (data.get("years_experience") or "").strip(),
+            "location": (data.get("location") or "").strip(),
+            "submitted_at": int(time.time()),
+        }
+        await self._redis.setex(
+            self._onboard_key(identity["conversation_id"], tenant_id=identity["tenant_id"]),
+            get_settings().onboarding_ttl_seconds,
+            json.dumps(record),
+        )
+        log.info("onboarding_saved", conversation_id=identity["conversation_id"])
+        return identity

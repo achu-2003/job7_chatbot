@@ -88,6 +88,10 @@ class AgentState(TypedDict, total=False):
     draft_response: str
     message_chunks: list[str]
     delivery_plan: list[dict[str, Any]]   # [{text, typing_ms, delay_ms, image_url?}]
+    # A fully-formed WhatsApp Cloud API interactive payload (e.g. the onboarding
+    # cta_url "Open form" button). When set, the WhatsApp route sends THIS instead
+    # of the text bubbles; the bubbles (draft_response) remain the web/fallback.
+    whatsapp_interactive: dict[str, Any] | None
     used_llm: bool
     latency_ms: int
     # the product shown this turn, pinned as the "current product" for next turn

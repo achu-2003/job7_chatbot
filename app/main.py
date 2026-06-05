@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.responses import Response
 
-from app.api.routes import admin, chat, health, whatsapp
+from app.api.routes import admin, chat, health, onboard, whatsapp
 from app.config import get_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RequestContextMiddleware
@@ -26,6 +26,14 @@ configure_logging()
 log = get_logger("app")
 
 
+def _base_url_unreachable(url: str) -> bool:
+    """True when the onboarding base URL is loopback — such links are neither
+    tappable (no TLD) nor reachable from a phone over WhatsApp."""
+    import re
+
+    return bool(re.search(r"://(localhost|127\.0\.0\.1|0\.0\.0\.0)\b", url or "", re.I))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info(
@@ -35,6 +43,14 @@ async def lifespan(app: FastAPI):
         vector_mode=settings.vector_mode,
         worker_in_api=settings.run_worker_in_api,
     )
+    if _base_url_unreachable(settings.public_base_url):
+        log.warning(
+            "public_base_url_not_reachable",
+            url=settings.public_base_url,
+            hint="Onboarding form links won't be tappable or openable on WhatsApp. "
+            "Set PUBLIC_BASE_URL to a public https URL (e.g. an ngrok/cloudflared "
+            "tunnel) for anywhere, or http://<your-LAN-IP>:8000 for same-WiFi testing.",
+        )
     await init_engine()
     app.state.vector = VectorStore()
     app.state.memory = ConversationMemory()
@@ -105,6 +121,7 @@ app.include_router(health.router, prefix="/health", tags=["health"])
 app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
 app.include_router(admin.router, prefix="/api/v1/admin", tags=["admin"])
 app.include_router(whatsapp.router, prefix="/api/whatsapp", tags=["whatsapp"])
+app.include_router(onboard.router, prefix="/onboard", tags=["onboard"])
 
 
 @app.get("/metrics")

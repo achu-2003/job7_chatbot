@@ -195,6 +195,16 @@ class Settings(BaseSettings):
     # ---- observability ----
     prometheus_enabled: bool = True
 
+    # ---- onboarding form (new-candidate profile) ----
+    # New WhatsApp numbers finish onboarding via a short self-hosted web form
+    # (email, experience, preferred role/location). Submissions are kept in
+    # Redis only — never the business DB. This is the base URL the form link
+    # points at, so it MUST be publicly reachable for the WhatsApp link to work
+    # (e.g. your domain or an ngrok tunnel); localhost is fine for web testing.
+    public_base_url: str = "http://localhost:8000"
+    # How long a generated form link / stored submission lives in Redis.
+    onboarding_ttl_seconds: int = 7 * 24 * 3600
+
     # ---- whatsapp / meta cloud api ----
     meta_access_token: str = Field(default="")
     meta_phone_number_id: str = Field(default="")

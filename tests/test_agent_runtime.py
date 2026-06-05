@@ -38,11 +38,15 @@ def _runtime() -> AgentRuntime:
 
 
 def _stub_memory(
-    rt: AgentRuntime, *, facts: dict | None = None, candidate: dict | None = None
+    rt: AgentRuntime,
+    *,
+    facts: dict | None = None,
+    candidate: dict | None = None,
+    onboarded: bool = True,
 ) -> None:
     # Default to a fully-onboarded sender so the identity gate is a no-op and the
     # reasoning tests below exercise the normal path. Onboarding tests pass
-    # facts={} (and optionally a candidate) to drive the gate explicitly.
+    # facts={} / onboarded=False (and optionally a candidate) to drive the gate.
     if facts is None:
         facts = {"full_name": "Asha", "email": "asha@example.com"}
 
@@ -70,10 +74,19 @@ def _stub_memory(
     async def fake_lookup(**kw):
         return candidate
 
+    async def fake_onboarding(**kw):
+        # The submitted form (the gate). None → not onboarded yet.
+        return {"email": "x@y.com"} if onboarded else None
+
+    async def fake_onboarding_token(**kw):
+        return "tok123"
+
     rt.gateway.load = fake_load            # type: ignore[assignment]
     rt.gateway.persist = fake_persist      # type: ignore[assignment]
     rt.gateway.set_focus_product = fake_set_focus  # type: ignore[assignment]
     rt.gateway.should_summarize = lambda st: False  # type: ignore[assignment]
+    rt.gateway.onboarding = fake_onboarding          # type: ignore[assignment]
+    rt.gateway.onboarding_token = fake_onboarding_token  # type: ignore[assignment]
     rt._candidate_lookup = fake_lookup     # type: ignore[assignment]
 
 
@@ -185,35 +198,63 @@ async def test_tool_path_plans_executes_reflects_responds():
 
 
 async def test_unknown_number_is_asked_for_name():
-    """A number with no job-board record and no captured name/email is asked to
+    """A number with no job-board record and no captured name is asked to
     introduce itself — with zero LLM calls — instead of being helped."""
     rt = _runtime()
-    _stub_memory(rt, facts={})              # nothing on file, no DB candidate
+    _stub_memory(rt, facts={}, onboarded=False)   # nothing on file, no DB candidate
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "hi")
     assert "full name" in out["response"].lower()
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
 
 
-async def test_unknown_number_asks_for_email_once_name_known():
-    """Name already captured, email missing → the gate asks for the email."""
+async def test_name_known_but_form_not_submitted_gets_form_link():
+    """Name captured, form not yet submitted → the gate hands over the form link
+    (and keeps gating job help), with zero LLM calls. With a non-https base URL
+    (the test default) the link is inline text, no cta button."""
     rt = _runtime()
-    _stub_memory(rt, facts={"full_name": "Achuthan E"})
+    _stub_memory(rt, facts={"full_name": "Achuthan E"}, onboarded=False)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "tell me about jobs")
-    assert "email" in out["response"].lower()
-    assert "achuthan" in out["response"].lower()    # greets by first name
+    assert "form" in out["response"].lower()
+    assert "/onboard/form?token=tok123" in out["response"]   # tokenised link
+    assert "achuthan" in out["response"].lower()             # addressed by name
+    assert out.get("whatsapp_interactive") is None           # http base → no cta
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
-async def test_email_in_message_completes_onboarding():
-    """With a name on file, an email in the message finishes onboarding and the
-    bot welcomes them rather than re-asking."""
+async def test_form_link_sent_as_cta_button_when_https(monkeypatch):
+    """With an https public base URL, the form link is sent as a tappable
+    cta_url 'Open form' button, and the inline-link text remains as fallback."""
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "public_base_url", "https://abc.ngrok-free.app")
     rt = _runtime()
-    _stub_memory(rt, facts={"full_name": "Achuthan E"})
+    _stub_memory(rt, facts={"full_name": "Partha"}, onboarded=False)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
-    out = await _handle(rt, "my email is achuthan@gmail.com")
-    assert "all set" in out["response"].lower()
+    out = await _handle(rt, "list jobs")
+
+    cta = out["whatsapp_interactive"]
+    assert cta is not None
+    interactive = cta["interactive"]
+    assert interactive["type"] == "cta_url"
+    params = interactive["action"]["parameters"]
+    assert params["display_text"] == "Open form"
+    assert params["url"] == "https://abc.ngrok-free.app/onboard/form?token=tok123"
+    # fallback text still carries the link inline
+    assert "token=tok123" in out["response"]
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
+
+
+async def test_form_submission_completes_onboarding():
+    """Once the form is submitted (present in Redis), the gate opens and the
+    sender is handled normally — greeted by name here, with 0 LLM."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Achuthan E"}, onboarded=True)
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "hi")
+    assert "achuthan" in out["response"].lower()    # past the gate → greeted
+    assert "looking for" in out["response"].lower()
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
