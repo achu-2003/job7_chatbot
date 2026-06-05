@@ -138,7 +138,7 @@ def toon_context(results: list[dict[str, Any]]) -> str:
 
 
 # Uniform job row for the LLM context (scalar-only → TOON table form).
-_JOB_FIELDS = ("title", "location", "employment_type", "department",
+_JOB_FIELDS = ("job_ref", "title", "location", "employment_type", "department",
                "salary_min", "salary_max", "availability")
 
 

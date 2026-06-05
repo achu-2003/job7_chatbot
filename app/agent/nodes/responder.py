@@ -30,6 +30,27 @@ _BUSY_REPLY = (
     "please send it again in a few seconds."
 )
 
+# Strict regeneration prompt. The first draft tripped the grounding validator
+# (usually a fabricated JOB-XXXX reference or a salary the model invented), so
+# rather than discard the whole reply we ask the model once to rewrite it using
+# only verifiable facts. Matches the documented "one strict regenerate, then
+# fall back" strategy (README §7) that the agent responder was missing.
+_REGEN_INSTRUCTION = (
+    "Your last reply included details I can't verify against the CONTEXT. "
+    "Rewrite it using ONLY facts shown in CONTEXT/MEMORY. Do NOT include any job "
+    "code or reference (never write 'JOB-1234' or similar), and do NOT state any "
+    "salary or number that isn't present in CONTEXT. If CONTEXT lists no matching "
+    "roles, simply say you couldn't find any right now. Max 3 short lines, no emojis."
+)
+
+
+def _clean(text: str | None) -> str:
+    """Strip + default an empty draft, then cap length (no wall of text, ever)."""
+    text = (text or "").strip() or (
+        "I couldn't find an answer for that — could you give me a bit more detail?"
+    )
+    return _shorten(text)
+
 
 async def respond(
     state: AgentState,
@@ -72,26 +93,60 @@ async def respond(
         log.warning("responder_llm_unavailable", error=str(exc)[:200])
         return {"draft_response": _BUSY_REPLY, "used_llm": True}
 
-    text = (text or "").strip() or (
-        "I couldn't find an answer for that — could you give me a bit more detail?"
-    )
-    text = _shorten(text)   # deterministic guard: no wall of text, ever
+    text = _clean(text)   # deterministic guard: no wall of text, ever
 
     # Grounding = tool results + the pinned product (so a legit follow-up like
-    # "it's ₹999" passes). If the model still quoted a price/order not in any of
-    # them, it fabricated → REPLACE the reply (don't send fake confirmations).
+    # "it's ₹999" passes). If the model quoted a salary/reference not in any of
+    # them, it fabricated → try ONE strict regenerate before giving up, so a
+    # single stray token can't discard an otherwise-correct job listing.
     grounding = _grounding_rows(results) + _cached_grounding(state)
-    verdict = validator.validate(
-        text, sql_rows=grounding, vector_hits=[], customer_query=state.get("inbound_text"),
+    text, result_label = await _validate_or_regenerate(
+        text, state=state, llm=llm, validator=validator,
+        messages=messages, grounding=grounding,
     )
-    if not verdict.valid:
-        log.warning("agent_response_blocked", offending=verdict.offending, draft=text[:160])
-        HALLUCINATION_COUNTER.labels(result="blocked").inc()
-        text = _SAFE_FALLBACK
-    else:
-        HALLUCINATION_COUNTER.labels(result="valid").inc()
-    conv.note("respond", f"{len(text)} chars")
+    HALLUCINATION_COUNTER.labels(result=result_label).inc()
+    conv.note("respond", f"{len(text)} chars ({result_label})")
     return {"draft_response": text, "used_llm": True}
+
+
+async def _validate_or_regenerate(
+    text: str,
+    *,
+    state: AgentState,
+    llm: Any,
+    validator: HallucinationValidator,
+    messages: list[dict[str, Any]],
+    grounding: list[dict[str, Any]],
+) -> tuple[str, str]:
+    """Validate the draft; on a grounding failure, regenerate once under a strict
+    instruction and re-validate. Returns ``(reply, metric_label)`` where the
+    label is ``valid`` / ``regenerated`` / ``blocked``."""
+    query = state.get("inbound_text")
+    verdict = validator.validate(text, sql_rows=grounding, vector_hits=[], customer_query=query)
+    if verdict.valid:
+        return text, "valid"
+
+    log.warning("agent_response_blocked", offending=verdict.offending, draft=text[:160])
+    try:
+        retry, _ = await llm.chat(
+            purpose="agent_respond_strict",
+            messages=messages + [
+                {"role": "assistant", "content": text},
+                {"role": "user", "content": _REGEN_INSTRUCTION},
+            ],
+            temperature=0.0, max_tokens=90,
+        )
+    except Exception as exc:  # noqa: BLE001 — regenerate is best-effort
+        log.warning("responder_regen_unavailable", error=str(exc)[:200])
+        return _SAFE_FALLBACK, "blocked"
+
+    retry = _clean(retry)
+    verdict = validator.validate(retry, sql_rows=grounding, vector_hits=[], customer_query=query)
+    if verdict.valid:
+        return retry, "regenerated"
+
+    log.warning("agent_response_blocked_after_regen", offending=verdict.offending, draft=retry[:160])
+    return _SAFE_FALLBACK, "blocked"
 
 
 def _application_status_reply(results: list[dict[str, Any]]) -> str | None:
@@ -169,7 +224,14 @@ def _grounding_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
             # salary_max — exactly the keys the validator grounds against — so the
             # rows pass through as-is. Without this branch every JOB-XXXX the model
             # quotes is flagged unsupported and the reply gets replaced.
-            rows.extend(j for j in res if isinstance(j, dict))
+            for j in res:
+                if isinstance(j, dict):
+                    r_copy = dict(j)
+                    if r_copy.get("salary_min") is not None:
+                        r_copy["price"] = r_copy["salary_min"]
+                    if r_copy.get("salary_max") is not None:
+                        r_copy["suggested_mrp"] = r_copy["salary_max"]
+                    rows.append(r_copy)
         elif tool == "get_order_status" and isinstance(res, dict) and isinstance(res.get("order"), dict):
             rows.append(res["order"])
         elif tool == "get_recent_orders" and isinstance(res, list):

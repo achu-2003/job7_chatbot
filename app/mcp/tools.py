@@ -19,6 +19,7 @@ Design rules
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -101,7 +102,9 @@ def _arg_query(args: dict[str, Any]) -> str:
     for key in ("query", "q", "search", "text"):
         v = args.get(key)
         if v not in (None, ""):
-            return str(v).strip()
+            q = str(v).strip()
+            # Strip trailing counts (e.g. "Admin (3)" -> "Admin") so vector search doesn't miss
+            return re.sub(r"\s*\(\d+\)\s*$", "", q)
     return ""
 
 
