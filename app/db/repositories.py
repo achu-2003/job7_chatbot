@@ -334,7 +334,12 @@ class CandidateRepository:
                 text(
                     'SELECT js.id, js.phone, js."fullName" AS full_name, js.email '
                     'FROM private_job_seekers js '
-                    'WHERE js.phone = :phone '
+                    # Match on the last 10 digits: the job board stores bare local
+                    # numbers (e.g. 9872003072) while WhatsApp delivers them with a
+                    # country code (e.g. 919872003072). Strip non-digits on both
+                    # sides, then compare the trailing 10 so either form matches.
+                    "WHERE right(regexp_replace(js.phone, '\\D', '', 'g'), 10) "
+                    "    = right(regexp_replace(:phone, '\\D', '', 'g'), 10) "
                     'LIMIT 1'
                 ),
                 {"phone": phone},

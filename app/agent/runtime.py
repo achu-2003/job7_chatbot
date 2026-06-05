@@ -29,6 +29,7 @@ from typing import Any, Literal
 from langgraph.graph import END, START, StateGraph
 
 from app.agent.context import is_followup
+from app.agent.identity import extract_email, extract_name
 from app.agent.nodes.humanizer import build_delivery_plan
 from app.agent.nodes.load_context import load_context
 from app.agent.nodes.persist import persist
@@ -40,6 +41,7 @@ from app.agent.nodes.tool_router import execute
 from app.agent.state import AgentState
 from app.chatbot.memory import ConversationMemory
 from app.chatbot.validator import HallucinationValidator
+from app.db.repositories import CandidateRepository
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.core.metrics import AGENT_LOOPS
@@ -69,6 +71,30 @@ _CLOSER_RX = re.compile(
     r"i'?m done|im done|done for now|that'?ll be all|ok bye|thank you bye)[\s!.?]*$",
     re.IGNORECASE,
 )
+
+# ---- new-candidate onboarding copy --------------------------------------
+# A number we've never seen (not in the job board AND no name/email captured
+# yet) is asked to introduce itself before we help with roles. The name prompt
+# MUST contain "full name"/"your name" so app.agent.identity.extract_name treats
+# the bare reply as the answer (see _ASKED_FOR_NAME_RX).
+_ONBOARD_ASK_NAME = (
+    "Hi, and welcome! I don't think we've spoken before. "
+    "Before I help you find roles, could you share your full name?"
+)
+
+
+def _first_name(name: str | None) -> str:
+    return name.split()[0] if name else ""
+
+
+def _onboard_ask_email(name: str | None) -> str:
+    who = f", {_first_name(name)}" if name else ""
+    return f"Thanks{who}! What's the best email address to reach you on?"
+
+
+def _onboard_welcome(name: str | None) -> str:
+    who = f", {_first_name(name)}" if name else ""
+    return f"Great{who}, you're all set. What kind of role are you looking for?"
 
 
 def _trim_result(res: Any) -> Any:
@@ -110,6 +136,8 @@ class AgentRuntime:
         self.gateway = MemoryGateway(vector=vector, short_term=memory)
         self.tool_registry = ToolRegistry(vector=vector)
         self.validator = HallucinationValidator()
+        # Injectable so tests can stub the job-board lookup without a DB.
+        self._candidate_lookup = CandidateRepository.get
         self._graph = self._build_graph()
 
     # ---- nodes (bound coroutine methods) ----------------------------
@@ -120,19 +148,100 @@ class AgentRuntime:
     async def _summarize(self, state: AgentState) -> dict[str, Any]:
         return await summarize_if_needed(state, gateway=self.gateway, llm=self.llm)
 
+    async def _identify(self, state: AgentState) -> dict[str, Any]:
+        """Decide whether the sender is a known person or a new number to onboard.
+
+        Known = a registered job-seeker in the job board (lookup by phone) OR a
+        number we've already captured BOTH name + email for (in customer_facts).
+        Unknown numbers are routed to the onboarding response, which asks for the
+        name then the email before any normal handling. Capture/storage itself is
+        the persist node's job — we reuse the SAME extractors here so the field we
+        decide to ask for is exactly the one persist will (or won't) store.
+        """
+        facts = dict(state.get("customer_facts") or {})
+        phone = (state.get("customer_id") or "").strip()
+        text = state.get("inbound_text", "") or ""
+
+        # No phone (HTTP chat / non-WhatsApp callers) → we can't key on a number,
+        # so don't gate — let the turn flow normally.
+        if not phone:
+            return {"is_known": True}
+
+        # 1) Existence is decided by the ACTIVE job-board table, re-checked every
+        # turn — never by the cache. A hit → known; the active record's name/email
+        # take precedence over any (possibly stale) cached value.
+        try:
+            candidate = await self._candidate_lookup(
+                tenant_id=state["tenant_id"], phone=phone
+            )
+        except Exception as exc:  # noqa: BLE001 — a DB blip must not hard-block; fall back to memory
+            log.warning("identity_db_lookup_failed", error=str(exc)[:200])
+            candidate = None
+        if candidate:
+            facts["full_name"] = candidate.get("full_name") or facts.get("full_name")
+            facts["email"] = candidate.get("email") or facts.get("email")
+            return {
+                "is_known": True,
+                "is_existing_user": True,
+                "candidate_id": str(candidate.get("id")) if candidate.get("id") is not None else None,
+                "customer_facts": facts,
+            }
+
+        # 2) NOT in the active table → a new number. The cache here only tracks
+        # onboarding progress (so we don't re-ask), it never makes someone
+        # "existing". Merge anything stated THIS turn to ask the next missing
+        # field (and welcome them the moment both exist).
+        had_both = bool(facts.get("full_name")) and bool(facts.get("email"))
+        name = facts.get("full_name") or extract_name(
+            text, assistant_prompt=self._last_assistant(state)
+        )
+        email = facts.get("email") or extract_email(text)
+
+        if name and email:
+            if had_both:
+                return {"is_known": True}            # returning, already onboarded
+            return {"is_known": False, "onboarding_prompt": _onboard_welcome(name)}
+        if not name:
+            return {"is_known": False, "onboarding_prompt": _ONBOARD_ASK_NAME}
+        return {"is_known": False, "onboarding_prompt": _onboard_ask_email(name)}
+
+    async def _onboarding_response(self, state: AgentState) -> dict[str, Any]:
+        """0-LLM reply that asks a new number for their name/email (or welcomes
+        them once both are in). The value they give is stored by the persist
+        node via the shared identity extractors."""
+        return {
+            "intent": "onboarding",
+            "draft_response": state.get("onboarding_prompt") or _ONBOARD_ASK_NAME,
+            "used_llm": False,
+        }
+
+    @staticmethod
+    def _last_assistant(state: AgentState) -> str | None:
+        """The assistant line shown just before this message — lets the name
+        extractor treat a bare reply as the answer to 'what's your name?'."""
+        for turn in reversed(state.get("short_term") or []):
+            if turn.get("role") == "assistant" and turn.get("content"):
+                return turn["content"]
+        return None
+
     async def _greeting_response(self, state: AgentState) -> dict[str, Any]:
         """0-LLM handling for pure greetings/farewells. A farewell also flags the
         session to be reset in persist (fresh start next time)."""
+        # Known senders are greeted by name — identify() seeds full_name into
+        # customer_facts from the job board (or earlier-captured memory).
+        first = _first_name((state.get("customer_facts") or {}).get("full_name"))
         if _CLOSER_RX.search(state.get("inbound_text", "")):
+            bye = f"Thanks for stopping by, {first}!" if first else "Thanks for stopping by!"
             return {
                 "intent": "greeting",
-                "draft_response": "Thanks for stopping by! Message me anytime you need something.",
+                "draft_response": f"{bye} Message me anytime you need something.",
                 "used_llm": False,
                 "end_session": True,
             }
+        hi = f"Hi {first}! What are you looking for today?" if first else "Hi! What are you looking for today?"
         return {
             "intent": "greeting",
-            "draft_response": "Hi! What are you looking for today?",
+            "draft_response": hi,
             "used_llm": False,
         }
 
@@ -245,9 +354,14 @@ class AgentRuntime:
 
     # ---- helpers -----------------------------------------------------
 
-    def _route_entry(self, state: AgentState) -> Literal["greeting", "agent"]:
-        """Pure greetings/farewells skip the LLM entirely; everything else goes
-        to the reasoning agent."""
+    def _route_after_identify(
+        self, state: AgentState
+    ) -> Literal["onboarding", "greeting", "agent"]:
+        """Unknown numbers go to onboarding (ask name/email). Known senders keep
+        the existing split: pure greetings/farewells skip the LLM; everything
+        else goes to the reasoning agent."""
+        if not state.get("is_known", False):
+            return "onboarding"
         q = state.get("inbound_text", "")
         if _GREETING_RX.match(q) or _CLOSER_RX.match(q):
             return "greeting"
@@ -313,6 +427,8 @@ class AgentRuntime:
     def _build_graph(self):
         g = StateGraph(AgentState)
         g.add_node("load_context", self._load_context)
+        g.add_node("identify", self._identify)
+        g.add_node("onboarding_response", self._onboarding_response)
         g.add_node("greeting_response", self._greeting_response)
         g.add_node("summarize", self._summarize)
         g.add_node("planner", self._planner)
@@ -323,11 +439,17 @@ class AgentRuntime:
         g.add_node("persist", self._persist)
 
         g.add_edge(START, "load_context")
-        # greetings/farewells short-circuit the LLM; everything else → agent
+        g.add_edge("load_context", "identify")
+        # unknown number → onboarding; known → greeting short-circuit or agent
         g.add_conditional_edges(
-            "load_context", self._route_entry,
-            {"greeting": "greeting_response", "agent": "summarize"},
+            "identify", self._route_after_identify,
+            {
+                "onboarding": "onboarding_response",
+                "greeting": "greeting_response",
+                "agent": "summarize",
+            },
         )
+        g.add_edge("onboarding_response", "humanize")
         g.add_edge("greeting_response", "humanize")
         g.add_edge("summarize", "planner")
         g.add_conditional_edges(

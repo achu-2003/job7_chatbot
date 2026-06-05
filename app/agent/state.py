@@ -63,6 +63,12 @@ class AgentState(TypedDict, total=False):
     cached_product: dict[str, str] | None  # the pinned "current product" (focus)
     working: dict[str, Any]               # free scratchpad for this turn
 
+    # ---- identity / onboarding (set by the identify node) ----
+    is_known: bool                        # existing job-seeker OR name+email captured (routing)
+    is_existing_user: bool                # found in the ACTIVE private_job_seekers table
+    candidate_id: str | None              # active-table row id, for past-application lookups
+    onboarding_prompt: str                # the ask-name / ask-email / welcome line
+
     # ---- session / continuity ----
     session_status: str                   # active | dormant | resumed
     last_active_at: float | None

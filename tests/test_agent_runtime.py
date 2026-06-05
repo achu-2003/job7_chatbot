@@ -37,14 +37,22 @@ def _runtime() -> AgentRuntime:
     return AgentRuntime(vector=_FakeVector(), memory=SimpleNamespace())
 
 
-def _stub_memory(rt: AgentRuntime) -> None:
+def _stub_memory(
+    rt: AgentRuntime, *, facts: dict | None = None, candidate: dict | None = None
+) -> None:
+    # Default to a fully-onboarded sender so the identity gate is a no-op and the
+    # reasoning tests below exercise the normal path. Onboarding tests pass
+    # facts={} (and optionally a candidate) to drive the gate explicitly.
+    if facts is None:
+        facts = {"full_name": "Asha", "email": "asha@example.com"}
+
     async def fake_load(**kw):
         return {
             "session_id": "s1",
             "session_status": "active",
             "short_term": [],
             "rolling_summary": "",
-            "customer_facts": {},
+            "customer_facts": dict(facts),
             "semantic_hits": [],
             "pending_actions": [],
             # pre-existing goal so the planner skips the DB write in tests
@@ -59,10 +67,14 @@ def _stub_memory(rt: AgentRuntime) -> None:
     async def fake_set_focus(**kw):
         return None
 
+    async def fake_lookup(**kw):
+        return candidate
+
     rt.gateway.load = fake_load            # type: ignore[assignment]
     rt.gateway.persist = fake_persist      # type: ignore[assignment]
     rt.gateway.set_focus_product = fake_set_focus  # type: ignore[assignment]
     rt.gateway.should_summarize = lambda st: False  # type: ignore[assignment]
+    rt._candidate_lookup = fake_lookup     # type: ignore[assignment]
 
 
 async def _handle(rt: AgentRuntime, message: str = "i need a saree"):
@@ -76,7 +88,8 @@ def test_graph_has_reasoning_pipeline():
     rt = _runtime()
     assert sorted(rt._graph.get_graph().nodes) == [
         "__end__", "__start__", "execute", "greeting_response", "humanize",
-        "load_context", "persist", "planner", "reflect", "responder", "summarize",
+        "identify", "load_context", "onboarding_response", "persist", "planner",
+        "reflect", "responder", "summarize",
     ]
 
 
@@ -169,6 +182,68 @@ async def test_tool_path_plans_executes_reflects_responds():
     # token saver: one successful tool step skips the reflection call
     assert rt.llm.json_calls == ["agent_plan"]
     assert rt.llm.chat_calls == ["agent_respond"]
+
+
+async def test_unknown_number_is_asked_for_name():
+    """A number with no job-board record and no captured name/email is asked to
+    introduce itself — with zero LLM calls — instead of being helped."""
+    rt = _runtime()
+    _stub_memory(rt, facts={})              # nothing on file, no DB candidate
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "hi")
+    assert "full name" in out["response"].lower()
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
+
+
+async def test_unknown_number_asks_for_email_once_name_known():
+    """Name already captured, email missing → the gate asks for the email."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Achuthan E"})
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "tell me about jobs")
+    assert "email" in out["response"].lower()
+    assert "achuthan" in out["response"].lower()    # greets by first name
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
+
+
+async def test_email_in_message_completes_onboarding():
+    """With a name on file, an email in the message finishes onboarding and the
+    bot welcomes them rather than re-asking."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Achuthan E"})
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "my email is achuthan@gmail.com")
+    assert "all set" in out["response"].lower()
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
+
+
+async def test_known_user_greeted_by_name():
+    """A registered sender saying 'hi' is greeted by their first name (from the
+    job board, seeded into facts by identify) — still 0 LLM."""
+    rt = _runtime()
+    _stub_memory(
+        rt, facts={},
+        candidate={"id": 1, "full_name": "Reg User", "email": "reg@x.com"},
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "hi")
+    assert "reg" in out["response"].lower()              # greeted by name
+    assert "looking for" in out["response"].lower()
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
+
+
+async def test_registered_jobseeker_skips_onboarding():
+    """A phone found in the job board is treated as known — straight to the agent,
+    no name/email questions."""
+    rt = _runtime()
+    _stub_memory(
+        rt, facts={},
+        candidate={"id": 1, "full_name": "Reg User", "email": "reg@x.com"},
+    )
+    rt.llm = _FakeLLM(plans=[{"goal": "greet", "direct_answer": True, "steps": []}],
+                      reply="Here are some roles!")
+    out = await _handle(rt, "show me python jobs")
+    assert out["response"] == "Here are some roles!"   # normal agent path
 
 
 async def test_replan_is_bounded_by_budget():
