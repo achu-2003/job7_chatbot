@@ -52,3 +52,24 @@ async def test_good_query_is_kept():
     out = await _plan({"goal": "find jobs", "direct_answer": False,
                        "steps": [{"tool": "search_jobs", "args": {"query": "remote backend"}}]})
     assert out["plan"][0]["args"]["query"] == "remote backend"
+
+
+async def test_apply_confirmation_on_pinned_role_routes_to_submit_application():
+    # "yes" on the pinned role → submit_application with the job_ref pulled from
+    # the current-job doc, no LLM plan (the shortcut fires first).
+    state = _state("yes")
+    state["cached_product"] = {"doc": "Tester — IT — Chennai — ref tester-1775205995605"}
+    out = await plan(state, llm=_FakeLLM({}), registry=_FakeRegistry(), memory_context=None)
+    assert len(out["plan"]) == 1
+    step = out["plan"][0]
+    assert step["tool"] == "submit_application"
+    assert step["args"] == {"job_ref": "tester-1775205995605"}
+
+
+async def test_non_apply_followup_stays_direct_not_apply():
+    # A non-apply follow-up ("tell me more") about the pinned role must NOT be
+    # treated as an apply — it stays a direct answer (no tool step).
+    state = _state("tell me more")
+    state["cached_product"] = {"doc": "Tester — IT — Chennai — ref tester-1775205995605"}
+    out = await plan(state, llm=_FakeLLM({}), registry=_FakeRegistry(), memory_context=None)
+    assert out["plan"] == []

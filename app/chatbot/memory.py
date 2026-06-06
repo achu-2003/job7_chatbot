@@ -222,6 +222,28 @@ class ConversationMemory:
         except json.JSONDecodeError:
             return None
 
+    async def mark_onboarding_welcomed(
+        self, conv_id: str, *, tenant_id: str | None = None
+    ) -> None:
+        """Flag the submitted form as acknowledged in chat, so the one-time
+        'profile complete' success message is sent exactly once (the next turn
+        proceeds normally). Preserves the record's remaining TTL."""
+        assert self._redis is not None
+        key = self._onboard_key(conv_id, tenant_id=tenant_id)
+        raw = await self._redis.get(key)
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        data["welcomed"] = True
+        ttl = await self._redis.ttl(key)
+        if ttl and ttl > 0:
+            await self._redis.setex(key, ttl, json.dumps(data))
+        else:
+            await self._redis.set(key, json.dumps(data))
+
     async def ensure_onboarding_token(
         self, conv_id: str, *, tenant_id: str, customer_id: str, name: str | None
     ) -> str:

@@ -168,33 +168,30 @@ async def test_application_status_requires_identity():
     assert "error" in out
 
 
-async def test_submit_application_requires_name_and_email():
-    out = await _registry().dispatch(
-        "submit_application", {"job_ref": "JOB-AB1001"}, _ctx(),
-    )
-    assert out.get("error") == "missing_details"
-    assert "email" in out["need"] and "full_name" in out["need"]
-
-
-async def test_submit_application_disabled_confirms_job_without_writing(monkeypatch):
-    # Apply is disabled on the live job board (jobs7uat): the tool must confirm
-    # the role is real (grounded reply) but NOT write, and never touch the
-    # candidate/application write repos (which raise NotImplementedError now).
+async def test_submit_application_returns_app_link_without_asking_for_details(monkeypatch):
+    # Applying is finished in the Jobs7 app: an identified candidate confirming a
+    # real role gets the app link back (no name/email gate — those are on file),
+    # and the live job board's write repos are never touched.
     async def fake_get_by_ref(ref, *, tenant_id=None):
         return {"id": "j1", "job_ref": "senior-backend-engineer",
                 "title": "Senior Backend Engineer"}
 
     monkeypatch.setattr(JobRepository, "get_by_ref", staticmethod(fake_get_by_ref))
     out = await _registry().dispatch(
-        "submit_application",
-        {"job_ref": "senior-backend-engineer", "full_name": "Asha Rao",
-         "email": "asha@example.com"},
-        _ctx(),
+        "submit_application", {"job_ref": "senior-backend-engineer"}, _ctx(),
     )
     assert out["submitted"] is False
-    assert out["apply_unavailable"] is True
+    assert out["apply_via_app"] is True
     assert out["job_title"] == "Senior Backend Engineer"
-    assert "message" in out
+    assert out["app_url"].startswith("https://play.google.com/store/apps/details")
+    assert "jobs7" in out["message"].lower()
+
+
+async def test_submit_application_requires_identity():
+    out = await _registry().dispatch(
+        "submit_application", {"job_ref": "JOB-AB1001"}, _ctx(phone=None),
+    )
+    assert out["error"] == "no candidate identity on this channel"
 
 
 async def test_submit_application_unknown_job(monkeypatch):
@@ -203,9 +200,7 @@ async def test_submit_application_unknown_job(monkeypatch):
 
     monkeypatch.setattr(JobRepository, "get_by_ref", staticmethod(fake_get_by_ref))
     out = await _registry().dispatch(
-        "submit_application",
-        {"job_ref": "JOB-ZZ9999", "full_name": "Asha", "email": "a@b.com"},
-        _ctx(),
+        "submit_application", {"job_ref": "JOB-ZZ9999"}, _ctx(),
     )
     assert out["error"] == "job_not_found"
 

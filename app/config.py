@@ -204,6 +204,11 @@ class Settings(BaseSettings):
     public_base_url: str = "http://localhost:8000"
     # How long a generated form link / stored submission lives in Redis.
     onboarding_ttl_seconds: int = 7 * 24 * 3600
+    # Applying to a role is completed in the Jobs7 mobile app, not from chat.
+    # Once an identified candidate confirms a role we hand them this Play Store
+    # link (as a tappable "Open in Jobs7" WhatsApp button); an https URL is
+    # required for the button (Meta rejects http/localhost), else it's inline text.
+    jobs7_app_url: str = "https://play.google.com/store/apps/details?id=com.jobs7"
 
     # ---- whatsapp / meta cloud api ----
     meta_access_token: str = Field(default="")

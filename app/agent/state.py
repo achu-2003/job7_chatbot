@@ -67,7 +67,9 @@ class AgentState(TypedDict, total=False):
     is_known: bool                        # existing job-seeker OR name+email captured (routing)
     is_existing_user: bool                # found in the ACTIVE private_job_seekers table
     candidate_id: str | None              # active-table row id, for past-application lookups
-    onboarding_prompt: str                # the ask-name / ask-email / welcome line
+    onboarding_prompt: str                # the ask-name / form-link / success line
+    just_onboarded: bool                  # first turn after the form was submitted (success msg)
+    did_browse: bool                      # this turn was a deterministic category listing
 
     # ---- session / continuity ----
     session_status: str                   # active | dormant | resumed
@@ -87,6 +89,7 @@ class AgentState(TypedDict, total=False):
     # ---- output ----
     draft_response: str
     message_chunks: list[str]
+    single_bubble: bool                   # deliver the reply whole (e.g. a full category listing)
     delivery_plan: list[dict[str, Any]]   # [{text, typing_ms, delay_ms, image_url?}]
     # A fully-formed WhatsApp Cloud API interactive payload (e.g. the onboarding
     # cta_url "Open form" button). When set, the WhatsApp route sends THIS instead

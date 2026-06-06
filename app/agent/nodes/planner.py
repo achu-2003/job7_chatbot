@@ -5,6 +5,7 @@ Robust to a weak model: invalid/empty JSON degrades to a sensible default
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.agent.context import is_followup
@@ -21,6 +22,20 @@ log = get_logger("agent_planner")
 # named it q/search/text), fall back to the candidate's own message so the
 # search still runs against what they actually asked for.
 _QUERY_TOOLS = {"search_jobs", "search_policies", "search_faq"}
+
+# A follow-up that means "I want to apply to the current role" — an affirmation
+# or an explicit "apply". Bare facet follow-ups ("what's the salary", "details")
+# DON'T match, so they stay a direct answer about the pinned job.
+_APPLY_INTENT = re.compile(
+    r"\b(appl(y|ied|ying)|yes|yeah|yep|yup|ya|sure|ok(ay)?|confirm\w*|proceed|"
+    r"go ahead|i'?m in|sign me up|count me in|i want (it|this|to apply)|"
+    r"interested)\b",
+    re.IGNORECASE,
+)
+# The job_ref the focus-pin appended to the current-job doc (see
+# AgentRuntime._product_doc: "… — ref <job_ref>"). Lets us apply to exactly the
+# role on screen without a fresh search.
+_JOB_REF_IN_DOC = re.compile(r"\bref\s+([\w-]+)")
 
 
 def _normalise_args(tool: str, args: dict[str, Any], state: AgentState) -> dict[str, Any]:
@@ -40,9 +55,24 @@ async def plan(
     # about this", "what colours") is answered straight from memory — no plan,
     # no search (which would pull the wrong/older product), no LLM call here.
     cached = state.get("cached_product") or {}
-    if cached.get("doc") and is_followup(state.get("inbound_text", "")):
-        conv.note("plan", "direct (follow-up on current product)")
+    doc = cached.get("doc") or ""
+    if doc and is_followup(state.get("inbound_text", "")):
         goals = state.get("goals") or [new_goal(state["inbound_text"])]
+        # An apply confirmation ("yes" / "interested" / "apply") on the pinned
+        # role → submit_application, which hands over the Jobs7 app link. We
+        # already have their name/email, so no need to ask. Other follow-ups
+        # (bare facets like "what's the salary") stay a direct answer.
+        ref_m = _JOB_REF_IN_DOC.search(doc)
+        if ref_m and _APPLY_INTENT.search(state.get("inbound_text", "")):
+            conv.note("plan", "apply to current role (Jobs7 app link)")
+            return {
+                "goals": goals,
+                "plan": [new_step("submit_application", tool="submit_application",
+                                  args={"job_ref": ref_m.group(1)})],
+                "cursor": 0,
+                "loop_count": state.get("loop_count", 0) + 1,
+            }
+        conv.note("plan", "direct (follow-up on current product)")
         return {"goals": goals, "plan": [], "cursor": 0,
                 "loop_count": state.get("loop_count", 0) + 1}
 

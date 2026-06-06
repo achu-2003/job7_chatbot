@@ -43,6 +43,8 @@ def _stub_memory(
     facts: dict | None = None,
     candidate: dict | None = None,
     onboarded: bool = True,
+    welcomed: bool = True,
+    browse: dict | None = None,
 ) -> None:
     # Default to a fully-onboarded sender so the identity gate is a no-op and the
     # reasoning tests below exercise the normal path. Onboarding tests pass
@@ -75,11 +77,18 @@ def _stub_memory(
         return candidate
 
     async def fake_onboarding(**kw):
-        # The submitted form (the gate). None → not onboarded yet.
-        return {"email": "x@y.com"} if onboarded else None
+        # The submitted form (the gate). None → not onboarded yet. ``welcomed``
+        # marks whether we've already sent the in-chat success message.
+        return {"email": "x@y.com", "welcomed": welcomed} if onboarded else None
 
     async def fake_onboarding_token(**kw):
         return "tok123"
+
+    async def fake_mark_welcomed(**kw):
+        return None
+
+    async def fake_browse(**kw):
+        return browse
 
     rt.gateway.load = fake_load            # type: ignore[assignment]
     rt.gateway.persist = fake_persist      # type: ignore[assignment]
@@ -87,7 +96,9 @@ def _stub_memory(
     rt.gateway.should_summarize = lambda st: False  # type: ignore[assignment]
     rt.gateway.onboarding = fake_onboarding          # type: ignore[assignment]
     rt.gateway.onboarding_token = fake_onboarding_token  # type: ignore[assignment]
+    rt.gateway.mark_onboarding_welcomed = fake_mark_welcomed  # type: ignore[assignment]
     rt._candidate_lookup = fake_lookup     # type: ignore[assignment]
+    rt._category_browse = fake_browse      # type: ignore[assignment]
 
 
 async def _handle(rt: AgentRuntime, message: str = "i need a saree"):
@@ -100,7 +111,7 @@ async def _handle(rt: AgentRuntime, message: str = "i need a saree"):
 def test_graph_has_reasoning_pipeline():
     rt = _runtime()
     assert sorted(rt._graph.get_graph().nodes) == [
-        "__end__", "__start__", "execute", "greeting_response", "humanize",
+        "__end__", "__start__", "browse", "execute", "greeting_response", "humanize",
         "identify", "load_context", "onboarding_response", "persist", "planner",
         "reflect", "responder", "summarize",
     ]
@@ -208,10 +219,14 @@ async def test_unknown_number_is_asked_for_name():
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
 
 
-async def test_name_known_but_form_not_submitted_gets_form_link():
+async def test_name_known_but_form_not_submitted_gets_form_link(monkeypatch):
     """Name captured, form not yet submitted → the gate hands over the form link
     (and keeps gating job help), with zero LLM calls. With a non-https base URL
-    (the test default) the link is inline text, no cta button."""
+    the link is inline text, no cta button. Pin the base URL so the test doesn't
+    depend on the ambient .env (which may set an https ngrok URL)."""
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "public_base_url", "http://localhost:8000")
     rt = _runtime()
     _stub_memory(rt, facts={"full_name": "Achuthan E"}, onboarded=False)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
@@ -258,6 +273,19 @@ async def test_form_submission_completes_onboarding():
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
+async def test_form_just_submitted_shows_success_message():
+    """The first turn after the form is submitted gets a one-time 'profile
+    complete' success message (0 LLM), then later turns proceed normally."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Achuthan E"}, onboarded=True, welcomed=False)
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "hi")
+    assert "all set" in out["response"].lower()
+    assert "profile" in out["response"].lower()
+    assert "achuthan" in out["response"].lower()
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
+
+
 async def test_known_user_greeted_by_name():
     """A registered sender saying 'hi' is greeted by their first name (from the
     job board, seeded into facts by identify) — still 0 LLM."""
@@ -285,6 +313,78 @@ async def test_registered_jobseeker_skips_onboarding():
                       reply="Here are some roles!")
     out = await _handle(rt, "show me python jobs")
     assert out["response"] == "Here are some roles!"   # normal agent path
+
+
+async def test_category_browse_short_circuits_to_full_listing():
+    """A message that names a category lists every job in it deterministically —
+    no planner, no LLM — and is flagged for single-bubble delivery."""
+    rt = _runtime()
+    jobs = [{"job_ref": f"r{i}", "title": f"IT Role {i}", "location": "Chennai"}
+            for i in range(18)]
+    _stub_memory(rt, browse={"category": "Information Technology", "jobs": jobs})
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "show the IT jobs")
+    assert "all 18 Information Technology roles" in out["response"]
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
+    assert len(out["delivery_plan"]) == 1                         # one bubble, not truncated
+
+
+async def test_non_category_message_falls_through_to_agent():
+    """When the message names no category, browse returns nothing and the normal
+    planner path runs."""
+    rt = _runtime()
+    _stub_memory(rt, browse=None)
+    rt.llm = _FakeLLM(plans=[{"goal": "greet", "direct_answer": True, "steps": []}],
+                      reply="Found some roles!")
+    out = await _handle(rt, "python developer roles")
+    assert out["response"] == "Found some roles!"
+    assert rt.llm.json_calls == ["agent_plan"]
+
+
+async def test_apply_confirmation_hands_over_app_link_with_cta(monkeypatch):
+    """A known candidate saying 'yes' on the pinned role is handed the Jobs7 app
+    link as a tappable cta button — deterministically, with 0 LLM calls (the
+    planner shortcut → submit_application → deterministic responder)."""
+    from app.config import get_settings
+
+    monkeypatch.setattr(
+        get_settings(), "jobs7_app_url",
+        "https://play.google.com/store/apps/details?id=com.jobs7",
+    )
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Achuthan E"})
+
+    # Pin a current role (as the focus-pin would after the candidate picked it).
+    async def fake_load(**kw):
+        return {
+            "session_id": "s1", "session_status": "active", "short_term": [],
+            "rolling_summary": "", "customer_facts": {"full_name": "Achuthan E"},
+            "semantic_hits": [], "pending_actions": [],
+            "goals": [{"id": "g1", "description": "d", "status": "active",
+                       "priority": 0, "created_at": 0.0}],
+            "last_active_at": None,
+            "cached_product": {"product_id": "j1",
+                               "doc": "Tester — IT — Chennai — ref tester-1775205995605"},
+        }
+
+    rt.gateway.load = fake_load  # type: ignore[assignment]
+
+    async def fake_dispatch(name, args, ctx):
+        assert name == "submit_application"
+        return {"apply_via_app": True, "job_title": "Tester",
+                "job_ref": "tester-1775205995605",
+                "app_url": "https://play.google.com/store/apps/details?id=com.jobs7"}
+
+    rt.tool_registry.dispatch = fake_dispatch  # type: ignore[assignment]
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+
+    out = await _handle(rt, "yes")
+    assert "Tester" in out["response"]
+    assert "id=com.jobs7" in out["response"]
+    assert "email" not in out["response"].lower()
+    cta = out["whatsapp_interactive"]["interactive"]
+    assert cta["action"]["parameters"]["display_text"] == "Open in Jobs7"
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
 
 
 async def test_replan_is_bounded_by_budget():

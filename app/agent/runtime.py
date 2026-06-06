@@ -28,6 +28,7 @@ from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
 
+from app.agent.browse import build_job_list_text
 from app.agent.context import is_followup
 from app.agent.identity import extract_name, is_plausible_name
 from app.agent.nodes.humanizer import build_delivery_plan
@@ -48,7 +49,7 @@ from app.core.logging import get_logger
 from app.core.metrics import AGENT_LOOPS
 from app.core.tenancy import get_current_tenant_id
 from app.llm.client import LLMClient
-from app.mcp.tools import ToolRegistry
+from app.mcp.tools import ToolRegistry, list_category_jobs_core
 from app.vector.store import VectorStore
 from app.memory.gateway import MemoryGateway
 
@@ -112,6 +113,16 @@ def _onboard_form_cta_body(name: str | None) -> str:
     )
 
 
+def _onboard_success(name: str | None) -> str:
+    """One-time confirmation shown the first time a candidate messages after
+    submitting the onboarding form."""
+    who = f", {_first_name(name)}" if name else ""
+    return (
+        f"You're all set{who}! Your profile is complete. "
+        "What kind of role are you looking for?"
+    )
+
+
 def _trim_result(res: Any) -> Any:
     """Compact a tool result for the UI: lists → count + a small sample."""
     if isinstance(res, list):
@@ -151,8 +162,9 @@ class AgentRuntime:
         self.gateway = MemoryGateway(vector=vector, short_term=memory)
         self.tool_registry = ToolRegistry(vector=vector)
         self.validator = HallucinationValidator()
-        # Injectable so tests can stub the job-board lookup without a DB.
+        # Injectable so tests can stub the job-board lookups without a DB.
         self._candidate_lookup = CandidateRepository.get
+        self._category_browse = list_category_jobs_core
         self._graph = self._build_graph()
 
     # ---- nodes (bound coroutine methods) ----------------------------
@@ -162,6 +174,38 @@ class AgentRuntime:
 
     async def _summarize(self, state: AgentState) -> dict[str, Any]:
         return await summarize_if_needed(state, gateway=self.gateway, llm=self.llm)
+
+    async def _browse(self, state: AgentState) -> dict[str, Any]:
+        """Deterministic category browse. If the message clearly names a known
+        category, list EVERY job in it from SQL (not the LLM, which abbreviates
+        the name and fuzzy-searches the wrong roles) and deliver it whole. Skipped
+        on application/status turns so 'I applied for a sales job' isn't hijacked.
+        Returns ``{}`` to fall through to the normal planner when it's not a browse.
+        """
+        text = state.get("inbound_text", "") or ""
+        if _ORDER_HINT_RX.search(text):
+            return {}
+        try:
+            res = await self._category_browse(tenant_id=state["tenant_id"], text=text)
+        except Exception as exc:  # noqa: BLE001 — a browse miss must never break the turn
+            log.warning("category_browse_failed", error=str(exc)[:200])
+            return {}
+        if not res or not res.get("jobs"):
+            return {}
+        jobs = res["jobs"]
+        return {
+            "draft_response": build_job_list_text(jobs, res["category"]),
+            "single_bubble": True,
+            "used_llm": False,
+            "did_browse": True,
+            "catalog_hits": jobs,
+            "intent": "browse",
+        }
+
+    def _route_after_browse(self, state: AgentState) -> Literal["humanize", "summarize"]:
+        """A matched category browse goes straight to delivery; otherwise continue
+        into the normal summarize → planner reasoning path."""
+        return "humanize" if state.get("did_browse") else "summarize"
 
     async def _identify(self, state: AgentState) -> dict[str, Any]:
         """Decide whether the sender is a known person or a new number to onboard.
@@ -226,7 +270,24 @@ class AgentRuntime:
             tenant_id=state["tenant_id"], conversation_id=state["conversation_id"],
         )
         if form:
-            return {"is_known": True}   # form submitted → fully onboarded
+            # Form submitted → fully onboarded. Seed name/email from it so the
+            # bot can greet/help right away. The FIRST turn after submission gets
+            # a one-time success message; later turns proceed normally.
+            facts["full_name"] = facts.get("full_name") or form.get("name") or name
+            if form.get("email"):
+                facts["email"] = facts.get("email") or form.get("email")
+            if not form.get("welcomed"):
+                await self.gateway.mark_onboarding_welcomed(
+                    tenant_id=state["tenant_id"],
+                    conversation_id=state["conversation_id"],
+                )
+                return {
+                    "is_known": True,
+                    "just_onboarded": True,
+                    "onboarding_prompt": _onboard_success(facts.get("full_name") or name),
+                    "customer_facts": facts,
+                }
+            return {"is_known": True, "customer_facts": facts}
 
         token = await self.gateway.onboarding_token(
             tenant_id=state["tenant_id"], customer_id=phone,
@@ -311,14 +372,22 @@ class AgentRuntime:
         """Split the reply into paced bubbles. (Jobs have no images, so unlike
         the e-commerce version no image is attached to the first bubble.)"""
         s = get_settings()
-        plan_ = build_delivery_plan(
-            state.get("draft_response", "") or "",
-            max_chars=s.agent_chunk_max_chars,
-            max_chunks=s.agent_max_chunks,
-            cps=s.agent_typing_cps,
-            min_ms=s.agent_typing_min_ms,
-            max_ms=s.agent_typing_max_ms,
-        )
+        draft = state.get("draft_response", "") or ""
+        if state.get("single_bubble"):
+            # A deterministic listing (e.g. all jobs in a category) must arrive
+            # whole — never chunked/truncated — so send it as one bubble.
+            typing = int(min(s.agent_typing_max_ms,
+                             max(s.agent_typing_min_ms, len(draft) / max(s.agent_typing_cps, 1.0) * 1000)))
+            plan_ = [{"text": draft, "typing_ms": typing}]
+        else:
+            plan_ = build_delivery_plan(
+                draft,
+                max_chars=s.agent_chunk_max_chars,
+                max_chunks=s.agent_max_chunks,
+                cps=s.agent_typing_cps,
+                min_ms=s.agent_typing_min_ms,
+                max_ms=s.agent_typing_max_ms,
+            )
         out: dict[str, Any] = {
             "delivery_plan": plan_,
             "message_chunks": [b["text"] for b in plan_],
@@ -404,9 +473,12 @@ class AgentRuntime:
     def _route_after_identify(
         self, state: AgentState
     ) -> Literal["onboarding", "greeting", "agent"]:
-        """Unknown numbers go to onboarding (ask name/email). Known senders keep
+        """Unknown numbers go to onboarding (ask name/form). Known senders keep
         the existing split: pure greetings/farewells skip the LLM; everything
         else goes to the reasoning agent."""
+        # First turn after the form is submitted → one-time success message.
+        if state.get("just_onboarded"):
+            return "onboarding"
         if not state.get("is_known", False):
             return "onboarding"
         q = state.get("inbound_text", "")
@@ -477,6 +549,7 @@ class AgentRuntime:
         g.add_node("identify", self._identify)
         g.add_node("onboarding_response", self._onboarding_response)
         g.add_node("greeting_response", self._greeting_response)
+        g.add_node("browse", self._browse)
         g.add_node("summarize", self._summarize)
         g.add_node("planner", self._planner)
         g.add_node("execute", self._execute)
@@ -493,8 +566,13 @@ class AgentRuntime:
             {
                 "onboarding": "onboarding_response",
                 "greeting": "greeting_response",
-                "agent": "summarize",
+                "agent": "browse",
             },
+        )
+        # A category browse short-circuits to delivery; anything else reasons on.
+        g.add_conditional_edges(
+            "browse", self._route_after_browse,
+            {"humanize": "humanize", "summarize": "summarize"},
         )
         g.add_edge("onboarding_response", "humanize")
         g.add_edge("greeting_response", "humanize")

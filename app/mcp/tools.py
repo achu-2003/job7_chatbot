@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Awaitable, Callable
 
+from app.agent.browse import match_category
 from app.chatbot.escalation import EscalationService, EscalationTicket
 from app.config import get_settings
 from app.core.logging import get_logger
@@ -193,11 +194,43 @@ def _matches_facets(
 # ---------------------------------------------------------------------------
 
 
+# When the candidate browses a whole category we list every job in it, so the
+# cap has to clear the largest category (not the 5 used for a top-k search).
+_CATEGORY_LIST_LIMIT = 30
+
+
+async def _resolve_category(text: str | None, *, tenant_id: str) -> str | None:
+    """Map a candidate's phrase (e.g. 'IT', 'sales') to an EXACT live category
+    name, or None if it names no category we have. Resolving here means the SQL
+    filter is exact — '%IT%' never matches the wrong rows."""
+    if not text:
+        return None
+    summary = await JobRepository.category_summary(tenant_id=tenant_id)
+    names = [c["category"] for c in summary.get("categories", []) if c.get("category")]
+    return match_category(text, names)
+
+
+async def list_category_jobs_core(
+    *, tenant_id: str, text: str, limit: int = _CATEGORY_LIST_LIMIT
+) -> dict[str, Any] | None:
+    """Deterministic category browse: if ``text`` names a known category, return
+    ``{"category": <name>, "jobs": [...]}`` with EVERY live job in it; else None
+    (so the caller falls through to normal search)."""
+    category = await _resolve_category(text, tenant_id=tenant_id)
+    if not category:
+        return None
+    rows, _ = await JobRepository.search(
+        department=category, limit=limit, tenant_id=tenant_id
+    )
+    return {"category": category, "jobs": [_compact_job(r) for r in rows]}
+
+
 async def search_jobs_core(
     vector: VectorStore,
     *,
     tenant_id: str,
     query: str,
+    category: str | None = None,
     location: str | None = None,
     employment_type: str | None = None,
     min_salary: float | None = None,
@@ -209,7 +242,27 @@ async def search_jobs_core(
     Vector search for recall, then ``get_by_ids`` for authoritative
     title/location/salary, then optional facet post-filtering. Transactional
     truth (salary band, status) always comes from SQL, never vectors.
+
+    ``category`` switches to a DETERMINISTIC browse: when the candidate picks a
+    category from the overview ("Sales & Marketing"), we list EVERY live job in
+    it straight from SQL — vectors would only surface the top-k by similarity, so
+    "show me all 15" would silently return 5.
     """
+    if category:
+        # Resolve to the exact category name so an abbreviation the planner sent
+        # ("IT") matches the real "Information Technology" rows, not '%IT%' junk.
+        resolved = await _resolve_category(category, tenant_id=tenant_id) or category
+        rows, _ = await JobRepository.search(
+            department=resolved,
+            location=location,
+            employment_type=employment_type,
+            min_salary=min_salary,
+            max_salary=max_salary,
+            limit=max(limit, _CATEGORY_LIST_LIMIT),
+            tenant_id=tenant_id,
+        )
+        return [_compact_job(r) for r in rows]
+
     s = get_settings()
     hits = await vector.query(
         s.vector_collection_products, query, tenant_id=tenant_id,
@@ -253,42 +306,38 @@ async def submit_application_core(
     tenant_id: str,
     phone: str | None,
     job_ref: str,
-    full_name: str | None = None,
-    email: str | None = None,
-    years_experience: float | None = None,  # noqa: ARG001 — kept for when real apply is re-enabled
-    cover_note: str | None = None,           # noqa: ARG001 — kept for when real apply is re-enabled
+    full_name: str | None = None,  # noqa: ARG001 — already on file; the app carries it over
+    email: str | None = None,  # noqa: ARG001 — already on file; the app carries it over
+    years_experience: float | None = None,  # noqa: ARG001 — collected in the app
+    cover_note: str | None = None,           # noqa: ARG001 — collected in the app
 ) -> dict[str, Any]:
-    """Acknowledge an apply request without writing to the DB.
+    """Hand an identified candidate the Jobs7 app link to finish applying.
 
-    Submitting via WhatsApp would INSERT into the production ``users`` +
-    ``applications`` tables of the live job board (jobs7uat), which needs a
-    proper design (new-user role/status, dedup, notifications) we haven't built.
-    Until then we don't write: we confirm the role is real (so the reply is
-    grounded and specific) and point the candidate to apply on the portal.
-
-    Still validates phone + name/email so the conversational flow that gathers
-    them is unchanged for when real submission is enabled.
+    Applications are completed in the Jobs7 mobile app, not from chat: writing
+    straight to the live job board's ``users`` + ``applications`` tables needs a
+    design (new-user role/status, dedup, notifications) we haven't built. The
+    candidate is already identified — their name and email are on file (in Redis
+    for an onboarded number, or the active job-board table for an existing user)
+    — so we don't re-ask. We confirm the role is real (grounded, specific) and
+    return the app link the responder turns into a tappable "Open in Jobs7"
+    button; the app carries their details over.
     """
     if not phone:
         return {"error": "no candidate identity on this channel"}
-    if not full_name or not email:
-        return {
-            "error": "missing_details",
-            "need": [f for f, v in (("full_name", full_name), ("email", email)) if not v],
-            "message": "I still need your name and email before I can submit.",
-        }
     job = await JobRepository.get_by_ref(job_ref, tenant_id=tenant_id)
     if not job:
         return {"error": "job_not_found", "job_ref": job_ref}
 
+    app_url = get_settings().jobs7_app_url
     return {
         "submitted": False,
-        "apply_unavailable": True,
+        "apply_via_app": True,
         "job_ref": job["job_ref"],
         "job_title": job["title"],
+        "app_url": app_url,
         "message": (
-            f"I found the {job['title']} role for you. Applying straight from "
-            "chat isn't available yet — I can connect you with our team to apply."
+            f"Great — you can finish applying for the {job['title']} role in the "
+            f"Jobs7 app. We've got your details ready to carry over: {app_url}"
         ),
     }
 
@@ -462,6 +511,7 @@ class ToolRegistry:
                 # A weak planner sometimes omits `query` or names it q/search/text
                 # — accept any of those rather than KeyError the whole turn.
                 query=_arg_query(args),
+                category=args.get("category"),
                 location=args.get("location"),
                 employment_type=args.get("employment_type"),
                 min_salary=args.get("min_salary"),
@@ -477,10 +527,6 @@ class ToolRegistry:
                 tenant_id=ctx.tenant_id,
                 phone=ctx.customer_external_id,  # injected, not from model
                 job_ref=args["job_ref"],
-                full_name=args.get("full_name"),
-                email=args.get("email"),
-                years_experience=args.get("years_experience"),
-                cover_note=args.get("cover_note"),
             )
 
         async def _get_application_status(args: dict[str, Any], ctx: ToolContext) -> Any:
@@ -544,7 +590,10 @@ class ToolRegistry:
                     "reference (JOB-XXXX), title, department, location, employment "
                     "type, seniority, salary range and skills. Salary and status "
                     "are authoritative — quote them verbatim. Optionally filter by "
-                    "location, employment_type or salary."
+                    "location, employment_type or salary. When the candidate picks "
+                    "a category from list_jobs_overview (e.g. 'Sales & Marketing'), "
+                    "pass that EXACT category name as `category` to list EVERY job "
+                    "in it (not just the top few)."
                 ),
                 parameters={
                     "type": "object",
@@ -552,6 +601,14 @@ class ToolRegistry:
                         "query": {
                             "type": "string",
                             "description": "What the candidate is looking for.",
+                        },
+                        "category": {
+                            "type": "string",
+                            "description": (
+                                "Exact category name from the overview menu, to list "
+                                "ALL jobs in it (e.g. 'Sales & Marketing', "
+                                "'Information Technology')."
+                            ),
                         },
                         "location": {"type": "string", "description": "Filter to this location."},
                         "employment_type": {
@@ -590,12 +647,11 @@ class ToolRegistry:
             ToolSpec(
                 name="submit_application",
                 description=(
-                    "Submit the current candidate's application to a job, by its "
-                    "JOB-XXXX reference. Requires the candidate's full name and "
-                    "email (ask for these first if you don't have them). "
-                    "years_experience and cover_note are optional. Idempotent — "
-                    "re-submitting the same role returns the existing application. "
-                    "Returns the new application reference (APP-XXXX)."
+                    "Call this when the candidate confirms they want to APPLY to a "
+                    "specific role (by its JOB-XXXX / job reference). Applying is "
+                    "finished in the Jobs7 mobile app, so this returns the app "
+                    "link to hand over — do NOT ask for name or email first, we "
+                    "already have them on file. Only job_ref is needed."
                 ),
                 parameters={
                     "type": "object",
@@ -604,18 +660,8 @@ class ToolRegistry:
                             "type": "string",
                             "description": "The job reference to apply to, e.g. JOB-AB1234.",
                         },
-                        "full_name": {"type": "string", "description": "Candidate's full name."},
-                        "email": {"type": "string", "description": "Candidate's email address."},
-                        "years_experience": {
-                            "type": "number",
-                            "description": "Years of relevant experience.",
-                        },
-                        "cover_note": {
-                            "type": "string",
-                            "description": "Optional short note on why they're a fit.",
-                        },
                     },
-                    "required": ["job_ref", "full_name", "email"],
+                    "required": ["job_ref"],
                     "additionalProperties": False,
                 },
                 handler=_submit_application,

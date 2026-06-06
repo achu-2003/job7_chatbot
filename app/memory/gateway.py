@@ -137,6 +137,15 @@ class MemoryGateway:
             conversation_id, tenant_id=tenant_id, customer_id=customer_id, name=name,
         )
 
+    async def mark_onboarding_welcomed(
+        self, *, tenant_id: str, conversation_id: str
+    ) -> None:
+        """Mark the submitted form as acknowledged in chat (so the success
+        message is sent once)."""
+        await self.short_term.mark_onboarding_welcomed(
+            conversation_id, tenant_id=tenant_id
+        )
+
     async def set_focus_product(
         self, *, conversation_id: str, tenant_id: str, product_id: str, doc: str
     ) -> None:

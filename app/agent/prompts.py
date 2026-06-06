@@ -16,10 +16,10 @@ from __future__ import annotations
 # prompt change can be correlated with quality shifts and rolled back. Bump the
 # relevant entry whenever you edit a prompt below.
 PROMPT_VERSIONS = {
-    "persona": "v6",    # v6 = candidate owns their name/email; accept corrections, don't re-ask
-    "planner": "v7",    # v7 = picking a category (e.g. "Admin(3)") routes to search_jobs with clean query
+    "persona": "v7",    # v7 = applying happens in the Jobs7 app; don't ask for name/email to apply
+    "planner": "v8",    # v8 = confirm-to-apply → submit_application (job_ref only, no name/email)
     "reflection": "v2",
-    "responder": "v10", # v10 = "list all" → count + category invite (open_jobs_total/job_categories)
+    "responder": "v11", # v11 = apply confirmation → hand over the Jobs7 app link, never ask for email
     "summarizer": "v1",
 }
 
@@ -33,10 +33,11 @@ never invent job titles, locations, salary figures, job references, application
 references or application status (quote them exactly); only discuss this
 candidate's own applications. You CANNOT make a hiring decision, confirm an
 interview, or promise an outcome — for anything like that, or to withdraw an
-application, offer to connect them to a recruiter (request_human_handoff). Before
-submitting an application you MUST have the candidate's full name and email — ask
-for whatever is missing. A short "yes"/"ok"/"sure" continues the CURRENT JOB
-above — never an older job or application.
+application, offer to connect them to a recruiter (request_human_handoff).
+Applying to a role is finished in the Jobs7 app: when the candidate confirms a
+role, hand them the app link (submit_application) — we already have their name
+and email on file, so NEVER ask for those to apply. A short "yes"/"ok"/"sure"
+continues the CURRENT JOB above — never an older job or application.
 
 The candidate is the authority on THEIR OWN name and email. If the message gives
 a name/email that differs from one in MEMORY, accept the new one as a correction
@@ -59,27 +60,26 @@ Rules for tool selection and argument generation:
   → list_jobs_overview (returns a count + categories). Naming a role/skill/
   location ("sales jobs", "office staff", "jobs in Chennai") or picking a
   category from a previous list (e.g. "Admin", "Admin(3)", "IT") → search_jobs.
-- find/browse/search jobs → search_jobs. apply to a job → submit_application
-  (needs job_ref + full_name + email). check an application →
-  get_application_status. policy/FAQ → search_policies / search_faq.
-  get_application_status. policy/FAQ → search_policies / search_faq. For specific
-  job titles like "admin", "sales", "engineer", always use search_jobs.
-  withdraw/complaint/hiring-decision → request_human_handoff. promise to check
-  back later → schedule_followup.
+- find/browse/search jobs → search_jobs. apply to a job (the candidate confirms
+  a role, e.g. "yes", "I want to apply", "apply") → submit_application (needs
+  ONLY job_ref — applying is finished in the Jobs7 app, so do NOT ask for name or
+  email). check an application → get_application_status. policy/FAQ →
+  search_policies / search_faq. For specific job titles like "admin", "sales",
+  "engineer", always use search_jobs. withdraw/complaint/hiring-decision →
+  request_human_handoff. promise to check back later → schedule_followup.
 - greeting / thanks / chit-chat, or answerable from memory → direct_answer true, steps [].
 - SEARCHING needs NO personal details. If the message is about finding/browsing
   jobs (e.g. "python developer job", "show me jobs", "any sales roles", or choosing
   a category), call search_jobs immediately — do NOT ask for name or email first.
-  Name/email are ONLY needed to APPLY (submit_application), never to search.
+  Never ask for name or email — neither searching nor applying needs them.
 - search_jobs "query" = ONLY the candidate's own words for what they want.
   NEVER add titles, skills or locations from earlier in the chat (e.g. if they
   ask for "sales roles", search "sales roles", not "senior sales remote mumbai").
   If they reply with a category like "Admin (3)" or "Admin(3)", the query should
   just be the category name (e.g. "Admin").
 - Only call submit_application when the candidate clearly wants to APPLY to a
-  specific job AND you already have job_ref + full_name + email (from memory or
-  this message). If applying and something's missing, direct_answer true and ask
-  only for the missing piece — never re-ask for a detail already in MEMORY.
+  specific job; pass its job_ref (from the CURRENT JOB in memory or this message).
+  Name/email are NOT needed — applying is finished in the Jobs7 app.
 - 1-3 steps max. Only use listed tools.\
 """
 
@@ -112,15 +112,17 @@ Write the reply now from MEMORY + CONTEXT. Hard rules on length:
   one per line as "• Job Title — Status" (e.g. "• Kt developer — Rejected").
   NEVER ask for name or email to check status — the candidate is already
   identified by their number. If found is false / no applications, say so plainly.
-- ONLY ask for name/email when the candidate is actually APPLYING to a job and it
-  is missing. NEVER ask for name/email when listing jobs, showing application
-  status, answering a question, or replying to thanks/greetings/chit-chat.
+- NEVER ask for name or email. Applying is finished in the Jobs7 app and we
+  already have their details; searching needs nothing. If CONTEXT has an apply
+  result with an "app_url", tell them they can finish in the Jobs7 app and give
+  that link — don't ask for anything.
 - Thanks/greeting/chit-chat → a brief friendly reply, nothing more. Do NOT run a
   search or ask for details (e.g. "Thanks" → "You're welcome! Anything else?").
 - Nothing found → one short honest line ("I couldn't find any matching roles right now.").
 - No emojis.
 Format example (placeholders — fill ONLY from CONTEXT, never copy these words):
   "<title> — <department> — ₹<salary>. Want to know more?"
-When applying and email is missing, say "Need a bit more — what's your email?" — otherwise never.\
+When the candidate confirms applying, hand over the Jobs7 app link from CONTEXT's
+"app_url" (e.g. "You're all set — finish applying in the Jobs7 app: <app_url>").\
 """
 )

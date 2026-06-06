@@ -9,9 +9,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.agent.browse import build_job_list_text
 from app.agent.context import toon_context
 from app.agent.prompts import PROMPT_VERSIONS, RESPONDER_SYSTEM
 from app.agent.state import AgentState
+from app.chatbot import wa_format as wa
 from app.chatbot.validator import HallucinationValidator
 from app.core import conversation_log as conv
 from app.core.logging import get_logger
@@ -69,6 +71,23 @@ async def respond(
     if direct is not None:
         conv.note("respond", f"app-status {len(direct)} chars")
         return {"draft_response": direct, "used_llm": False}
+
+    # Apply confirmation: the candidate is identified and confirmed a real role,
+    # so submit_application returned the Jobs7 app link. Format it ourselves (the
+    # weak model otherwise asks for name/email or claims "no matching roles") and
+    # attach a tappable "Open in Jobs7" cta button. Grounded by construction.
+    apply = _apply_link_reply(results, state)
+    if apply is not None:
+        conv.note("respond", "apply-link (Jobs7 app)")
+        return apply
+
+    # Category browse: the candidate asked to see a whole category, so list every
+    # job deterministically. The LLM responder caps at ~3 lines and can't, so we
+    # format it ourselves and flag single_bubble so delivery doesn't truncate it.
+    listing = _job_listing_reply(results)
+    if listing is not None:
+        conv.note("respond", f"job-listing {len(listing)} chars")
+        return {"draft_response": listing, "used_llm": False, "single_bubble": True}
 
     parts: list[str] = []
     if memory_context:
@@ -175,6 +194,68 @@ def _application_status_reply(results: list[dict[str, Any]]) -> str | None:
         status = str(a.get("status") or "submitted").replace("_", " ").title()
         lines.append(f"• {title} — {status}")
     return "\n".join(lines)
+
+
+def _first_name(name: str | None) -> str:
+    return name.split()[0] if name else ""
+
+
+def _apply_link_reply(
+    results: list[dict[str, Any]], state: AgentState
+) -> dict[str, Any] | None:
+    """When the candidate confirmed applying to a real role, ``submit_application``
+    returns the Jobs7 app link. Build the hand-over reply deterministically: a
+    grounded text bubble (link inline, used as the web/fallback) plus a tappable
+    ``cta_url`` "Open in Jobs7" button for WhatsApp. Returns None when this turn
+    wasn't an apply confirmation, so other turns fall through to the LLM."""
+    res = next(
+        (r.get("result") for r in results if r.get("tool") == "submit_application"),
+        None,
+    )
+    if not isinstance(res, dict) or not res.get("apply_via_app"):
+        return None
+
+    title = res.get("job_title") or "this role"
+    url = res.get("app_url") or ""
+    name = _first_name((state.get("customer_facts") or {}).get("full_name"))
+    who = f", {name}" if name else ""
+    out: dict[str, Any] = {
+        "draft_response": (
+            f"You're all set to apply for the {title} role{who}! Finish in the "
+            f"Jobs7 app — we've got your details ready to carry over:\n{url}"
+        ),
+        "used_llm": False,
+        "single_bubble": True,
+    }
+    # Tappable button only for an https link (Meta rejects http/localhost). The
+    # text above keeps the link inline as the web reply + WhatsApp fallback.
+    if url.startswith("https://"):
+        out["whatsapp_interactive"] = wa.cta_url_message(
+            body=(
+                f"You're all set to apply for the {title} role{who}! Tap below to "
+                "open the Jobs7 app and finish — we've got your details ready."
+            ),
+            display_text="Open in Jobs7",
+            url=url,
+        )
+    return out
+
+
+def _job_listing_reply(results: list[dict[str, Any]]) -> str | None:
+    """When a category browse returned a sizable set of jobs, list them ALL as a
+    compact, grounded reply. Returns None for ordinary top-k searches (<= 5 hits),
+    which keep their natural LLM-written reply. Bullets (not '1.' numbering) so the
+    bubble splitter doesn't mistake the numbers for sentence boundaries."""
+    jobs = next(
+        (r.get("result") for r in results
+         if r.get("tool") == "search_jobs" and isinstance(r.get("result"), list)),
+        None,
+    )
+    if not jobs or len(jobs) <= 5:
+        return None
+
+    dept = next((j.get("department") for j in jobs if j.get("department")), None)
+    return build_job_list_text(jobs, dept)
 
 
 def _cached_grounding(state: AgentState) -> list[dict[str, Any]]:

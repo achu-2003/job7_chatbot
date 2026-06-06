@@ -57,6 +57,57 @@ async def test_application_status_is_reported_not_asked_for_identity():
     assert "email" not in out["draft_response"].lower()
 
 
+async def test_apply_confirmation_hands_over_jobs7_app_link():
+    # When submit_application returns the Jobs7 app link, the responder formats
+    # it deterministically (no LLM, never asks for email) and attaches a tappable
+    # cta_url button — with the link inline as the fallback text.
+    state = {
+        "inbound_text": "yes",
+        "working": {"tool_results": [{
+            "tool": "submit_application",
+            "result": {
+                "apply_via_app": True, "job_title": "Tester",
+                "app_url": "https://play.google.com/store/apps/details?id=com.jobs7",
+            },
+        }]},
+        "short_term": [], "cached_product": {},
+        "customer_facts": {"full_name": "Achuthan E"},
+    }
+    out = await respond(
+        state, llm=_CannedLLM("Need a bit more — what's your email?"),
+        validator=HallucinationValidator(), memory_context=None,
+    )
+    assert out["used_llm"] is False
+    assert out["single_bubble"] is True
+    assert "Tester" in out["draft_response"]
+    assert "Achuthan" in out["draft_response"]            # addressed by first name
+    assert "id=com.jobs7" in out["draft_response"]        # link inline (fallback)
+    assert "email" not in out["draft_response"].lower()   # never asks for email
+    cta = out["whatsapp_interactive"]["interactive"]
+    assert cta["type"] == "cta_url"
+    assert cta["action"]["parameters"]["display_text"] == "Open in Jobs7"
+    assert cta["action"]["parameters"]["url"].endswith("id=com.jobs7")
+
+
+async def test_apply_link_http_has_no_cta_button():
+    # A non-https app URL can't be a Meta cta button — link stays inline only.
+    state = {
+        "inbound_text": "apply",
+        "working": {"tool_results": [{
+            "tool": "submit_application",
+            "result": {"apply_via_app": True, "job_title": "QA Engineer",
+                       "app_url": "http://localhost/app"},
+        }]},
+        "short_term": [], "cached_product": {}, "customer_facts": {},
+    }
+    out = await respond(
+        state, llm=_CannedLLM("x"),
+        validator=HallucinationValidator(), memory_context=None,
+    )
+    assert out.get("whatsapp_interactive") is None
+    assert "http://localhost/app" in out["draft_response"]
+
+
 async def test_no_applications_gives_friendly_line():
     state = {
         "inbound_text": "my applications",
@@ -99,6 +150,46 @@ async def test_job_refs_grounded_by_search_jobs_pass():
     )
     assert out["draft_response"] != _SAFE_FALLBACK
     assert "JOB-AB1001" in out["draft_response"]
+
+
+async def test_category_browse_lists_every_job_deterministically():
+    # A sizable result set (a category browse) is listed in full, bypassing the
+    # LLM, and flagged for single-bubble delivery so nothing gets truncated.
+    jobs = [
+        {"job_ref": f"role-{i}", "title": f"Sales Exec {i}",
+         "location": "Chennai", "department": "Sales & Marketing"}
+        for i in range(15)
+    ]
+    state = {
+        "inbound_text": "Sales & Marketing",
+        "working": {"tool_results": [{"tool": "search_jobs", "result": jobs}]},
+        "short_term": [], "cached_product": {},
+    }
+    out = await respond(
+        state, llm=_CannedLLM("(should not be called)"),
+        validator=HallucinationValidator(), memory_context=None,
+    )
+    assert out["used_llm"] is False
+    assert out["single_bubble"] is True
+    assert "all 15 Sales & Marketing roles" in out["draft_response"]
+    for i in range(15):                                   # every job present, not truncated
+        assert f"Sales Exec {i}" in out["draft_response"]
+
+
+async def test_small_search_keeps_llm_reply():
+    # <= 5 hits is an ordinary search → the natural LLM reply, NOT the list format.
+    jobs = [{"job_ref": "JOB-1", "title": "Python Dev", "location": "Pune"}]
+    state = {
+        "inbound_text": "python jobs",
+        "working": {"tool_results": [{"tool": "search_jobs", "result": jobs}]},
+        "short_term": [], "cached_product": {},
+    }
+    out = await respond(
+        state, llm=_CannedLLM("Found a Python Dev role in Pune (JOB-1)!"),
+        validator=HallucinationValidator(), memory_context=None,
+    )
+    assert out["used_llm"] is True
+    assert not out.get("single_bubble")
 
 
 def test_short_reply_unchanged():

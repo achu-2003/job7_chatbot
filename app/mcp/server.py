@@ -65,20 +65,16 @@ async def submit_application(
     job_ref: str,
     tenant_id: str,
     phone: str,
-    full_name: str,
-    email: str,
-    years_experience: float | None = None,
-    cover_note: str | None = None,
 ) -> dict[str, Any]:
-    """Submit a candidate's application to a job (idempotent)."""
+    """Hand an identified candidate the Jobs7 app link to finish applying.
+
+    Applying is completed in the Jobs7 mobile app, so this confirms the role is
+    real and returns the app link — name/email aren't needed (already on file).
+    """
     return await submit_application_core(
         tenant_id=tenant_id,
         phone=phone,
         job_ref=job_ref,
-        full_name=full_name,
-        email=email,
-        years_experience=years_experience,
-        cover_note=cover_note,
     )
 
 
