@@ -225,6 +225,15 @@ async def list_category_jobs_core(
     return {"category": category, "jobs": [_compact_job(r) for r in rows]}
 
 
+async def get_job_core(*, tenant_id: str, ref: str) -> dict[str, Any] | None:
+    """Resolve a job reference (slug) to its compact row, or None. Used by the
+    interactive browse flow to hydrate a tapped role/card for its details."""
+    if not ref:
+        return None
+    row = await JobRepository.get_by_ref(ref, tenant_id=tenant_id)
+    return _compact_job(row) if row else None
+
+
 async def search_jobs_core(
     vector: VectorStore,
     *,

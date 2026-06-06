@@ -28,7 +28,7 @@ from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
 
-from app.agent.browse import build_job_list_text
+from app.agent import jobflow
 from app.agent.context import is_followup
 from app.agent.identity import extract_name, is_plausible_name
 from app.agent.nodes.humanizer import build_delivery_plan
@@ -51,6 +51,7 @@ from app.core.tenancy import get_current_tenant_id
 from app.llm.client import LLMClient
 from app.mcp.tools import (
     ToolRegistry,
+    get_job_core,
     list_category_jobs_core,
     list_jobs_overview_core,
     recommend_jobs_core,
@@ -195,6 +196,7 @@ class AgentRuntime:
         self._category_browse = list_category_jobs_core
         self._jobs_overview = list_jobs_overview_core
         self._recommend = recommend_jobs_core
+        self._job_lookup = get_job_core
         self._graph = self._build_graph()
 
     # ---- nodes (bound coroutine methods) ----------------------------
@@ -206,31 +208,155 @@ class AgentRuntime:
         return await summarize_if_needed(state, gateway=self.gateway, llm=self.llm)
 
     async def _browse(self, state: AgentState) -> dict[str, Any]:
-        """Deterministic category browse. If the message clearly names a known
-        category, list EVERY job in it from SQL (not the LLM, which abbreviates
-        the name and fuzzy-searches the wrong roles) and deliver it whole. Skipped
-        on application/status turns so 'I applied for a sales job' isn't hijacked.
-        Returns ``{}`` to fall through to the normal planner when it's not a browse.
+        """The tappable job-browse state machine (deterministic, 0-LLM):
+
+            category tapped/typed → list its roles (paged 10 at a time)
+            "More roles" tapped   → next page
+            a role tapped         → ask preferred location (tappable list)
+            a location tapped     → matching job cards (Apply / Save / Share)
+            an Apply/Save/Share tap → record + confirm
+
+        Selection rides on the interactive ``button_id`` (so it survives WhatsApp's
+        24-char title truncation); typed text is the web/fallback path. Anything
+        that isn't a browse step returns ``{}`` to fall through to the planner.
         """
         text = state.get("inbound_text", "") or ""
+        prefix, rest = jobflow.split_id(state.get("button_id"))
+
+        if prefix in {"apply", "save", "share"}:
+            return await self._job_action(state, prefix, rest)
+        if prefix == "view":
+            return await self._browse_one(state, rest)
+        if prefix == "job":
+            return await self._browse_role(state, rest)
+        if prefix == "more":
+            category, _, off = rest.rpartition(":")
+            try:
+                offset = int(off)
+            except ValueError:
+                offset = 0
+            return await self._browse_category(state, category or rest, offset=offset)
+        if prefix == "category":
+            return await self._browse_category(state, rest, offset=0)
+
+        # Typed path: an application/status turn must not be hijacked into browse.
         if _ORDER_HINT_RX.search(text):
             return {}
+        return await self._browse_category(state, text, offset=0)
+
+    async def _category_jobs(self, state: AgentState, category: str) -> tuple[str, list[dict[str, Any]]]:
+        """Resolve a category phrase to (exact name, all its jobs), or ('', [])."""
         try:
-            res = await self._category_browse(tenant_id=state["tenant_id"], text=text)
+            res = await self._category_browse(tenant_id=state["tenant_id"], text=category)
         except Exception as exc:  # noqa: BLE001 — a browse miss must never break the turn
             log.warning("category_browse_failed", error=str(exc)[:200])
-            return {}
+            return "", []
         if not res or not res.get("jobs"):
-            return {}
-        jobs = res["jobs"]
+            return "", []
+        return res.get("category") or category, res["jobs"]
+
+    async def _browse_category(
+        self, state: AgentState, category_text: str, *, offset: int
+    ) -> dict[str, Any]:
+        """Show the tappable role list for a category (page ``offset``)."""
+        category, jobs = await self._category_jobs(state, category_text)
+        if not jobs:
+            return {}  # not a known category → fall through to the planner
+        payload, fallback = jobflow.role_list_message(jobs, category=category, offset=offset)
+        await self._save_browse(state, {"stage": "roles", "category": category, "offset": offset})
         return {
-            "draft_response": build_job_list_text(jobs, res["category"]),
-            "single_bubble": True,
-            "used_llm": False,
-            "did_browse": True,
-            "catalog_hits": jobs,
-            "intent": "browse",
+            "intent": "browse", "did_browse": True, "used_llm": False, "single_bubble": True,
+            "draft_response": fallback, "whatsapp_interactive": payload, "catalog_hits": jobs,
         }
+
+    async def _browse_role(self, state: AgentState, ref: str) -> dict[str, Any]:
+        """A role was tapped → show the detail cards (emoji + Apply/Save/Share)
+        for EVERY open posting of that role, across all locations. e.g. tapping
+        'Backend Developer' when 3 are open shows all 3 cards."""
+        st = await self._load_browse(state)
+        category = st.get("category")
+        jobs = (await self._category_jobs(state, category))[1] if category else []
+
+        role = next((j for j in jobs if jobflow.job_ref(j) == ref), None)
+        if role is None:                       # tapped from recommendations / stale list
+            role = await self._job_lookup(tenant_id=state["tenant_id"], ref=ref)
+            if role and role.get("department") and not jobs:
+                category, jobs = await self._category_jobs(state, role["department"])
+        if role is None:
+            return {}                          # unknown ref → fall through
+
+        title = role.get("title") or "this role"
+        matches = [j for j in jobs if jobflow.same_role_family(title, j.get("title"))]
+        if not matches:
+            matches = [role]
+
+        cards, text = jobflow.job_cards(matches, limit=8)
+        plural = "opening" if len(matches) == 1 else "openings"
+        header = f"{len(matches)} {title} {plural}:"
+        await self._save_browse(state, {"stage": "results", "category": category, "role_title": title})
+        return {
+            "intent": "browse", "did_browse": True, "used_llm": False, "single_bubble": True,
+            "draft_response": f"{header}\n\n{text}", "whatsapp_messages": cards,
+            "catalog_hits": matches,
+        }
+
+    async def _browse_one(self, state: AgentState, ref: str) -> dict[str, Any]:
+        """Show the details of ONE specific job (e.g. a tapped recommended role)
+        as a single card with Apply/Save/Share."""
+        try:
+            job = await self._job_lookup(tenant_id=state["tenant_id"], ref=ref)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("job_lookup_failed", error=str(exc)[:200])
+            job = None
+        if not job:
+            return {}  # unknown ref → fall through to the planner
+        cards, text = jobflow.job_cards([job], limit=1)
+        return {
+            "intent": "browse", "did_browse": True, "used_llm": False, "single_bubble": True,
+            "draft_response": text, "whatsapp_messages": cards, "catalog_hits": [job],
+        }
+
+    async def _job_action(self, state: AgentState, action: str, ref: str) -> dict[str, Any]:
+        """Handle an Apply / Save / Share tap on a job card."""
+        job = await self._job_lookup(tenant_id=state["tenant_id"], ref=ref)
+        title = (job or {}).get("title") or "that role"
+        kw = {"tenant_id": state["tenant_id"], "conversation_id": state["conversation_id"]}
+        if action == "save":
+            await self._safe_store(self.gateway.save_job, ref=ref, job=job or {"job_ref": ref}, **kw)
+            msg = f"Saved {title} to your list. Tap Apply on it whenever you're ready."
+        elif action == "apply":
+            await self._safe_store(self.gateway.record_interest, ref=ref, job=job or {"job_ref": ref}, **kw)
+            msg = (
+                f"Great — I've noted your interest in {title}. "
+                "Our team will reach out about the next steps."
+            )
+        else:  # share
+            msg = jobflow.share_text(job) if job else f"Job reference: {ref}"
+        return {"intent": "browse", "did_browse": True, "used_llm": False, "draft_response": msg}
+
+    @staticmethod
+    async def _safe_store(fn, **kw) -> None:
+        try:
+            await fn(**kw)
+        except Exception as exc:  # noqa: BLE001 — a Redis hiccup must not 500 the tap
+            log.warning("job_action_store_failed", error=str(exc)[:200])
+
+    async def _load_browse(self, state: AgentState) -> dict[str, Any]:
+        try:
+            return await self.gateway.browse_state(
+                tenant_id=state["tenant_id"], conversation_id=state["conversation_id"]
+            ) or {}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("browse_state_load_failed", error=str(exc)[:200])
+            return {}
+
+    async def _save_browse(self, state: AgentState, data: dict[str, Any]) -> None:
+        try:
+            await self.gateway.set_browse_state(
+                tenant_id=state["tenant_id"], conversation_id=state["conversation_id"], state=data
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("browse_state_save_failed", error=str(exc)[:200])
 
     def _route_after_browse(self, state: AgentState) -> Literal["humanize", "summarize"]:
         """A matched category browse goes straight to delivery; otherwise continue
@@ -321,12 +447,12 @@ class AgentRuntime:
                     "role or area you're interested in and I'll pull some up."
                 ),
             }
-        who = f", {first}" if first else ""
-        header = f"Based on your profile{who}, here are some roles you might like:"
+        payload, fallback = jobflow.recommend_list_message(jobs, name=first)
         return {
             "intent": "menu", "did_menu": True, "used_llm": False, "single_bubble": True,
             "catalog_hits": jobs,
-            "draft_response": build_job_list_text(jobs, header=header),
+            "draft_response": fallback,
+            "whatsapp_interactive": payload,
         }
 
     async def _profile_pref(self, state: AgentState) -> tuple[str | None, str | None]:
@@ -760,6 +886,7 @@ class AgentRuntime:
         customer_external_id: str | None,
         channel: str,
         tenant_id: str | None = None,
+        interactive_id: str | None = None,
     ) -> dict[str, Any]:
         tid = tenant_id or get_current_tenant_id()
         conv_id = conversation_id or f"conv_{uuid.uuid4().hex[:12]}"
@@ -768,7 +895,9 @@ class AgentRuntime:
             "conversation_id": conv_id,
             "customer_id": customer_external_id or "",
             "inbound_text": customer_query,
-            "inbound_kind": "text",
+            "inbound_kind": "button" if interactive_id else "text",
+            # structured id of a tapped row/button (job:<ref>, loc:<x>, apply:<ref>…)
+            "button_id": interactive_id,
             "request_id": request_id,
             "received_at": time.time(),
             # reasoning-loop budget (Phase 0 Budget semantics, tracked on state)
@@ -800,6 +929,9 @@ class AgentRuntime:
             # interactive payload (e.g. onboarding cta_url button) — route sends
             # this instead of the text bubbles when present
             "whatsapp_interactive": final.get("whatsapp_interactive"),
+            # a sequence of interactive cards (one per matching job) — route sends
+            # each in turn; takes priority over whatsapp_interactive + bubbles
+            "whatsapp_messages": final.get("whatsapp_messages"),
             "session_id": final.get("session_id"),
             "session_status": final.get("session_status"),
             "used_llm": final.get("used_llm", True),

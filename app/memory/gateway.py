@@ -155,6 +155,39 @@ class MemoryGateway:
             conversation_id, product_id, doc, tenant_id=tenant_id,
         )
 
+    # ---- job-browse flow (category → role → location) ---------------
+
+    async def browse_state(
+        self, *, tenant_id: str, conversation_id: str
+    ) -> dict[str, Any] | None:
+        """Where the candidate is in the tappable job-browse flow, or None."""
+        return await self.short_term.get_browse_state(
+            conversation_id, tenant_id=tenant_id
+        )
+
+    async def set_browse_state(
+        self, *, tenant_id: str, conversation_id: str, state: dict[str, Any]
+    ) -> None:
+        await self.short_term.set_browse_state(
+            conversation_id, state, tenant_id=tenant_id
+        )
+
+    async def save_job(
+        self, *, tenant_id: str, conversation_id: str, ref: str, job: dict[str, Any]
+    ) -> None:
+        """Add a job to the candidate's saved list (Redis only)."""
+        await self.short_term.save_job(
+            conversation_id, ref, job, tenant_id=tenant_id
+        )
+
+    async def record_interest(
+        self, *, tenant_id: str, conversation_id: str, ref: str, job: dict[str, Any]
+    ) -> None:
+        """Record an Apply tap as interest (Redis only — a recruiter follows up)."""
+        await self.short_term.record_interest(
+            conversation_id, ref, job, tenant_id=tenant_id
+        )
+
     async def reset_session(
         self, *, tenant_id: str, conversation_id: str
     ) -> None:

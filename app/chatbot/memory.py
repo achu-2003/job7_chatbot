@@ -67,6 +67,18 @@ class ConversationMemory:
         tid = tenant_id or get_current_tenant_id()
         return f"t:{tid}:conv:{conv_id}:last_product"
 
+    def _browse_key(self, conv_id: str, *, tenant_id: str | None = None) -> str:
+        tid = tenant_id or get_current_tenant_id()
+        return f"t:{tid}:conv:{conv_id}:browse"
+
+    def _saved_key(self, conv_id: str, *, tenant_id: str | None = None) -> str:
+        tid = tenant_id or get_current_tenant_id()
+        return f"t:{tid}:conv:{conv_id}:saved"
+
+    def _applied_key(self, conv_id: str, *, tenant_id: str | None = None) -> str:
+        tid = tenant_id or get_current_tenant_id()
+        return f"t:{tid}:conv:{conv_id}:applied"
+
     # ------------------------------------------------------------------
     # history
     # ------------------------------------------------------------------
@@ -110,12 +122,15 @@ class ConversationMemory:
         *,
         tenant_id: str | None = None,
     ) -> None:
-        """Clear this conversation's short-term history AND pinned product. Both
-        keys are tenant+conversation scoped, so only this one customer is reset."""
+        """Clear this conversation's short-term history, pinned product AND the
+        in-progress job-browse selection. All keys are tenant+conversation
+        scoped, so only this one customer is reset. (Saved/applied jobs are kept
+        on purpose — they're the candidate's durable list.)"""
         assert self._redis is not None
         await self._redis.delete(
             self._key(conv_id, tenant_id=tenant_id),
             self._last_product_key(conv_id, tenant_id=tenant_id),
+            self._browse_key(conv_id, tenant_id=tenant_id),
         )
 
     # ------------------------------------------------------------------
@@ -150,6 +165,64 @@ class ConversationMemory:
             return json.loads(raw)
         except json.JSONDecodeError:
             return None
+
+    # ------------------------------------------------------------------
+    # job-browse state (the multi-step category → role → location flow)
+    # ------------------------------------------------------------------
+
+    async def set_browse_state(
+        self, conv_id: str, state: dict[str, Any], *, tenant_id: str | None = None
+    ) -> None:
+        """Remember where the candidate is in the tappable job-browse flow
+        (selected category/role, page offset). TTL-bounded like the rest of the
+        conversation's short-term memory."""
+        assert self._redis is not None
+        await self._redis.setex(
+            self._browse_key(conv_id, tenant_id=tenant_id), self._ttl, json.dumps(state)
+        )
+
+    async def get_browse_state(
+        self, conv_id: str, *, tenant_id: str | None = None
+    ) -> dict[str, Any] | None:
+        assert self._redis is not None
+        raw = await self._redis.get(self._browse_key(conv_id, tenant_id=tenant_id))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    # ------------------------------------------------------------------
+    # saved jobs / applied-interest (the candidate's durable lists, Redis only)
+    # ------------------------------------------------------------------
+
+    async def _add_to_set(
+        self, key: str, ref: str, job: dict[str, Any], *, ttl_days: int = 90
+    ) -> None:
+        assert self._redis is not None
+        async with self._redis.pipeline(transaction=True) as pipe:
+            pipe.hset(key, ref, json.dumps(job, default=str))
+            pipe.expire(key, ttl_days * 86400)
+            await pipe.execute()
+
+    async def save_job(
+        self, conv_id: str, ref: str, job: dict[str, Any], *, tenant_id: str | None = None
+    ) -> None:
+        """Add a job to the candidate's saved list (keyed by its reference, so
+        re-saving is idempotent)."""
+        await self._add_to_set(
+            self._saved_key(conv_id, tenant_id=tenant_id), ref, job
+        )
+
+    async def record_interest(
+        self, conv_id: str, ref: str, job: dict[str, Any], *, tenant_id: str | None = None
+    ) -> None:
+        """Record that the candidate tapped Apply on a job. No business-DB write —
+        a recruiter follows up — so we just keep the interest in Redis."""
+        await self._add_to_set(
+            self._applied_key(conv_id, tenant_id=tenant_id), ref, job
+        )
 
     # ------------------------------------------------------------------
     # live feed (recent turns for the monitor UI) — per tenant

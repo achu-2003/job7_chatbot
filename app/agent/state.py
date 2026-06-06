@@ -52,6 +52,7 @@ class AgentState(TypedDict, total=False):
     request_id: str
     inbound_text: str
     inbound_kind: str           # text | button | list | image
+    button_id: str | None       # structured id of a tapped list row / button (e.g. "job:<ref>")
     received_at: float
 
     # ---- memory (hydrated by load_context) ----
@@ -96,6 +97,10 @@ class AgentState(TypedDict, total=False):
     # cta_url "Open form" button). When set, the WhatsApp route sends THIS instead
     # of the text bubbles; the bubbles (draft_response) remain the web/fallback.
     whatsapp_interactive: dict[str, Any] | None
+    # A SEQUENCE of interactive payloads sent one after another (e.g. one
+    # Apply/Save/Share card per matching job). Takes priority over the single
+    # whatsapp_interactive + text bubbles when present.
+    whatsapp_messages: list[dict[str, Any]] | None
     used_llm: bool
     latency_ms: int
     # the product shown this turn, pinned as the "current product" for next turn

@@ -139,6 +139,19 @@ def cta_url_message(
     return {"type": "interactive", "interactive": interactive}
 
 
+def interactive_fallback_text(payload: dict[str, Any]) -> str:
+    """Plain-text fallback for an interactive payload (used when Meta rejects it,
+    e.g. cta_url/list not enabled). Returns the body text; for a cta_url button it
+    appends the URL so the link isn't lost."""
+    interactive = (payload or {}).get("interactive") or {}
+    body = ((interactive.get("body") or {}).get("text") or "").strip()
+    if interactive.get("type") == "cta_url":
+        url = ((interactive.get("action") or {}).get("parameters") or {}).get("url")
+        if url:
+            body = f"{body}\n{url}".strip()
+    return body
+
+
 def first_image_url(row: dict[str, Any]) -> str | None:
     """Best-effort extract of a usable https product image URL.
 

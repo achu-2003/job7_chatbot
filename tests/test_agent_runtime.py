@@ -47,6 +47,8 @@ def _stub_memory(
     browse: dict | None = None,
     overview: dict | None = None,
     recommend: list | None = None,
+    browse_state: dict | None = None,
+    job_lookup: dict | None = None,
 ) -> None:
     # Default to a fully-onboarded sender so the identity gate is a no-op and the
     # reasoning tests below exercise the normal path. Onboarding tests pass
@@ -98,6 +100,24 @@ def _stub_memory(
     async def fake_recommend(*a, **kw):
         return recommend or []
 
+    saved_calls: list = []
+    applied_calls: list = []
+
+    async def fake_browse_state(**kw):
+        return browse_state
+
+    async def fake_set_browse_state(**kw):
+        return None
+
+    async def fake_save_job(**kw):
+        saved_calls.append(kw)
+
+    async def fake_record_interest(**kw):
+        applied_calls.append(kw)
+
+    async def fake_job_lookup(**kw):
+        return job_lookup
+
     rt.gateway.load = fake_load            # type: ignore[assignment]
     rt.gateway.persist = fake_persist      # type: ignore[assignment]
     rt.gateway.set_focus_product = fake_set_focus  # type: ignore[assignment]
@@ -105,16 +125,25 @@ def _stub_memory(
     rt.gateway.onboarding = fake_onboarding          # type: ignore[assignment]
     rt.gateway.onboarding_token = fake_onboarding_token  # type: ignore[assignment]
     rt.gateway.mark_onboarding_welcomed = fake_mark_welcomed  # type: ignore[assignment]
+    rt.gateway.browse_state = fake_browse_state       # type: ignore[assignment]
+    rt.gateway.set_browse_state = fake_set_browse_state  # type: ignore[assignment]
+    rt.gateway.save_job = fake_save_job               # type: ignore[assignment]
+    rt.gateway.record_interest = fake_record_interest  # type: ignore[assignment]
     rt._candidate_lookup = fake_lookup     # type: ignore[assignment]
     rt._category_browse = fake_browse      # type: ignore[assignment]
     rt._jobs_overview = fake_overview      # type: ignore[assignment]
     rt._recommend = fake_recommend         # type: ignore[assignment]
+    rt._job_lookup = fake_job_lookup       # type: ignore[assignment]
+    # expose action-call logs for assertions
+    rt._test_saved = saved_calls           # type: ignore[attr-defined]
+    rt._test_applied = applied_calls       # type: ignore[attr-defined]
 
 
-async def _handle(rt: AgentRuntime, message: str = "i need a saree"):
+async def _handle(rt: AgentRuntime, message: str = "i need a saree", *, interactive_id: str | None = None):
     return await rt.handle(
         request_id="r1", conversation_id="wa_91", customer_query=message,
         customer_external_id="91", channel="whatsapp", tenant_id="t",
+        interactive_id=interactive_id,
     )
 
 
@@ -362,7 +391,8 @@ async def test_job_search_button_shows_category_list():
 
 
 async def test_recommended_jobs_button_lists_profile_matches():
-    """Tapping 'Recommended Jobs' lists profile-matched roles deterministically."""
+    """Tapping 'Recommended Jobs' returns a TAPPABLE list of profile-matched roles
+    (each row id = view:<ref>, so a tap shows that one job) — deterministically."""
     rt = _runtime()
     _stub_memory(
         rt, facts={"full_name": "Achuthan E"},
@@ -371,10 +401,32 @@ async def test_recommended_jobs_button_lists_profile_matches():
     )
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "Recommended Jobs")
-    assert "Based on your profile" in out["response"]
+    interactive = out["whatsapp_interactive"]["interactive"]
+    assert interactive["type"] == "list"
+    ids = [r["id"] for r in interactive["action"]["sections"][0]["rows"]]
+    assert ids == ["view:r1", "view:r2"]
+    assert "Based on your profile" in out["response"]            # text fallback
     assert "Achuthan" in out["response"]
     assert "QA Engineer" in out["response"] and "Tester" in out["response"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
+
+
+async def test_tap_recommended_job_shows_single_card():
+    """Tapping a recommended role shows THAT specific job's card (one card with
+    Apply/Save/Share) — not the whole role family."""
+    rt = _runtime()
+    _stub_memory(rt, job_lookup={
+        "job_ref": "r1", "title": "QA Engineer", "location": "Chennai",
+        "salary_min": 25000, "salary_max": 40000, "employment_type": "full_time"})
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "QA Engineer", interactive_id="view:r1")
+    cards = out["whatsapp_messages"]
+    assert len(cards) == 1
+    ids = [b["reply"]["id"] for b in cards[0]["interactive"]["action"]["buttons"]]
+    assert ids == ["apply:r1", "save:r1", "share:r1"]
+    assert "QA Engineer" in out["response"]
+    assert "₹25,000–40,000/month" in out["response"]
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
 async def test_application_status_button_falls_through_to_pipeline():
@@ -398,18 +450,25 @@ async def test_application_status_button_falls_through_to_pipeline():
     assert rt.llm.json_calls == ["agent_plan"]              # went through the planner
 
 
-async def test_category_browse_short_circuits_to_full_listing():
-    """A message that names a category lists every job in it deterministically —
-    no planner, no LLM — and is flagged for single-bubble delivery."""
+async def test_category_browse_shows_tappable_role_list():
+    """A message that names a category returns a TAPPABLE role list (paged 10 at
+    a time) — deterministically, no planner, no LLM. With 18 roles the first page
+    shows 9 + a 'More roles' pager row."""
     rt = _runtime()
     jobs = [{"job_ref": f"r{i}", "title": f"IT Role {i}", "location": "Chennai"}
             for i in range(18)]
     _stub_memory(rt, browse={"category": "Information Technology", "jobs": jobs})
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "show the IT jobs")
-    assert "all 18 Information Technology roles" in out["response"]
-    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
-    assert len(out["delivery_plan"]) == 1                         # one bubble, not truncated
+    interactive = out["whatsapp_interactive"]["interactive"]
+    assert interactive["type"] == "list"
+    rows = interactive["action"]["sections"][0]["rows"]
+    assert len(rows) == 10                       # 9 roles + "More roles"
+    assert rows[0]["id"] == "job:r0"
+    assert rows[-1]["id"] == "more:Information Technology:9"
+    assert "18 Information Technology roles" in out["response"]    # text fallback
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
+    assert len(out["delivery_plan"]) == 1                          # single bubble
 
 
 async def test_non_category_message_falls_through_to_agent():
@@ -496,3 +555,96 @@ async def test_replan_is_bounded_by_budget():
     # capped at agent_max_loops — never spins
     assert rt.llm.json_calls.count("agent_plan") == get_settings().agent_max_loops
     assert rt.llm.chat_calls == ["agent_respond"]
+
+
+# ---- interactive job-browse flow (category → role → location → cards) -------
+
+_FLOW_JOBS = [
+    {"job_ref": "r1", "title": "Python Developer", "location": "Chennai",
+     "salary_min": 1_000_000, "salary_max": 1_000_000, "employment_type": "full_time"},
+    {"job_ref": "r2", "title": "Python Developer", "location": "Bengaluru",
+     "salary_min": 1_200_000, "salary_max": 1_500_000, "employment_type": "full_time"},
+    {"job_ref": "r3", "title": "QA Engineer", "location": "Remote (India)",
+     "salary_min": 800_000, "salary_max": 800_000, "employment_type": "full_time"},
+]
+
+
+async def test_tap_category_lists_roles_as_buttons():
+    """Tapping a category row (structured id) returns a tappable role list."""
+    rt = _runtime()
+    _stub_memory(rt, browse={"category": "Information Technology", "jobs": _FLOW_JOBS})
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Information Technology", interactive_id="category:Information Technology")
+    interactive = out["whatsapp_interactive"]["interactive"]
+    assert interactive["type"] == "list"
+    ids = [r["id"] for r in interactive["action"]["sections"][0]["rows"]]
+    assert ids == ["job:r1", "job:r2", "job:r3"]
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
+
+
+async def test_tap_role_shows_job_cards_directly():
+    """Tapping a role goes STRAIGHT to the detail cards (no location step) — all
+    postings of that role, each with Apply/Save/Share."""
+    rt = _runtime()
+    _stub_memory(
+        rt,
+        browse={"category": "Information Technology", "jobs": _FLOW_JOBS},
+        browse_state={"stage": "roles", "category": "Information Technology"},
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Python Developer", interactive_id="job:r1")
+    assert out.get("whatsapp_interactive") is None               # no location list
+    cards = out["whatsapp_messages"]
+    assert len(cards) == 2                                        # both Python Developer postings
+    ids = [b["reply"]["id"] for b in cards[0]["interactive"]["action"]["buttons"]]
+    assert ids == ["apply:r1", "save:r1", "share:r1"]
+    assert "Python Developer openings" in out["response"]
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
+
+
+async def test_tap_role_shows_all_matching_openings():
+    """A role with 3 open postings → 3 cards (the user's 'backend developer' case);
+    other roles in the category are NOT mixed in."""
+    jobs = [
+        {"job_ref": "b1", "title": "Backend Developer", "location": "Chennai",
+         "salary_min": 30000, "salary_max": 60000, "employment_type": "full_time"},
+        {"job_ref": "b2", "title": "Senior Backend Developer", "location": "Bengaluru"},
+        {"job_ref": "b3", "title": "Backend Developer", "location": "Remote (India)"},
+        {"job_ref": "f1", "title": "Frontend Developer", "location": "Chennai"},
+        {"job_ref": "q1", "title": "QA Engineer", "location": "Pune"},
+    ]
+    rt = _runtime()
+    _stub_memory(
+        rt,
+        browse={"category": "Information Technology", "jobs": jobs},
+        browse_state={"stage": "roles", "category": "Information Technology"},
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Backend Developer", interactive_id="job:b1")
+    assert len(out["whatsapp_messages"]) == 3                     # 3 backend roles, not frontend/QA
+    assert "3 Backend Developer openings" in out["response"]
+    assert "₹30,000–60,000/month" in out["response"]             # monthly salary, not LPA
+
+
+async def test_tap_apply_records_interest():
+    """Apply records the candidate's interest in Redis and confirms — no LLM."""
+    rt = _runtime()
+    _stub_memory(rt, job_lookup={"job_ref": "r1", "title": "Python Developer",
+                                 "location": "Chennai"})
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Apply", interactive_id="apply:r1")
+    assert rt._test_applied and rt._test_applied[0]["ref"] == "r1"   # type: ignore[attr-defined]
+    assert "Python Developer" in out["response"]
+    assert "interest" in out["response"].lower()
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
+
+
+async def test_tap_save_adds_to_saved_list():
+    """Save adds the job to the saved list and confirms."""
+    rt = _runtime()
+    _stub_memory(rt, job_lookup={"job_ref": "r2", "title": "Python Developer",
+                                 "location": "Bengaluru"})
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Save", interactive_id="save:r2")
+    assert rt._test_saved and rt._test_saved[0]["ref"] == "r2"       # type: ignore[attr-defined]
+    assert "saved" in out["response"].lower()

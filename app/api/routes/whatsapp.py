@@ -142,6 +142,7 @@ async def receive_webhook(
         customer_query=incoming_text,
         customer_external_id=customer_number,
         channel="whatsapp",
+        interactive_id=message.get("id"),
     )
     bot_reply: str = (
         result.get("response")
@@ -152,12 +153,25 @@ async def receive_webhook(
     # Production AgentRuntime path: paced, human-like multi-bubble delivery.
     delivery_plan = result.get("delivery_plan")
     if delivery_plan:
-        # An interactive payload (e.g. the onboarding cta_url "Open form" button)
-        # takes priority over the text bubbles. If Meta rejects it (cta_url not
-        # enabled / non-https URL), fall back to the bubbles — whose text carries
-        # the same link inline, so the candidate never loses it.
+        # A SEQUENCE of interactive messages (one Apply/Save/Share card per job)
+        # is sent one after another, each with its own text fallback if rejected.
+        messages = result.get("whatsapp_messages")
+        # A single interactive payload (e.g. the onboarding cta_url "Open form"
+        # button, or the category/role list) takes priority over the text bubbles.
+        # If Meta rejects it (cta_url/list not enabled / non-https URL), fall back
+        # to the bubbles — whose text carries the same content, so nothing is lost.
         interactive = result.get("whatsapp_interactive")
-        if interactive:
+        if messages:
+            sent = 0
+            for m in messages:
+                st = await _post_whatsapp_message(settings, customer_number, m)
+                if st not in (200, 201):
+                    fb = wa.interactive_fallback_text(m)
+                    if fb:
+                        await _post_whatsapp_message(settings, customer_number, wa.text_message(fb))
+                sent += 1
+            conv.note("reply to", f"{customer_number} ({sent} card(s))")
+        elif interactive:
             status = await _post_whatsapp_message(settings, customer_number, interactive)
             if status in (200, 201):
                 sent = 1
@@ -407,6 +421,7 @@ def _extract_text_message(payload: dict[str, Any]) -> dict[str, str] | None:
     sender = msg.get("from")
     mtype = msg.get("type")
     body: str | None = None
+    reply_id: str | None = None
 
     if mtype == "text":
         body = (msg.get("text") or {}).get("body", "")
@@ -414,14 +429,21 @@ def _extract_text_message(payload: dict[str, Any]) -> dict[str, str] | None:
         interactive = msg.get("interactive") or {}
         itype = interactive.get("type")
         if itype == "button_reply":
-            body = (interactive.get("button_reply") or {}).get("title", "")
+            reply = interactive.get("button_reply") or {}
+            body = reply.get("title", "")
+            reply_id = reply.get("id")
         elif itype == "list_reply":
-            body = (interactive.get("list_reply") or {}).get("title", "")
+            reply = interactive.get("list_reply") or {}
+            body = reply.get("title", "")
+            reply_id = reply.get("id")
 
     body = (body or "").strip()
     if not body or not sender:
         return None
-    return {"from": str(sender), "text": body}
+    # ``id`` carries the STRUCTURED selection (e.g. "job:<ref>", "loc:Chennai")
+    # which survives WhatsApp's 24-char title truncation — the job-browse flow
+    # keys off it. None for typed text.
+    return {"from": str(sender), "text": body, "id": reply_id}
 
 
 def _extract_image_message(payload: dict[str, Any]) -> dict[str, str] | None:
