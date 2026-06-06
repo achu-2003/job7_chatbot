@@ -143,13 +143,10 @@ def _onboard_form_cta_body(name: str | None) -> str:
 
 
 def _onboard_success(name: str | None) -> str:
-    """One-time confirmation shown the first time a candidate messages after
-    submitting the onboarding form."""
-    who = f", {_first_name(name)}" if name else ""
-    return (
-        f"You're all set{who}! Your profile is complete. "
-        "What kind of role are you looking for?"
-    )
+    """One-time welcome shown the first time a candidate messages after submitting
+    the onboarding form (carries the quick-reply menu, set in _onboarding_response)."""
+    who = f" {_first_name(name)}" if name else ""
+    return f"Welcome back{who}! What are you looking for today?"
 
 
 def _trim_result(res: Any) -> Any:

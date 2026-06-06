@@ -28,3 +28,14 @@ def test_success_and_expired_pages_render():
     assert "all set" in _success_html("Prasanth").lower()
     assert "Prasanth" in _success_html("Prasanth")
     assert "expired" in _expired_html().lower()
+
+
+def test_success_page_has_back_to_chat_button():
+    # With a business number → a wa.me deep link (pre-filled so one tap returns
+    # to the chat); without → a plain Close button.
+    out = _success_html("Prasanth", business_number="919876543210")
+    assert "https://wa.me/919876543210?text=Hi" in out
+    assert "Back to chat" in out
+    plain = _success_html("Prasanth")
+    assert "window.close()" in plain
+    assert "wa.me" not in plain

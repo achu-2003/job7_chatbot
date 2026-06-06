@@ -312,16 +312,20 @@ async def test_form_submission_completes_onboarding():
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
-async def test_form_just_submitted_shows_success_message():
-    """The first turn after the form is submitted gets a one-time 'profile
-    complete' success message (0 LLM), then later turns proceed normally."""
+async def test_form_just_submitted_shows_welcome_and_menu():
+    """The first turn after the form is submitted gets a one-time 'welcome back'
+    message WITH the quick-reply menu (0 LLM); later turns proceed normally."""
     rt = _runtime()
     _stub_memory(rt, facts={"full_name": "Achuthan E"}, onboarded=True, welcomed=False)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "hi")
-    assert "all set" in out["response"].lower()
-    assert "profile" in out["response"].lower()
+    assert "welcome back" in out["response"].lower()
     assert "achuthan" in out["response"].lower()
+    assert "looking for" in out["response"].lower()
+    # the 3 menu buttons ride along
+    titles = [b["reply"]["title"]
+              for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
+    assert titles == ["Job Search", "Application Status", "Recommended Jobs"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 

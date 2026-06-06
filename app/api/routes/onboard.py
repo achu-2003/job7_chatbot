@@ -17,10 +17,13 @@ from __future__ import annotations
 import html
 from urllib.parse import parse_qs
 
+import re
+
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse
 
 from app.api.deps import get_memory
+from app.config import get_settings
 from app.core.logging import get_logger
 
 router = APIRouter()
@@ -63,7 +66,8 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
     )
     if not identity:
         return HTMLResponse(_expired_html(), status_code=404)
-    return HTMLResponse(_success_html(identity.get("name") or ""))
+    number = re.sub(r"\D", "", get_settings().whatsapp_business_number or "")
+    return HTMLResponse(_success_html(identity.get("name") or "", business_number=number))
 
 
 # ---------------------------------------------------------------------------
@@ -83,8 +87,9 @@ _PAGE = """\
   label{{display:block;font-size:13px;color:#aebac1;margin:14px 0 6px}}
   input{{width:100%;box-sizing:border-box;padding:11px 12px;border-radius:8px;border:1px solid #2a3942;
          background:#202c33;color:#e9edef;font-size:15px}}
-  button{{width:100%;margin-top:22px;padding:12px;border:0;border-radius:8px;background:#00a884;
-          color:#fff;font-size:16px;font-weight:600;cursor:pointer}}
+  button,a.btn{{display:block;width:100%;box-sizing:border-box;margin-top:22px;padding:12px;border:0;
+          border-radius:8px;background:#00a884;color:#fff;font-size:16px;font-weight:600;cursor:pointer;
+          text-align:center;text-decoration:none}}
   .err{{background:#3a1d1d;color:#ffb4b4;padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:8px}}
   .ok{{text-align:center}} .ok .tick{{font-size:44px}}
 </style></head><body><div class="card">{body}</div></body></html>"""
@@ -114,14 +119,37 @@ def _form_html(token: str, name: str, *, error: str = "") -> str:
     return _PAGE.format(body=body)
 
 
-def _success_html(name: str) -> str:
+def _success_html(name: str, *, business_number: str = "") -> str:
     who = f", {html.escape(name)}" if name else ""
+    # A "Back to chat" button that returns the candidate to WhatsApp. With the
+    # business number configured it's a wa.me deep link (pre-filled "Hi" so one
+    # tap sends it and the bot replies with the welcome + menu); otherwise it's a
+    # best-effort window.close(). This button only appears AFTER a submission, so
+    # a candidate who merely opens the form and leaves is never let past the gate.
+    if business_number:
+        # Reliable: navigate back to WhatsApp (the app reopens the chat). A web
+        # page cannot force-close a tab the user navigated to, so we redirect
+        # rather than call window.close().
+        close = (
+            f'<a class="btn" href="https://wa.me/{business_number}?text=Hi">'
+            "Back to chat</a>"
+        )
+    else:
+        # No business number configured → we can't deep-link back. window.close()
+        # is blocked for user-opened tabs, so we attempt it but ALSO tell the
+        # candidate how to return, instead of leaving a dead button.
+        close = (
+            '<button onclick="window.close()">Close</button>'
+            '<p class="sub" style="margin-top:14px">All done! Return to WhatsApp '
+            "(tap the back arrow or &#10005; at the top) and send us a message.</p>"
+        )
     body = f"""\
 <div class="ok">
   <div class="tick">&#10003;</div>
   <h1>You're all set{who}!</h1>
-  <p class="sub">Thanks for completing your profile. Head back to WhatsApp and
-  send us a message — we'll start finding you roles right away.</p>
+  <p class="sub">Thanks for completing your profile. Tap below to head back to the
+  chat — we'll start finding you roles right away.</p>
+  {close}
 </div>"""
     return _PAGE.format(body=body)
 
