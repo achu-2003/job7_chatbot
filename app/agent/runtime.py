@@ -49,7 +49,12 @@ from app.core.logging import get_logger
 from app.core.metrics import AGENT_LOOPS
 from app.core.tenancy import get_current_tenant_id
 from app.llm.client import LLMClient
-from app.mcp.tools import ToolRegistry, list_category_jobs_core
+from app.mcp.tools import (
+    ToolRegistry,
+    list_category_jobs_core,
+    list_jobs_overview_core,
+    recommend_jobs_core,
+)
 from app.vector.store import VectorStore
 from app.memory.gateway import MemoryGateway
 
@@ -73,6 +78,29 @@ _CLOSER_RX = re.compile(
     r"i'?m done|im done|done for now|that'?ll be all|ok bye|thank you bye)[\s!.?]*$",
     re.IGNORECASE,
 )
+
+# ---- quick-reply menu (greeting / onboarding success) -------------------
+# Three tappable buttons. A tap comes back as the button TITLE text (see the
+# WhatsApp route), so the menu node + browse path detect these titles. Reply
+# button titles are capped at 20 chars by Meta.
+_MENU_BUTTONS = (
+    ("menu_search", "Job Search"),
+    ("menu_status", "Application Status"),
+    ("menu_recommend", "Recommended Jobs"),
+)
+# Tapped/typed "Job Search" → show the category list. "Recommended Jobs" →
+# profile-based recommendations. "Application Status" is left to the normal
+# pipeline (planner → get_application_status), which already handles it.
+_MENU_SEARCH_RX = re.compile(r"^\s*(job\s*search|search\s*jobs?)\s*$", re.IGNORECASE)
+_MENU_RECOMMEND_RX = re.compile(
+    r"^\s*(recommend(ed)?\s*jobs?|recommendations?|recommend)\s*$", re.IGNORECASE
+)
+
+
+def _menu_buttons_message(body: str) -> dict[str, Any]:
+    """The greeting/onboarding quick-reply buttons wrapped as a WhatsApp
+    interactive payload (text ``body`` doubles as the web/fallback reply)."""
+    return wa.buttons_message(body, _MENU_BUTTONS)
 
 # ---- new-candidate onboarding copy --------------------------------------
 # A number we've never seen (not in the job board AND not onboarded yet) is
@@ -165,6 +193,8 @@ class AgentRuntime:
         # Injectable so tests can stub the job-board lookups without a DB.
         self._candidate_lookup = CandidateRepository.get
         self._category_browse = list_category_jobs_core
+        self._jobs_overview = list_jobs_overview_core
+        self._recommend = recommend_jobs_core
         self._graph = self._build_graph()
 
     # ---- nodes (bound coroutine methods) ----------------------------
@@ -206,6 +236,115 @@ class AgentRuntime:
         """A matched category browse goes straight to delivery; otherwise continue
         into the normal summarize → planner reasoning path."""
         return "humanize" if state.get("did_browse") else "summarize"
+
+    async def _menu(self, state: AgentState) -> dict[str, Any]:
+        """Handle the quick-reply menu taps (and their typed equivalents):
+
+        * "Job Search"       → a tappable list of job categories (each row's
+          title is the category name, so a tap flows into the browse node which
+          lists every job in it).
+        * "Recommended Jobs" → roles matched to the candidate's preferred role
+          from onboarding, or the newest jobs when there's none on file.
+
+        Everything else (incl. "Application Status") returns ``{}`` to fall
+        through to the browse → planner pipeline that already handles it.
+        """
+        text = state.get("inbound_text", "") or ""
+        if _MENU_SEARCH_RX.match(text):
+            return await self._category_menu(state)
+        if _MENU_RECOMMEND_RX.match(text):
+            return await self._recommend_menu(state)
+        return {}
+
+    def _route_after_menu(self, state: AgentState) -> Literal["humanize", "browse"]:
+        """A handled menu tap goes straight to delivery; otherwise continue into
+        the category-browse / reasoning path."""
+        return "humanize" if state.get("did_menu") else "browse"
+
+    async def _category_menu(self, state: AgentState) -> dict[str, Any]:
+        """Build the tappable category list for the 'Job Search' button."""
+        try:
+            overview = await self._jobs_overview(tenant_id=state["tenant_id"])
+        except Exception as exc:  # noqa: BLE001 — a menu miss must never break the turn
+            log.warning("menu_overview_failed", error=str(exc)[:200])
+            return {}
+        cats = overview.get("categories") or []
+        if not cats:
+            return {}
+        total = overview.get("total_open_jobs")
+        body = (
+            f"We have {total} open jobs. Which area interests you?"
+            if total else "Which area interests you?"
+        )
+        rows = [
+            {
+                "id": f"category:{c['category']}",
+                "title": c["category"],
+                "description": f"{c['count']} open role" + ("s" if c["count"] != 1 else ""),
+            }
+            for c in cats[:10]
+        ]
+        # Text fallback (web + when the interactive list is rejected) lists the
+        # same areas; tapping/typing one runs the category browse.
+        lines = [body, ""] + [f"• {c['category']} ({c['count']})" for c in cats[:10]]
+        lines.append("\nReply with an area to see all its roles.")
+        return {
+            "intent": "menu",
+            "did_menu": True,
+            "used_llm": False,
+            "single_bubble": True,
+            "draft_response": "\n".join(lines),
+            "whatsapp_interactive": wa.list_message(
+                body=body, button_text="Choose area", rows=rows,
+                header="Job categories", section_title="Areas",
+            ),
+        }
+
+    async def _recommend_menu(self, state: AgentState) -> dict[str, Any]:
+        """Profile-based recommendations for the 'Recommended Jobs' button."""
+        role, location = await self._profile_pref(state)
+        try:
+            jobs = await self._recommend(
+                self.vector, tenant_id=state["tenant_id"],
+                role=role, location=location, limit=8,
+            )
+        except Exception as exc:  # noqa: BLE001 — never break the turn on a lookup miss
+            log.warning("menu_recommend_failed", error=str(exc)[:200])
+            jobs = []
+        first = _first_name((state.get("customer_facts") or {}).get("full_name"))
+        if not jobs:
+            who = f", {first}" if first else ""
+            return {
+                "intent": "menu", "did_menu": True, "used_llm": False,
+                "draft_response": (
+                    f"I couldn't find roles to recommend just yet{who} — tell me a "
+                    "role or area you're interested in and I'll pull some up."
+                ),
+            }
+        who = f", {first}" if first else ""
+        header = f"Based on your profile{who}, here are some roles you might like:"
+        return {
+            "intent": "menu", "did_menu": True, "used_llm": False, "single_bubble": True,
+            "catalog_hits": jobs,
+            "draft_response": build_job_list_text(jobs, header=header),
+        }
+
+    async def _profile_pref(self, state: AgentState) -> tuple[str | None, str | None]:
+        """The candidate's preferred role + location from the onboarding form
+        (Redis), if any. Older records (before the form split) only carry the
+        combined ``location`` field, so we fall back to it for the role."""
+        try:
+            form = await self.gateway.onboarding(
+                tenant_id=state["tenant_id"], conversation_id=state["conversation_id"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("menu_profile_lookup_failed", error=str(exc)[:200])
+            form = None
+        if not form:
+            return None, None
+        role = (form.get("preferred_role") or form.get("location") or "").strip() or None
+        location = (form.get("location") or "").strip() or None
+        return role, location
 
     async def _identify(self, state: AgentState) -> dict[str, Any]:
         """Decide whether the sender is a known person or a new number to onboard.
@@ -312,11 +451,18 @@ class AgentRuntime:
         """0-LLM reply that asks a new number for their name/email (or welcomes
         them once both are in). The value they give is stored by the persist
         node via the shared identity extractors."""
-        return {
+        out: dict[str, Any] = {
             "intent": "onboarding",
             "draft_response": state.get("onboarding_prompt") or _ONBOARD_ASK_NAME,
             "used_llm": False,
         }
+        # The one-time "profile complete" success message offers the same
+        # quick-reply menu as the greeting, so a freshly-onboarded candidate can
+        # tap straight into a search. (Earlier onboarding steps keep identify's
+        # form-link cta button, which this never overwrites.)
+        if state.get("just_onboarded"):
+            out["whatsapp_interactive"] = _menu_buttons_message(out["draft_response"])
+        return out
 
     @staticmethod
     def _last_assistant(state: AgentState) -> str | None:
@@ -346,6 +492,8 @@ class AgentRuntime:
             "intent": "greeting",
             "draft_response": hi,
             "used_llm": False,
+            # Offer the quick-reply menu so the candidate can tap instead of type.
+            "whatsapp_interactive": _menu_buttons_message(hi),
         }
 
     async def _planner(self, state: AgentState) -> dict[str, Any]:
@@ -549,6 +697,7 @@ class AgentRuntime:
         g.add_node("identify", self._identify)
         g.add_node("onboarding_response", self._onboarding_response)
         g.add_node("greeting_response", self._greeting_response)
+        g.add_node("menu", self._menu)
         g.add_node("browse", self._browse)
         g.add_node("summarize", self._summarize)
         g.add_node("planner", self._planner)
@@ -566,8 +715,14 @@ class AgentRuntime:
             {
                 "onboarding": "onboarding_response",
                 "greeting": "greeting_response",
-                "agent": "browse",
+                "agent": "menu",
             },
+        )
+        # A handled menu tap (category list / recommendations) short-circuits to
+        # delivery; anything else falls through to the category browse.
+        g.add_conditional_edges(
+            "menu", self._route_after_menu,
+            {"humanize": "humanize", "browse": "browse"},
         )
         # A category browse short-circuits to delivery; anything else reasons on.
         g.add_conditional_edges(

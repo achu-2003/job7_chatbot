@@ -7,6 +7,7 @@ def test_form_renders_token_and_fields():
     assert 'name="token" value="tok123"' in out
     assert 'name="email"' in out
     assert 'name="years_experience"' in out
+    assert 'name="preferred_role"' in out
     assert 'name="location"' in out
     assert 'action="/onboard/submit"' in out
     assert "Prasanth" in out

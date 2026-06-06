@@ -64,11 +64,17 @@ def match_category(text: str, categories: list[str]) -> str | None:
     return best
 
 
-def build_job_list_text(jobs: list[dict], category: str | None = None) -> str:
+def build_job_list_text(
+    jobs: list[dict], category: str | None = None, *, header: str | None = None
+) -> str:
     """A compact, deterministic listing of EVERY job passed in — bullets (not
-    '1.' numbering, which the bubble splitter would read as sentence breaks)."""
+    '1.' numbering, which the bubble splitter would read as sentence breaks).
+
+    ``header`` overrides the default "Here are all N …" lead line (used for e.g.
+    a personalised "Based on your profile…" recommendations list)."""
     n = len(jobs)
-    header = f"Here are all {n} {category} roles:" if category else f"Here are all {n} roles:"
+    if header is None:
+        header = f"Here are all {n} {category} roles:" if category else f"Here are all {n} roles:"
     lines = [header, ""]
     for j in jobs:
         line = f"• {j.get('title') or 'Role'}"

@@ -289,6 +289,33 @@ async def search_jobs_core(
     return [_compact_job(r) for r in filtered[:limit]]
 
 
+async def recommend_jobs_core(
+    vector: VectorStore,
+    *,
+    tenant_id: str,
+    role: str | None = None,
+    location: str | None = None,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    """Profile-based recommendations for the 'Recommended Jobs' menu button.
+
+    Searches by the candidate's preferred ``role`` (and ``location`` when set),
+    captured at onboarding. When there's no role on file — or it matches nothing
+    — we fall back to the newest open jobs so the button always has something to
+    show. Returns the same compact job shape as ``search_jobs_core``.
+    """
+    role = (role or "").strip()
+    loc = (location or "").strip() or None
+    if role:
+        jobs = await search_jobs_core(
+            vector, tenant_id=tenant_id, query=role, location=loc, limit=limit,
+        )
+        if jobs:
+            return jobs
+    rows, _ = await JobRepository.search(limit=limit, tenant_id=tenant_id)
+    return [_compact_job(r) for r in rows]
+
+
 async def list_jobs_overview_core(*, tenant_id: str) -> dict[str, Any]:
     """A count + category menu of open jobs — the answer to "list all jobs" so
     the candidate can pick a category instead of getting a wall of postings."""

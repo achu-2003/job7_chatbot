@@ -11,7 +11,7 @@ from app.db.repositories import (
     JobRepository,
 )
 from app.memory.repositories import PendingActionRepository
-from app.mcp.tools import ToolContext, ToolRegistry
+from app.mcp.tools import ToolContext, ToolRegistry, recommend_jobs_core
 
 
 class _FakeVector:
@@ -166,6 +166,32 @@ async def test_get_application_status_no_candidate(monkeypatch):
 async def test_application_status_requires_identity():
     out = await _registry().dispatch("get_application_status", {}, _ctx(phone=None))
     assert "error" in out
+
+
+async def test_recommend_jobs_searches_by_role(monkeypatch):
+    # With a preferred role on file, recommendations come from a role search.
+    async def fake_get_by_ids(ids, *, tenant_id=None):
+        return [{"id": "j1", "job_ref": "qa-1", "title": "QA Engineer",
+                 "location": "Chennai", "status": "LIVE"}]
+
+    monkeypatch.setattr(JobRepository, "get_by_ids", staticmethod(fake_get_by_ids))
+    out = await recommend_jobs_core(_FakeVector(), tenant_id="t1", role="QA Engineer")
+    assert out and out[0]["title"] == "QA Engineer"
+
+
+async def test_recommend_jobs_falls_back_to_newest_when_no_role(monkeypatch):
+    # No role on file → newest open jobs (JobRepository.search with no filters).
+    called: dict[str, Any] = {}
+
+    async def fake_search(*, limit=10, tenant_id=None, **kw):
+        called["limit"] = limit
+        return ([{"id": "j9", "job_ref": "new-1", "title": "Fresh Role",
+                  "status": "LIVE"}], "sql")
+
+    monkeypatch.setattr(JobRepository, "search", staticmethod(fake_search))
+    out = await recommend_jobs_core(_FakeVector(), tenant_id="t1", role=None)
+    assert out and out[0]["title"] == "Fresh Role"
+    assert called["limit"] == 8
 
 
 async def test_submit_application_returns_app_link_without_asking_for_details(monkeypatch):

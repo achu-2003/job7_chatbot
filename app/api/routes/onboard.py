@@ -57,6 +57,7 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
         {
             "email": email,
             "years_experience": fields.get("years_experience", ""),
+            "preferred_role": fields.get("preferred_role", ""),
             "location": fields.get("location", ""),
         },
     )
@@ -104,8 +105,10 @@ def _form_html(token: str, name: str, *, error: str = "") -> str:
   <input type="email" name="email" placeholder="you@example.com" required>
   <label>Years of experience</label>
   <input type="number" name="years_experience" min="0" step="1" placeholder="e.g. 3">
-  <label>Preferred role / location</label>
-  <input type="text" name="location" placeholder="e.g. Backend Engineer, Chennai">
+  <label>Preferred role</label>
+  <input type="text" name="preferred_role" placeholder="e.g. Backend Engineer">
+  <label>Preferred location</label>
+  <input type="text" name="location" placeholder="e.g. Chennai">
   <button type="submit">Submit</button>
 </form>"""
     return _PAGE.format(body=body)

@@ -291,6 +291,9 @@ class ConversationMemory:
             "name": identity.get("name", ""),
             "email": (data.get("email") or "").strip(),
             "years_experience": (data.get("years_experience") or "").strip(),
+            # Preferred role drives the "Recommended Jobs" menu button; older
+            # records (before the form split) only carry the combined `location`.
+            "preferred_role": (data.get("preferred_role") or "").strip(),
             "location": (data.get("location") or "").strip(),
             "submitted_at": int(time.time()),
         }

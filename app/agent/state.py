@@ -70,6 +70,7 @@ class AgentState(TypedDict, total=False):
     onboarding_prompt: str                # the ask-name / form-link / success line
     just_onboarded: bool                  # first turn after the form was submitted (success msg)
     did_browse: bool                      # this turn was a deterministic category listing
+    did_menu: bool                        # this turn was a handled quick-reply menu tap
 
     # ---- session / continuity ----
     session_status: str                   # active | dormant | resumed

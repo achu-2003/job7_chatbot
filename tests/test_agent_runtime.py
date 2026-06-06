@@ -45,6 +45,8 @@ def _stub_memory(
     onboarded: bool = True,
     welcomed: bool = True,
     browse: dict | None = None,
+    overview: dict | None = None,
+    recommend: list | None = None,
 ) -> None:
     # Default to a fully-onboarded sender so the identity gate is a no-op and the
     # reasoning tests below exercise the normal path. Onboarding tests pass
@@ -90,6 +92,12 @@ def _stub_memory(
     async def fake_browse(**kw):
         return browse
 
+    async def fake_overview(**kw):
+        return overview or {"total_open_jobs": 0, "categories": []}
+
+    async def fake_recommend(*a, **kw):
+        return recommend or []
+
     rt.gateway.load = fake_load            # type: ignore[assignment]
     rt.gateway.persist = fake_persist      # type: ignore[assignment]
     rt.gateway.set_focus_product = fake_set_focus  # type: ignore[assignment]
@@ -99,6 +107,8 @@ def _stub_memory(
     rt.gateway.mark_onboarding_welcomed = fake_mark_welcomed  # type: ignore[assignment]
     rt._candidate_lookup = fake_lookup     # type: ignore[assignment]
     rt._category_browse = fake_browse      # type: ignore[assignment]
+    rt._jobs_overview = fake_overview      # type: ignore[assignment]
+    rt._recommend = fake_recommend         # type: ignore[assignment]
 
 
 async def _handle(rt: AgentRuntime, message: str = "i need a saree"):
@@ -112,7 +122,7 @@ def test_graph_has_reasoning_pipeline():
     rt = _runtime()
     assert sorted(rt._graph.get_graph().nodes) == [
         "__end__", "__start__", "browse", "execute", "greeting_response", "humanize",
-        "identify", "load_context", "onboarding_response", "persist", "planner",
+        "identify", "load_context", "menu", "onboarding_response", "persist", "planner",
         "reflect", "responder", "summarize",
     ]
 
@@ -313,6 +323,79 @@ async def test_registered_jobseeker_skips_onboarding():
                       reply="Here are some roles!")
     out = await _handle(rt, "show me python jobs")
     assert out["response"] == "Here are some roles!"   # normal agent path
+
+
+async def test_greeting_offers_quick_reply_menu():
+    """The 'hi' greeting carries the three quick-reply buttons (Job Search,
+    Application Status, Recommended Jobs) as a WhatsApp interactive payload."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Achuthan E"})
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "hi")
+    cta = out["whatsapp_interactive"]["interactive"]
+    assert cta["type"] == "button"
+    titles = [b["reply"]["title"] for b in cta["action"]["buttons"]]
+    assert titles == ["Job Search", "Application Status", "Recommended Jobs"]
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
+
+
+async def test_job_search_button_shows_category_list():
+    """Tapping 'Job Search' (title comes back as text) returns a tappable list of
+    job categories — deterministically, 0 LLM."""
+    rt = _runtime()
+    _stub_memory(rt, overview={
+        "total_open_jobs": 69,
+        "categories": [{"category": "Information Technology", "count": 18},
+                       {"category": "Sales & Marketing", "count": 15},
+                       {"category": "Administration", "count": 3}],
+    })
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Job Search")
+    interactive = out["whatsapp_interactive"]["interactive"]
+    assert interactive["type"] == "list"
+    rows = interactive["action"]["sections"][0]["rows"]
+    assert [r["title"] for r in rows] == [
+        "Information Technology", "Sales & Marketing", "Administration"]
+    assert "69 open jobs" in out["response"]                # text fallback
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
+    assert len(out["delivery_plan"]) == 1                   # single bubble
+
+
+async def test_recommended_jobs_button_lists_profile_matches():
+    """Tapping 'Recommended Jobs' lists profile-matched roles deterministically."""
+    rt = _runtime()
+    _stub_memory(
+        rt, facts={"full_name": "Achuthan E"},
+        recommend=[{"job_ref": "r1", "title": "QA Engineer", "location": "Chennai"},
+                   {"job_ref": "r2", "title": "Tester", "location": "Remote"}],
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Recommended Jobs")
+    assert "Based on your profile" in out["response"]
+    assert "Achuthan" in out["response"]
+    assert "QA Engineer" in out["response"] and "Tester" in out["response"]
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
+
+
+async def test_application_status_button_falls_through_to_pipeline():
+    """'Application Status' isn't a menu short-circuit — it flows to the normal
+    planner path (which routes to get_application_status)."""
+    rt = _runtime()
+    _stub_memory(rt)
+    rt.llm = _FakeLLM(
+        plans=[{"goal": "status", "direct_answer": False,
+                "steps": [{"tool": "get_application_status", "args": {}}]}],
+        reply="(ignored — app-status is formatted deterministically)",
+    )
+
+    async def fake_dispatch(name, args, ctx):
+        assert name == "get_application_status"
+        return {"found": False}
+
+    rt.tool_registry.dispatch = fake_dispatch  # type: ignore[assignment]
+    out = await _handle(rt, "Application Status")
+    assert "don't have any applications" in out["response"].lower()
+    assert rt.llm.json_calls == ["agent_plan"]              # went through the planner
 
 
 async def test_category_browse_short_circuits_to_full_listing():
