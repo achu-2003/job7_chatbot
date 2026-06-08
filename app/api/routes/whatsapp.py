@@ -108,10 +108,19 @@ async def receive_webhook(
             )
 
     message = _extract_text_message(payload)
+    attachment: dict[str, Any] | None = None
     if message is None:
-        # status updates, delivery receipts, non-text — ack and ignore (no
-        # conversation_turn for these, they aren't customer turns)
-        return ORJSONResponse({"status": "ignored"}, status_code=200)
+        # A document (e.g. a resume PDF sent during an application) → route it
+        # through the agent as an attachment with the filename as the text.
+        doc = _extract_document_message(payload)
+        if doc is None:
+            # status updates, delivery receipts, other non-text — ack and ignore
+            return ORJSONResponse({"status": "ignored"}, status_code=200)
+        message = {"from": doc["from"], "text": doc.get("filename") or "📎 document", "id": None}
+        attachment = {
+            "kind": "document", "media_id": doc["media_id"],
+            "filename": doc.get("filename"), "mime": doc.get("mime"),
+        }
 
     customer_number: str = _normalize_phone(message["from"])
     incoming_text: str = message["text"]
@@ -143,6 +152,7 @@ async def receive_webhook(
         customer_external_id=customer_number,
         channel="whatsapp",
         interactive_id=message.get("id"),
+        attachment=attachment,
     )
     bot_reply: str = (
         result.get("response")
@@ -444,6 +454,29 @@ def _extract_text_message(payload: dict[str, Any]) -> dict[str, str] | None:
     # which survives WhatsApp's 24-char title truncation — the job-browse flow
     # keys off it. None for typed text.
     return {"from": str(sender), "text": body, "id": reply_id}
+
+
+def _extract_document_message(payload: dict[str, Any]) -> dict[str, str | None] | None:
+    """Pull an inbound document's media id + filename + sender (e.g. a resume PDF
+    a candidate sends during an application)."""
+    try:
+        messages = payload["entry"][0]["changes"][0]["value"]["messages"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if not messages:
+        return None
+    msg = messages[0]
+    if msg.get("type") != "document":
+        return None
+    doc = msg.get("document") or {}
+    media_id = doc.get("id")
+    sender = msg.get("from")
+    if not media_id or not sender:
+        return None
+    return {
+        "from": str(sender), "media_id": str(media_id),
+        "filename": doc.get("filename"), "mime": doc.get("mime_type"),
+    }
 
 
 def _extract_image_message(payload: dict[str, Any]) -> dict[str, str] | None:

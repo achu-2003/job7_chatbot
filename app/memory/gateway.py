@@ -188,6 +188,48 @@ class MemoryGateway:
             conversation_id, ref, job, tenant_id=tenant_id
         )
 
+    # ---- apply-time top-up (progressive profiling) ------------------
+
+    async def registration(
+        self, *, tenant_id: str, conversation_id: str
+    ) -> dict[str, Any] | None:
+        """The staged DB-ready registration payload (seeker + profile + child rows)."""
+        return await self.short_term.get_registration(
+            conversation_id, tenant_id=tenant_id
+        )
+
+    async def update_registration_profile(
+        self, *, tenant_id: str, conversation_id: str, fields: dict[str, Any]
+    ) -> None:
+        await self.short_term.update_registration_profile(
+            conversation_id, fields, tenant_id=tenant_id
+        )
+
+    async def apply_state(
+        self, *, tenant_id: str, conversation_id: str
+    ) -> dict[str, Any] | None:
+        return await self.short_term.get_apply_state(
+            conversation_id, tenant_id=tenant_id
+        )
+
+    async def set_apply_state(
+        self, *, tenant_id: str, conversation_id: str, state: dict[str, Any]
+    ) -> None:
+        await self.short_term.set_apply_state(
+            conversation_id, state, tenant_id=tenant_id
+        )
+
+    async def clear_apply_state(self, *, tenant_id: str, conversation_id: str) -> None:
+        await self.short_term.clear_apply_state(conversation_id, tenant_id=tenant_id)
+
+    async def save_application(
+        self, *, tenant_id: str, conversation_id: str, ref: str, record: dict[str, Any]
+    ) -> None:
+        """Stage a DB-ready application record in Redis (no business-DB write)."""
+        await self.short_term.save_application(
+            conversation_id, ref, record, tenant_id=tenant_id
+        )
+
     async def reset_session(
         self, *, tenant_id: str, conversation_id: str
     ) -> None:

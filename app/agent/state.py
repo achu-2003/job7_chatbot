@@ -51,8 +51,9 @@ class AgentState(TypedDict, total=False):
     session_id: str
     request_id: str
     inbound_text: str
-    inbound_kind: str           # text | button | list | image
+    inbound_kind: str           # text | button | list | image | document
     button_id: str | None       # structured id of a tapped list row / button (e.g. "job:<ref>")
+    attachment: dict[str, Any] | None  # an uploaded file (e.g. a resume document): {kind, media_id, filename}
     received_at: float
 
     # ---- memory (hydrated by load_context) ----

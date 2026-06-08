@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse
 from app.api.deps import get_memory
 from app.config import get_settings
 from app.core.logging import get_logger
+from app.onboarding import prepare_registration
 
 router = APIRouter()
 log = get_logger("onboard")
@@ -55,17 +56,29 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
             status_code=400,
         )
 
-    identity = await get_memory(request).save_onboarding(
-        token,
-        {
-            "email": email,
-            "years_experience": fields.get("years_experience", ""),
-            "preferred_role": fields.get("preferred_role", ""),
-            "location": fields.get("location", ""),
-        },
-    )
+    form = {
+        "email": email,
+        "years_experience": fields.get("years_experience", ""),
+        "preferred_role": fields.get("preferred_role", ""),
+        "location": fields.get("location", ""),
+    }
+    memory = get_memory(request)
+    identity = await memory.save_onboarding(token, form)
     if not identity:
         return HTMLResponse(_expired_html(), status_code=404)
+
+    # Build the DB-ready registration payload (private_job_seekers +
+    # job_seeker_profiles + child rows, with role/location resolved to FK ids by
+    # READING the lookup tables) and STAGE it in Redis. Nothing is written to the
+    # business DB yet — this lets us verify the shape before enabling real INSERTs.
+    try:
+        payload = await prepare_registration(identity=identity, form=form)
+        await memory.save_registration(
+            identity["conversation_id"], payload, tenant_id=identity["tenant_id"]
+        )
+    except Exception as exc:  # noqa: BLE001 — staging must never fail the submission
+        log.warning("registration_stage_failed", error=str(exc)[:200])
+
     number = re.sub(r"\D", "", get_settings().whatsapp_business_number or "")
     return HTMLResponse(_success_html(identity.get("name") or "", business_number=number))
 

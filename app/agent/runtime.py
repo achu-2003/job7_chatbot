@@ -28,6 +28,7 @@ from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
 
+from app import onboarding
 from app.agent import jobflow
 from app.agent.context import is_followup
 from app.agent.identity import extract_name, is_plausible_name
@@ -118,6 +119,19 @@ _ONBOARD_ASK_NAME = (
 
 def _first_name(name: str | None) -> str:
     return name.split()[0] if name else ""
+
+
+def _apply_reply(msg: str) -> dict[str, Any]:
+    """Standard 0-LLM apply-flow turn (single bubble), short-circuited to delivery."""
+    return {"intent": "apply", "did_browse": True, "used_llm": False, "draft_response": msg}
+
+
+def _apply_prompt(msg: str) -> dict[str, Any]:
+    """An apply-flow question with a tappable Skip button (the candidate can also
+    type the answer / send a document)."""
+    out = _apply_reply(msg)
+    out["whatsapp_interactive"] = wa.buttons_message(msg, [("apply_skip", "Skip")])
+    return out
 
 
 def _onboard_ask_form(name: str | None, link: str) -> str:
@@ -217,6 +231,25 @@ class AgentRuntime:
         24-char title truncation); typed text is the web/fallback path. Anything
         that isn't a browse step returns ``{}`` to fall through to the planner.
         """
+        # Mid apply-time collection? A typed reply / sent document is the answer
+        # to the current question; the Skip button skips it; tapping a DIFFERENT
+        # button abandons the apply flow.
+        apply_state = await self._load_apply(state)
+        if apply_state:
+            bid = state.get("button_id") or ""
+            if bid == "apply_skip":
+                return await self._apply_answer(state, apply_state, skip=True)
+            if bid:
+                await self._clear_apply(state)
+            else:
+                return await self._apply_answer(state, apply_state)
+        elif state.get("attachment"):
+            # A file arrived outside an application — nudge them to apply first.
+            return _apply_reply(
+                "Thanks for the file! I can attach your resume once you tap Apply "
+                "on a role. Want me to find you some jobs?"
+            )
+
         text = state.get("inbound_text", "") or ""
         prefix, rest = jobflow.split_id(state.get("button_id"))
 
@@ -314,22 +347,146 @@ class AgentRuntime:
         }
 
     async def _job_action(self, state: AgentState, action: str, ref: str) -> dict[str, Any]:
-        """Handle an Apply / Save / Share tap on a job card."""
+        """Handle a Save / Share tap (Apply has its own collection flow)."""
+        if action == "apply":
+            return await self._apply_start(state, ref)
         job = await self._job_lookup(tenant_id=state["tenant_id"], ref=ref)
         title = (job or {}).get("title") or "that role"
         kw = {"tenant_id": state["tenant_id"], "conversation_id": state["conversation_id"]}
         if action == "save":
             await self._safe_store(self.gateway.save_job, ref=ref, job=job or {"job_ref": ref}, **kw)
             msg = f"Saved {title} to your list. Tap Apply on it whenever you're ready."
-        elif action == "apply":
-            await self._safe_store(self.gateway.record_interest, ref=ref, job=job or {"job_ref": ref}, **kw)
-            msg = (
-                f"Great — I've noted your interest in {title}. "
-                "Our team will reach out about the next steps."
-            )
         else:  # share
             msg = jobflow.share_text(job) if job else f"Job reference: {ref}"
         return {"intent": "browse", "did_browse": True, "used_llm": False, "draft_response": msg}
+
+    # ---- apply-time top-up (progressive profiling) -------------------
+
+    async def _apply_start(self, state: AgentState, ref: str) -> dict[str, Any]:
+        """Begin applying: ask only for the apply-time details the profile is
+        still missing (resume, expected salary). If the profile already has them
+        — or we have no staged profile — go straight to recording the apply."""
+        job = await self._job_lookup(tenant_id=state["tenant_id"], ref=ref)
+        title = (job or {}).get("title") or "this role"
+        reg = await self._registration(state)
+        if not job or not reg:
+            # No job id / no staged profile → fall back to recording interest.
+            await self._safe_store(
+                self.gateway.record_interest, ref=ref, job=job or {"job_ref": ref},
+                tenant_id=state["tenant_id"], conversation_id=state["conversation_id"],
+            )
+            return _apply_reply(f"Great — I've noted your interest in {title}. Our team will reach out.")
+
+        pending = [
+            f["key"] for f in onboarding.APPLY_FIELDS
+            if f["key"] not in onboarding.known_apply_fields(reg)
+        ]
+        if not pending:
+            return await self._apply_finalize(state, ref, job, reg, answers={})
+        await self._save_apply(
+            state, {"job_ref": ref, "job_title": title, "pending": pending, "answers": {}}
+        )
+        prompt = onboarding.APPLY_FIELD_BY_KEY[pending[0]]["prompt"]
+        return _apply_prompt(f"Let's apply for {title}.\n\n{prompt}")
+
+    async def _apply_answer(
+        self, state: AgentState, apply_state: dict[str, Any], *, skip: bool = False
+    ) -> dict[str, Any]:
+        """Store the candidate's answer (typed value, sent document, or Skip) to
+        the current apply-time question, then ask the next one or finalize."""
+        text = (state.get("inbound_text") or "").strip()
+        attachment = state.get("attachment") or {}
+        pending = list(apply_state.get("pending") or [])
+        answers = dict(apply_state.get("answers") or {})
+        if not pending:
+            await self._clear_apply(state)
+            return {}
+        key = pending[0]
+        spec = onboarding.APPLY_FIELD_BY_KEY.get(key, {})
+
+        if skip or onboarding.is_skip(text):
+            answers[key] = None
+        elif key == "resume" and attachment.get("kind") == "document":
+            # A real resume upload — store a reference (filename + media id). On
+            # real-DB wiring this is downloaded from Meta and hosted.
+            fn = attachment.get("filename") or "resume"
+            answers[key] = f"{fn} [wa-doc:{attachment.get('media_id')}]"
+        elif attachment:
+            # A file on a non-file question → ignore it and re-ask.
+            return _apply_prompt(onboarding.APPLY_FIELD_BY_KEY[key]["prompt"])
+        elif spec.get("numeric"):
+            val = onboarding.parse_salary(text)
+            if val is None:
+                return _apply_prompt("Please reply with a number (e.g. 25000), or tap Skip.")
+            answers[key] = val
+        else:
+            answers[key] = text
+
+        pending = pending[1:]
+        if pending:
+            await self._save_apply(state, {**apply_state, "pending": pending, "answers": answers})
+            return _apply_prompt(onboarding.APPLY_FIELD_BY_KEY[pending[0]]["prompt"])
+
+        ref = apply_state.get("job_ref")
+        job = await self._job_lookup(tenant_id=state["tenant_id"], ref=ref)
+        reg = await self._registration(state)
+        await self._clear_apply(state)
+        if not job or not reg:
+            return _apply_reply("Thanks! I've noted your details — our team will follow up.")
+        return await self._apply_finalize(state, ref, job, reg, answers)
+
+    async def _apply_finalize(
+        self, state: AgentState, ref: str, job: dict[str, Any],
+        reg: dict[str, Any], answers: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build + stage the application record (Redis only) and confirm."""
+        built = onboarding.build_application_record(registration=reg, job=job, answers=answers)
+        title = job.get("title") or "the role"
+        kw = {"tenant_id": state["tenant_id"], "conversation_id": state["conversation_id"]}
+        try:
+            await self.gateway.save_application(ref=ref, record=built["application"], **kw)
+            if built["profile_update"]:
+                await self.gateway.update_registration_profile(fields=built["profile_update"], **kw)
+        except Exception as exc:  # noqa: BLE001 — staging must not 500 the turn
+            log.warning("apply_stage_failed", error=str(exc)[:200])
+        return _apply_reply(
+            f"✅ Applied to {title}! Our team will review your profile and get back "
+            "to you. Anything else I can help with?"
+        )
+
+    async def _registration(self, state: AgentState) -> dict[str, Any] | None:
+        try:
+            return await self.gateway.registration(
+                tenant_id=state["tenant_id"], conversation_id=state["conversation_id"]
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("registration_load_failed", error=str(exc)[:200])
+            return None
+
+    async def _load_apply(self, state: AgentState) -> dict[str, Any] | None:
+        try:
+            return await self.gateway.apply_state(
+                tenant_id=state["tenant_id"], conversation_id=state["conversation_id"]
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("apply_state_load_failed", error=str(exc)[:200])
+            return None
+
+    async def _save_apply(self, state: AgentState, st: dict[str, Any]) -> None:
+        try:
+            await self.gateway.set_apply_state(
+                tenant_id=state["tenant_id"], conversation_id=state["conversation_id"], state=st
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("apply_state_save_failed", error=str(exc)[:200])
+
+    async def _clear_apply(self, state: AgentState) -> None:
+        try:
+            await self.gateway.clear_apply_state(
+                tenant_id=state["tenant_id"], conversation_id=state["conversation_id"]
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     @staticmethod
     async def _safe_store(fn, **kw) -> None:
@@ -884,6 +1041,7 @@ class AgentRuntime:
         channel: str,
         tenant_id: str | None = None,
         interactive_id: str | None = None,
+        attachment: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         tid = tenant_id or get_current_tenant_id()
         conv_id = conversation_id or f"conv_{uuid.uuid4().hex[:12]}"
@@ -892,9 +1050,11 @@ class AgentRuntime:
             "conversation_id": conv_id,
             "customer_id": customer_external_id or "",
             "inbound_text": customer_query,
-            "inbound_kind": "button" if interactive_id else "text",
+            "inbound_kind": "document" if attachment else ("button" if interactive_id else "text"),
             # structured id of a tapped row/button (job:<ref>, loc:<x>, apply:<ref>…)
             "button_id": interactive_id,
+            # an uploaded file (e.g. a resume document) when present
+            "attachment": attachment,
             "request_id": request_id,
             "received_at": time.time(),
             # reasoning-loop budget (Phase 0 Budget semantics, tracked on state)

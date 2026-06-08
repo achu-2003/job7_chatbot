@@ -462,3 +462,55 @@ class ApplicationRepository:
             rows = [dict(r._mapping) for r in res]
         SQL_LATENCY.labels(op="application_history").observe(time.perf_counter() - start)
         return rows
+
+
+# ---------------------------------------------------------------
+# Lookups (read-only reference data) — resolve a candidate's free-text
+# preference to the FK id the profile child tables need.
+# ---------------------------------------------------------------
+
+
+class LookupRepository:
+    """Resolve free-text role/location to the reference ids used by
+    ``private_job_seeker_preferred_roles.jobRoleId`` / ``..._locations.districtId``.
+
+    Match precedence: exact name → exact slug → contains. Read-only; these are
+    global reference tables (no tenant column)."""
+
+    @staticmethod
+    async def find_job_role(name: str) -> dict[str, Any] | None:
+        q = (name or "").strip()
+        if not q:
+            return None
+        sql = text(
+            "SELECT id, name, slug FROM private_job_roles "
+            'WHERE "isActive" = TRUE AND ('
+            "  LOWER(TRIM(name)) = LOWER(:q) OR LOWER(slug) = LOWER(:slug) "
+            "  OR name ILIKE :like) "
+            "ORDER BY CASE WHEN LOWER(TRIM(name)) = LOWER(:q) THEN 0 "
+            "              WHEN LOWER(slug) = LOWER(:slug) THEN 1 ELSE 2 END, "
+            '         "displayOrder" NULLS LAST '
+            "LIMIT 1"
+        )
+        params = {"q": q, "slug": q.lower().replace(" ", "-"), "like": f"%{q}%"}
+        async with session_scope() as session:
+            row = (await session.execute(sql, params)).first()
+        return dict(row._mapping) if row else None
+
+    @staticmethod
+    async def find_district(name: str) -> dict[str, Any] | None:
+        q = (name or "").strip()
+        if not q:
+            return None
+        sql = text(
+            "SELECT id, name, slug FROM districts "
+            "WHERE LOWER(TRIM(name)) = LOWER(:q) OR LOWER(slug) = LOWER(:slug) "
+            "   OR name ILIKE :like "
+            "ORDER BY CASE WHEN LOWER(TRIM(name)) = LOWER(:q) THEN 0 "
+            "              WHEN LOWER(slug) = LOWER(:slug) THEN 1 ELSE 2 END "
+            "LIMIT 1"
+        )
+        params = {"q": q, "slug": q.lower().replace(" ", "-"), "like": f"%{q}%"}
+        async with session_scope() as session:
+            row = (await session.execute(sql, params)).first()
+        return dict(row._mapping) if row else None

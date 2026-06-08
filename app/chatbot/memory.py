@@ -194,6 +194,38 @@ class ConversationMemory:
             return None
 
     # ------------------------------------------------------------------
+    # apply-time top-up (the in-progress "collect resume/salary" Q&A)
+    # ------------------------------------------------------------------
+
+    def _apply_key(self, conv_id: str, *, tenant_id: str | None = None) -> str:
+        tid = tenant_id or get_current_tenant_id()
+        return f"t:{tid}:conv:{conv_id}:apply"
+
+    async def set_apply_state(
+        self, conv_id: str, state: dict[str, Any], *, tenant_id: str | None = None
+    ) -> None:
+        assert self._redis is not None
+        await self._redis.setex(
+            self._apply_key(conv_id, tenant_id=tenant_id), self._ttl, json.dumps(state)
+        )
+
+    async def get_apply_state(
+        self, conv_id: str, *, tenant_id: str | None = None
+    ) -> dict[str, Any] | None:
+        assert self._redis is not None
+        raw = await self._redis.get(self._apply_key(conv_id, tenant_id=tenant_id))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    async def clear_apply_state(self, conv_id: str, *, tenant_id: str | None = None) -> None:
+        assert self._redis is not None
+        await self._redis.delete(self._apply_key(conv_id, tenant_id=tenant_id))
+
+    # ------------------------------------------------------------------
     # saved jobs / applied-interest (the candidate's durable lists, Redis only)
     # ------------------------------------------------------------------
 
@@ -223,6 +255,33 @@ class ConversationMemory:
         await self._add_to_set(
             self._applied_key(conv_id, tenant_id=tenant_id), ref, job
         )
+
+    def _applications_key(self, conv_id: str, *, tenant_id: str | None = None) -> str:
+        tid = tenant_id or get_current_tenant_id()
+        return f"t:{tid}:conv:{conv_id}:applications"
+
+    async def save_application(
+        self, conv_id: str, ref: str, record: dict[str, Any], *, tenant_id: str | None = None
+    ) -> None:
+        """Stage a DB-ready ``private_job_applications`` record in Redis (keyed by
+        job ref so re-applying overwrites). No business-DB write yet."""
+        await self._add_to_set(
+            self._applications_key(conv_id, tenant_id=tenant_id), ref, record
+        )
+
+    async def get_applications(
+        self, conv_id: str, *, tenant_id: str | None = None
+    ) -> dict[str, Any]:
+        """All staged applications for this conversation, keyed by job ref."""
+        assert self._redis is not None
+        raw = await self._redis.hgetall(self._applications_key(conv_id, tenant_id=tenant_id))
+        out: dict[str, Any] = {}
+        for k, v in (raw or {}).items():
+            try:
+                out[k] = json.loads(v)
+            except json.JSONDecodeError:
+                continue
+        return out
 
     # ------------------------------------------------------------------
     # live feed (recent turns for the monitor UI) — per tenant
@@ -338,6 +397,49 @@ class ConversationMemory:
         await self._redis.setex(self._onboard_token_key(token), ttl, identity)
         await self._redis.expire(fwd, ttl)
         return token
+
+    def _registration_key(self, conv_id: str, *, tenant_id: str | None = None) -> str:
+        tid = tenant_id or get_current_tenant_id()
+        return f"t:{tid}:conv:{conv_id}:registration"
+
+    async def save_registration(
+        self, conv_id: str, payload: dict[str, Any], *, tenant_id: str | None = None
+    ) -> None:
+        """Stage the DB-ready registration payload (seeker + profile + child rows)
+        in Redis — NOT the business DB — so the data shape can be verified before
+        real INSERTs are turned on."""
+        assert self._redis is not None
+        await self._redis.setex(
+            self._registration_key(conv_id, tenant_id=tenant_id),
+            get_settings().onboarding_ttl_seconds,
+            json.dumps(payload, default=str),
+        )
+        log.info("registration_staged", conversation_id=conv_id)
+
+    async def get_registration(
+        self, conv_id: str, *, tenant_id: str | None = None
+    ) -> dict[str, Any] | None:
+        assert self._redis is not None
+        raw = await self._redis.get(self._registration_key(conv_id, tenant_id=tenant_id))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    async def update_registration_profile(
+        self, conv_id: str, fields: dict[str, Any], *, tenant_id: str | None = None
+    ) -> None:
+        """Merge fields (e.g. resume, expectedSalary collected at apply-time) into
+        the staged registration's profile, so later applies don't re-ask."""
+        reg = await self.get_registration(conv_id, tenant_id=tenant_id)
+        if not reg:
+            return
+        profile = reg.get("job_seeker_profiles") or {}
+        profile.update(fields)
+        reg["job_seeker_profiles"] = profile
+        await self.save_registration(conv_id, reg, tenant_id=tenant_id)
 
     async def get_onboarding_identity(self, token: str) -> dict[str, Any] | None:
         """Resolve a form token back to its candidate identity (for the form
