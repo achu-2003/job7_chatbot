@@ -184,18 +184,24 @@ async def _handle(
 def test_graph_has_reasoning_pipeline():
     rt = _runtime()
     assert sorted(rt._graph.get_graph().nodes) == [
-        "__end__", "__start__", "browse", "execute", "greeting_response", "humanize",
-        "identify", "load_context", "menu", "onboarding_response", "persist", "planner",
-        "reflect", "responder", "summarize",
+        "__end__", "__start__", "browse", "creator_response", "execute",
+        "greeting_response", "humanize", "identify", "load_context", "menu",
+        "onboarding_response", "persist", "planner", "reflect", "responder",
+        "role_select", "summarize",
     ]
 
 
-async def test_greeting_short_circuits_the_llm():
+async def test_greeting_offers_role_choice():
+    """The 'hi' greeting now opens with the Job Seeker / Job Creator lane choice
+    (two reply buttons) — deterministically, 0 LLM."""
     rt = _runtime()
     _stub_memory(rt)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "hi")
-    assert "looking for" in out["response"].lower()      # fixed greeting
+    cta = out["whatsapp_interactive"]["interactive"]
+    assert cta["type"] == "button"
+    titles = [b["reply"]["title"] for b in cta["action"]["buttons"]]
+    assert titles == ["Job Seeker", "Job Creator"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
 
 
@@ -283,11 +289,12 @@ async def test_tool_path_plans_executes_reflects_responds():
 
 async def test_unknown_number_is_asked_for_name():
     """A number with no job-board record and no captured name is asked to
-    introduce itself — with zero LLM calls — instead of being helped."""
+    introduce itself — with zero LLM calls — instead of being helped. (A non-
+    greeting message skips the lane choice and hits the onboarding gate.)"""
     rt = _runtime()
     _stub_memory(rt, facts={}, onboarded=False)   # nothing on file, no DB candidate
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
-    out = await _handle(rt, "hi")
+    out = await _handle(rt, "i need a job")
     assert "full name" in out["response"].lower()
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
 
@@ -341,8 +348,10 @@ async def test_form_submission_completes_onboarding():
     _stub_memory(rt, facts={"full_name": "Achuthan E"}, onboarded=True)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "hi")
-    assert "achuthan" in out["response"].lower()    # past the gate → greeted
-    assert "looking for" in out["response"].lower()
+    assert "achuthan" in out["response"].lower()    # past the gate → greeted by name
+    titles = [b["reply"]["title"]
+              for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
+    assert titles == ["Job Seeker", "Job Creator"]   # lane choice, not the name/form ask
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
@@ -365,7 +374,7 @@ async def test_form_just_submitted_shows_welcome_and_menu():
 
 async def test_known_user_greeted_by_name():
     """A registered sender saying 'hi' is greeted by their first name (from the
-    job board, seeded into facts by identify) — still 0 LLM."""
+    job board, seeded into facts by identify) on the lane-choice prompt — 0 LLM."""
     rt = _runtime()
     _stub_memory(
         rt, facts={},
@@ -374,7 +383,9 @@ async def test_known_user_greeted_by_name():
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "hi")
     assert "reg" in out["response"].lower()              # greeted by name
-    assert "looking for" in out["response"].lower()
+    titles = [b["reply"]["title"]
+              for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
+    assert titles == ["Job Seeker", "Job Creator"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
@@ -392,17 +403,42 @@ async def test_registered_jobseeker_skips_onboarding():
     assert out["response"] == "Here are some roles!"   # normal agent path
 
 
-async def test_greeting_offers_quick_reply_menu():
-    """The 'hi' greeting carries the three quick-reply buttons (Job Search,
-    Application Status, Recommended Jobs) as a WhatsApp interactive payload."""
+async def test_seeker_tap_offers_quick_reply_menu():
+    """Tapping 'Job Seeker' (role:seeker) resumes the candidate flow: a known
+    sender gets the three quick-reply buttons (Job Search, Application Status,
+    Recommended Jobs) as a WhatsApp interactive payload — 0 LLM."""
     rt = _runtime()
     _stub_memory(rt, facts={"full_name": "Achuthan E"})
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
-    out = await _handle(rt, "hi")
+    out = await _handle(rt, "Job Seeker", interactive_id="role:seeker")
     cta = out["whatsapp_interactive"]["interactive"]
     assert cta["type"] == "button"
     titles = [b["reply"]["title"] for b in cta["action"]["buttons"]]
     assert titles == ["Job Search", "Application Status", "Recommended Jobs"]
+    assert "looking for" in out["response"].lower()
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
+
+
+async def test_creator_tap_shows_stub():
+    """Tapping 'Job Creator' (role:creator) routes to the placeholder recruiter
+    reply — deterministically, 0 LLM, no menu buttons."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Achuthan E"})
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Job Creator", interactive_id="role:creator")
+    assert "coming soon" in out["response"].lower()
+    assert out.get("whatsapp_interactive") is None
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
+
+
+async def test_new_number_seeker_tap_starts_onboarding():
+    """An unknown number that taps 'Job Seeker' enters onboarding (asked for a
+    name) — the existing-user check + onboarding happen after the lane choice."""
+    rt = _runtime()
+    _stub_memory(rt, facts={}, onboarded=False)
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Job Seeker", interactive_id="role:seeker")
+    assert "name" in out["response"].lower()             # onboarding ask-name
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
 
 

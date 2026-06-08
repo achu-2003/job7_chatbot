@@ -106,20 +106,20 @@ class JobRepository:
     ``salary_min`` ← ``salaryMin`` …), so nothing downstream (``_compact_job``,
     the validator, the responder) had to change.
 
-    "Shown to candidates" = every PUBLISHED posting: anything that isn't a
-    half-written ``DRAFT`` and isn't soft-deleted. Expired/closed/suspended jobs
-    ARE shown (the reply labels their status, e.g. "(expired)") so candidates see
-    the full board and know which are still open. The candidate-facing reference
-    is the human-readable ``slug``.
+    "Shown to candidates" = only genuinely OPEN postings: status ``LIVE`` or
+    ``APPROVED`` and not soft-deleted. Expired/closed/suspended/pending/draft jobs
+    are NOT shown — so the counts, category menu, search, and recommendations all
+    reflect live openings a candidate can actually apply to. The candidate-facing
+    reference is the human-readable ``slug``.
 
     WHERE clauses are appended dynamically based on which filters are present,
     so we never evaluate dead ``IS NULL`` branches and avoid bind-vs-cast
     ambiguity.
     """
 
-    # Shown = published (not DRAFT) and not soft-deleted. Expired/closed/etc. are
-    # included on purpose and labelled in the reply.
-    _LIVE = "j.status <> 'DRAFT' AND j.\"deletedAt\" IS NULL"
+    # Shown = open openings only: LIVE or APPROVED, and not soft-deleted.
+    # Expired/closed/suspended/pending/draft are excluded (not "open jobs").
+    _LIVE = "j.status IN ('LIVE', 'APPROVED') AND j.\"deletedAt\" IS NULL"
 
     _SELECT = (
         'SELECT '

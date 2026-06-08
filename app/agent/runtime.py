@@ -104,6 +104,41 @@ def _menu_buttons_message(body: str) -> dict[str, Any]:
     interactive payload (text ``body`` doubles as the web/fallback reply)."""
     return wa.buttons_message(body, _MENU_BUTTONS)
 
+
+# ---- lane selection (job seeker vs job creator) -------------------------
+# A greeting now opens by asking which lane the sender is in. "Job Seeker"
+# resumes the existing candidate flow (onboarding / menu); "Job Creator" is a
+# placeholder until the recruiter side is built. The choice rides on a
+# structured button id (role:seeker / role:creator) so it survives WhatsApp's
+# title truncation; the exact title text doubles as the web/typed path.
+_ROLE_BUTTONS = (
+    ("role:seeker", "Job Seeker"),
+    ("role:creator", "Job Creator"),
+)
+_ROLE_SEEKER_RX = re.compile(r"^\s*job\s*seeker\s*$", re.IGNORECASE)
+_ROLE_CREATOR_RX = re.compile(r"^\s*job\s*creator\s*$", re.IGNORECASE)
+
+
+def _role_choice_message(body: str) -> dict[str, Any]:
+    """The Job Seeker / Job Creator quick-reply buttons wrapped as a WhatsApp
+    interactive payload (``body`` doubles as the web/fallback reply)."""
+    return wa.buttons_message(body, _ROLE_BUTTONS)
+
+
+def _role_selection(state: AgentState) -> str | None:
+    """Which lane the sender picked this turn: ``"seeker"``, ``"creator"``, or
+    ``None``. Reads the structured button id first (role:seeker / role:creator);
+    falls back to the exact title text for the web/typed path."""
+    prefix, rest = jobflow.split_id(state.get("button_id"))
+    if prefix == "role" and rest in {"seeker", "creator"}:
+        return rest
+    text = state.get("inbound_text", "") or ""
+    if _ROLE_SEEKER_RX.match(text):
+        return "seeker"
+    if _ROLE_CREATOR_RX.match(text):
+        return "creator"
+    return None
+
 # ---- new-candidate onboarding copy --------------------------------------
 # A number we've never seen (not in the job board AND not onboarded yet) is
 # asked to introduce itself before we help with roles: first the name in chat,
@@ -776,6 +811,43 @@ class AgentRuntime:
             "whatsapp_interactive": _menu_buttons_message(hi),
         }
 
+    async def _role_select(self, state: AgentState) -> dict[str, Any]:
+        """0-LLM opener shown on a greeting: ask whether the sender is here to
+        find a job (Job Seeker → the existing candidate flow) or to hire (Job
+        Creator → a stub until the recruiter side lands)."""
+        first = _first_name((state.get("customer_facts") or {}).get("full_name"))
+        who = f" {first}" if first else ""
+        body = (
+            f"Hi{who}! Welcome to Jobs7. 👋\n\n"
+            "Are you here to find a job, or to post jobs and hire?\n\n"
+            'Tap an option below (or reply "Job Seeker" / "Job Creator").'
+        )
+        return {
+            "intent": "role_select",
+            "draft_response": body,
+            "used_llm": False,
+            "single_bubble": True,
+            "whatsapp_interactive": _role_choice_message(body),
+        }
+
+    async def _creator_response(self, state: AgentState) -> dict[str, Any]:
+        """Placeholder for the Job Creator lane. The recruiter experience isn't
+        built yet, so acknowledge and point them at the team — the routing is in
+        place so building it out later is purely additive."""
+        first = _first_name((state.get("customer_facts") or {}).get("full_name"))
+        who = f", {first}" if first else ""
+        body = (
+            f"Thanks for your interest in hiring through Jobs7{who}! 🙌\n\n"
+            "The job-poster experience is coming soon. For now, reply here and our "
+            "team will help you post your roles and reach candidates."
+        )
+        return {
+            "intent": "role_creator",
+            "draft_response": body,
+            "used_llm": False,
+            "single_bubble": True,
+        }
+
     async def _planner(self, state: AgentState) -> dict[str, Any]:
         return await plan(
             state, llm=self.llm, registry=self.tool_registry,
@@ -900,18 +972,34 @@ class AgentRuntime:
 
     def _route_after_identify(
         self, state: AgentState
-    ) -> Literal["onboarding", "greeting", "agent"]:
-        """Unknown numbers go to onboarding (ask name/form). Known senders keep
-        the existing split: pure greetings/farewells skip the LLM; everything
-        else goes to the reasoning agent."""
+    ) -> Literal["onboarding", "greeting", "role_select", "creator", "agent"]:
+        """Routing gate. A greeting now opens with the Job Seeker / Job Creator
+        choice; picking 'Job Seeker' resumes the existing flow (a new number
+        onboards, a known one gets the menu), 'Job Creator' goes to its stub.
+        Everything else keeps the prior split: unknown numbers onboard, known
+        ones go to the reasoning agent."""
         # First turn after the form is submitted → one-time success message.
         if state.get("just_onboarded"):
             return "onboarding"
+
+        # Lane gate (seeker vs creator) sits in front of the normal flow.
+        lane = _role_selection(state)
+        if lane == "creator":
+            return "creator"
+        if lane == "seeker":
+            # Seeker picked → resume the usual split: onboard a new number,
+            # show the menu to a known one.
+            return "greeting" if state.get("is_known", False) else "onboarding"
+
+        q = state.get("inbound_text", "")
+        # A farewell keeps the 0-LLM closer; an opening greeting asks the lane.
+        if _CLOSER_RX.match(q):
+            return "greeting"
+        if _GREETING_RX.match(q):
+            return "role_select"
+
         if not state.get("is_known", False):
             return "onboarding"
-        q = state.get("inbound_text", "")
-        if _GREETING_RX.match(q) or _CLOSER_RX.match(q):
-            return "greeting"
         return "agent"
 
     def _memory_context(self, state: AgentState, *, for_planner: bool = False) -> str | None:
@@ -977,6 +1065,8 @@ class AgentRuntime:
         g.add_node("identify", self._identify)
         g.add_node("onboarding_response", self._onboarding_response)
         g.add_node("greeting_response", self._greeting_response)
+        g.add_node("role_select", self._role_select)
+        g.add_node("creator_response", self._creator_response)
         g.add_node("menu", self._menu)
         g.add_node("browse", self._browse)
         g.add_node("summarize", self._summarize)
@@ -995,6 +1085,8 @@ class AgentRuntime:
             {
                 "onboarding": "onboarding_response",
                 "greeting": "greeting_response",
+                "role_select": "role_select",
+                "creator": "creator_response",
                 "agent": "menu",
             },
         )
@@ -1011,6 +1103,8 @@ class AgentRuntime:
         )
         g.add_edge("onboarding_response", "humanize")
         g.add_edge("greeting_response", "humanize")
+        g.add_edge("role_select", "humanize")
+        g.add_edge("creator_response", "humanize")
         g.add_edge("summarize", "planner")
         g.add_conditional_edges(
             "planner", self._route_after_plan,
