@@ -355,19 +355,31 @@ async def test_form_submission_completes_onboarding():
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
-async def test_form_just_submitted_shows_welcome_and_menu():
-    """The first turn after the form is submitted gets a one-time 'welcome back'
-    message WITH the quick-reply menu (0 LLM); later turns proceed normally."""
+async def test_form_just_submitted_shows_success_and_lane_choice():
+    """The first turn after the form is submitted gets a one-time success message
+    WITH the Job Seeker / Job Creator lane choice (0 LLM) — a freshly-registered
+    candidate picks where to go next."""
     rt = _runtime()
     _stub_memory(rt, facts={"full_name": "Achuthan E"}, onboarded=True, welcomed=False)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "hi")
     assert "registered successfully" in out["response"].lower()   # one-time confirmation
     assert "achuthan" in out["response"].lower()
-    # the 3 menu buttons ride along
     titles = [b["reply"]["title"]
               for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
-    assert titles == ["Job Search", "Application Status", "Recommended Jobs"]
+    assert titles == ["Job Seeker", "Job Creator"]
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
+
+
+async def test_new_number_hi_goes_straight_to_onboarding():
+    """A number NOT in our DB (and not onboarded) that says 'hi' is asked for its
+    name — the lane choice is NOT offered until they've registered."""
+    rt = _runtime()
+    _stub_memory(rt, facts={}, onboarded=False)   # no DB candidate, no form
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "hi")
+    assert "full name" in out["response"].lower()                 # onboarding ask-name
+    assert out.get("whatsapp_interactive") is None                # no lane buttons yet
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
