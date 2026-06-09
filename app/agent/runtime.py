@@ -193,12 +193,12 @@ def _onboard_form_cta_body(name: str | None) -> str:
 
 def _onboard_success(name: str | None) -> str:
     """One-time confirmation shown the first time a candidate messages after
-    submitting the onboarding form (carries the quick-reply menu, set in
-    _onboarding_response)."""
+    submitting the onboarding form (carries the Job Seeker / Job Creator lane
+    choice, set in _onboarding_response)."""
     who = f" {_first_name(name)}" if name else ""
     return (
-        f"You're registered successfully{who}! ✅ "
-        "What would you like to do today?"
+        f"You're registered successfully{who}! ✅\n\n"
+        "Are you here to find a job, or to post jobs and hire?"
     )
 
 
@@ -775,12 +775,12 @@ class AgentRuntime:
             "draft_response": state.get("onboarding_prompt") or _ONBOARD_ASK_NAME,
             "used_llm": False,
         }
-        # The one-time "profile complete" success message offers the same
-        # quick-reply menu as the greeting, so a freshly-onboarded candidate can
-        # tap straight into a search. (Earlier onboarding steps keep identify's
-        # form-link cta button, which this never overwrites.)
+        # The one-time "profile complete" success message offers the Job Seeker /
+        # Job Creator lane choice — a freshly-registered candidate picks where to
+        # go next, the same hub a known sender gets on greeting. (Earlier
+        # onboarding steps keep identify's form-link cta, never overwritten here.)
         if state.get("just_onboarded"):
-            out["whatsapp_interactive"] = _menu_buttons_message(out["draft_response"])
+            out["whatsapp_interactive"] = _role_choice_message(out["draft_response"])
         return out
 
     @staticmethod
@@ -977,33 +977,37 @@ class AgentRuntime:
     def _route_after_identify(
         self, state: AgentState
     ) -> Literal["onboarding", "greeting", "role_select", "creator", "agent"]:
-        """Routing gate. A greeting now opens with the Job Seeker / Job Creator
-        choice; picking 'Job Seeker' resumes the existing flow (a new number
-        onboards, a known one gets the menu), 'Job Creator' goes to its stub.
-        Everything else keeps the prior split: unknown numbers onboard, known
-        ones go to the reasoning agent."""
-        # First turn after the form is submitted → one-time success message.
+        """Routing gate, keyed on whether the number is already ours.
+
+        * KNOWN number (in the job-board DB, or already onboarded) → a greeting
+          opens the Job Seeker / Job Creator choice; picking one runs that flow.
+        * NEW number (not in our DB) → straight to onboarding (ask name → form);
+          the lane choice is only offered AFTER they've registered — that's the
+          one-time post-form success turn (``just_onboarded``), which carries the
+          lane buttons.
+        """
+        # First turn after the form is submitted → one-time success + lane choice.
         if state.get("just_onboarded"):
             return "onboarding"
 
-        # Lane gate (seeker vs creator) sits in front of the normal flow.
+        # Lane gate (seeker vs creator) — only reachable once known.
         lane = _role_selection(state)
         if lane == "creator":
             return "creator"
         if lane == "seeker":
-            # Seeker picked → resume the usual split: onboard a new number,
-            # show the menu to a known one.
             return "greeting" if state.get("is_known", False) else "onboarding"
 
         q = state.get("inbound_text", "")
-        # A farewell keeps the 0-LLM closer; an opening greeting asks the lane.
         if _CLOSER_RX.match(q):
             return "greeting"
-        if _GREETING_RX.match(q):
-            return "role_select"
 
+        # New numbers must register first — no lane choice until they're known.
         if not state.get("is_known", False):
             return "onboarding"
+        # Known senders: a greeting opens the Job Seeker / Job Creator choice;
+        # anything else goes to the reasoning agent.
+        if _GREETING_RX.match(q):
+            return "role_select"
         return "agent"
 
     def _memory_context(self, state: AgentState, *, for_planner: bool = False) -> str | None:
