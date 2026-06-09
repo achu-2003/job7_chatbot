@@ -41,8 +41,11 @@ _REGEN_INSTRUCTION = (
     "Your last reply included details I can't verify against the CONTEXT. "
     "Rewrite it using ONLY facts shown in CONTEXT/MEMORY. Do NOT include any job "
     "code or reference (never write 'JOB-1234' or similar), and do NOT state any "
-    "salary or number that isn't present in CONTEXT. If CONTEXT lists no matching "
-    "roles, simply say you couldn't find any right now. Max 3 short lines, no emojis."
+    "salary or number that isn't present in CONTEXT. In particular, do NOT state "
+    "any count of jobs/roles/openings (e.g. 'we have 69 open jobs') unless CONTEXT "
+    "has an 'open_jobs_total' — if it doesn't, tell them to tap 'Job Search' to see "
+    "what's open. If CONTEXT lists no matching roles, simply say you couldn't find "
+    "any right now. Max 3 short lines, no emojis."
 )
 
 
@@ -122,6 +125,7 @@ async def respond(
     text, result_label = await _validate_or_regenerate(
         text, state=state, llm=llm, validator=validator,
         messages=messages, grounding=grounding,
+        allowed_counts=_allowed_job_counts(results),
     )
     HALLUCINATION_COUNTER.labels(result=result_label).inc()
     conv.note("respond", f"{len(text)} chars ({result_label})")
@@ -136,12 +140,16 @@ async def _validate_or_regenerate(
     validator: HallucinationValidator,
     messages: list[dict[str, Any]],
     grounding: list[dict[str, Any]],
+    allowed_counts: set[int] | None = None,
 ) -> tuple[str, str]:
     """Validate the draft; on a grounding failure, regenerate once under a strict
     instruction and re-validate. Returns ``(reply, metric_label)`` where the
     label is ``valid`` / ``regenerated`` / ``blocked``."""
     query = state.get("inbound_text")
-    verdict = validator.validate(text, sql_rows=grounding, vector_hits=[], customer_query=query)
+    verdict = validator.validate(
+        text, sql_rows=grounding, vector_hits=[], customer_query=query,
+        allowed_counts=allowed_counts,
+    )
     if verdict.valid:
         return text, "valid"
 
@@ -160,7 +168,10 @@ async def _validate_or_regenerate(
         return _SAFE_FALLBACK, "blocked"
 
     retry = _clean(retry)
-    verdict = validator.validate(retry, sql_rows=grounding, vector_hits=[], customer_query=query)
+    verdict = validator.validate(
+        retry, sql_rows=grounding, vector_hits=[], customer_query=query,
+        allowed_counts=allowed_counts,
+    )
     if verdict.valid:
         return retry, "regenerated"
 
@@ -256,6 +267,30 @@ def _job_listing_reply(results: list[dict[str, Any]]) -> str | None:
 
     dept = next((j.get("department") for j in jobs if j.get("department")), None)
     return build_job_list_text(jobs, dept)
+
+
+def _allowed_job_counts(results: list[dict[str, Any]]) -> set[int]:
+    """The job counts the responder is allowed to state this turn — derived from
+    the actual tool results. A list result grounds its length (e.g. 3 search
+    hits → "3 roles"); an overview result grounds its total + per-category counts.
+    Anything else the model says (a count from memory or the prompt example) is a
+    fabrication the validator will reject."""
+    counts: set[int] = set()
+    for r in results:
+        res = r.get("result")
+        if isinstance(res, list):
+            counts.add(len(res))
+        elif isinstance(res, dict):
+            for key in ("total_open_jobs", "total", "count"):
+                if isinstance(res.get(key), int):
+                    counts.add(res[key])
+            for c in res.get("categories") or []:
+                if isinstance(c, dict) and isinstance(c.get("count"), int):
+                    counts.add(c["count"])
+            for v in res.values():            # nested lists (e.g. applications)
+                if isinstance(v, list):
+                    counts.add(len(v))
+    return counts
 
 
 def _cached_grounding(state: AgentState) -> list[dict[str, Any]]:

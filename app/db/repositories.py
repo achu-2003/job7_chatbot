@@ -27,9 +27,12 @@ from sqlalchemy import text
 
 from app.config import get_settings
 from app.core.exceptions import UnsafeSQLError
+from app.core.logging import get_logger
 from app.core.metrics import SQL_LATENCY
 from app.core.tenancy import get_current_tenant_id
 from app.db.session import session_scope
+
+log = get_logger("repositories")
 
 
 def _tenant_clause(table_alias: str, params: dict[str, Any], tenant_id: str | None) -> str:
@@ -514,3 +517,64 @@ class LookupRepository:
         async with session_scope() as session:
             row = (await session.execute(sql, params)).first()
         return dict(row._mapping) if row else None
+
+    # ---- option lists for the onboarding form -----------------------------
+    # (table, filter on isActive?, ORDER BY, parent-id column). Read-only global
+    # reference data populating the form's dropdowns; each option's value is its
+    # id. ``parent`` (when set) carries the FK to its parent option so the form
+    # can CASCADE — districts → their state, specializations → their course — so
+    # the dependent list is filtered (and de-duplicated) by the parent choice.
+    _OPTION_SOURCES = {
+        "education_levels": ("private_education_levels", True, '"displayOrder" NULLS LAST, name', None),
+        "courses":          ("private_courses", True, '"displayOrder" NULLS LAST, name', None),
+        "specializations":  ("private_specializations", True, '"displayOrder" NULLS LAST, name', "courseId"),
+        "experience_levels":("private_experience_levels", True, '"displayOrder" NULLS LAST', None),
+        "skills":           ("private_skills", True, "name", None),
+        "roles":            ("private_job_roles", True, '"displayOrder" NULLS LAST, name', None),
+        "categories":       ("private_job_categories", False, "name", None),
+        "states":           ("states", False, "name", None),
+        "districts":        ("districts", False, "name", "stateId"),
+    }
+
+    @staticmethod
+    async def options(kind: str) -> list[dict[str, Any]]:
+        """``[{"id", "name"[, "parent"]}]`` for a form dropdown. ``parent`` is the
+        FK to the parent option for cascading lists. Returns [] (never raises) on
+        a miss so a single bad lookup can't break the whole form."""
+        src = LookupRepository._OPTION_SOURCES.get(kind)
+        if not src:
+            return []
+        table, has_active, order, parent = src
+        sel = "id, name" + (f', "{parent}" AS parent' if parent else "")
+        where = 'WHERE "isActive" = TRUE ' if has_active else ""
+        sql = text(f"SELECT {sel} FROM {table} {where}ORDER BY {order}")
+        try:
+            async with session_scope() as session:
+                rows = (await session.execute(sql)).fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                m = r._mapping
+                item = {"id": m["id"], "name": m["name"]}
+                if parent:
+                    item["parent"] = m["parent"]
+                out.append(item)
+            return out
+        except Exception as exc:  # noqa: BLE001 — a lookup miss must not break the form
+            log.warning("lookup_options_failed", kind=kind, error=str(exc)[:160])
+            return []
+
+    @staticmethod
+    async def name_for(kind: str, id_: str | None) -> str | None:
+        """The display name for a selected option id (for back-compat fields like
+        the recommendation engine's preferred_role/location text). None on miss."""
+        src = LookupRepository._OPTION_SOURCES.get(kind)
+        if not id_ or not src:
+            return None
+        try:
+            async with session_scope() as session:
+                row = (await session.execute(
+                    text(f"SELECT name FROM {src[0]} WHERE id = :id"), {"id": id_}
+                )).first()
+            return row._mapping["name"] if row else None
+        except Exception:  # noqa: BLE001
+            return None

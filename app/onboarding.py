@@ -15,17 +15,21 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from app.db.repositories import LookupRepository
-
 # ---------------------------------------------------------------------------
 # Progressive-profiling field plan
 # ---------------------------------------------------------------------------
-# INITIAL  — collected in the onboarding form (enough to create the seeker +
-#            profile and start browsing).
+# INITIAL  — collected in the onboarding form (Step 1-5): enough to create the
+#            seeker + profile + preference child rows and start browsing.
 # APPLY    — the gaps we top up at apply-time, asked ONE at a time and only when
 #            the profile doesn't already have them. resume lives on the
 #            application; expected_salary lives on the profile.
-INITIAL_FIELDS = ("full_name", "email", "years_experience", "preferred_role", "location")
+INITIAL_FIELDS = (
+    "full_name", "email", "gender", "marital_status", "state_id", "district_id",
+    "current_status", "current_year_of_study", "education_level_id", "course_id",
+    "specialization_id", "experience_level_id", "current_salary", "expected_salary",
+    "english_proficiency", "skill_ids", "preferred_location_ids",
+    "preferred_category_ids", "preferred_role_ids",
+)
 
 APPLY_FIELDS = (
     {
@@ -82,34 +86,71 @@ def _to_int(value: Any) -> int | None:
         return None
 
 
+def _to_num(value: Any) -> float | None:
+    """Parse a numeric salary field; None for blank/invalid/negative."""
+    try:
+        v = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return v if v >= 0 else None
+
+
+def _id(form: dict[str, Any], key: str) -> str | None:
+    v = (form.get(key) or "").strip() if isinstance(form.get(key), str) else form.get(key)
+    return (v or None) if isinstance(v, str) else (str(v) if v else None)
+
+
+def _enum(form: dict[str, Any], key: str) -> str | None:
+    """A fixed-enum text field, normalised to the UPPER form the DB stores."""
+    v = (form.get(key) or "").strip().upper()
+    return v or None
+
+
+def _id_list(value: Any) -> list[str]:
+    """The selected ids of a multi-select — a list (form post) or a comma string."""
+    if isinstance(value, (list, tuple)):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if value:
+        return [s.strip() for s in str(value).split(",") if s.strip()]
+    return []
+
+
 async def prepare_registration(*, identity: dict[str, Any], form: dict[str, Any]) -> dict[str, Any]:
-    """Resolve the form's role/location text to FK ids (read-only DB) and build
-    the registration payload."""
-    role_text = (form.get("preferred_role") or "").strip()
-    loc_text = (form.get("location") or "").strip()
-    role = await LookupRepository.find_job_role(role_text) if role_text else None
-    district = await LookupRepository.find_district(loc_text) if loc_text else None
-    return build_registration_records(identity=identity, form=form, role=role, district=district)
+    """Build the registration payload. The form already carries FK ids (the
+    dropdowns are id-valued), so no DB resolution is needed here."""
+    return build_registration_records(identity=identity, form=form)
 
 
 def build_registration_records(
-    *,
-    identity: dict[str, Any],
-    form: dict[str, Any],
-    role: dict[str, Any] | None,
-    district: dict[str, Any] | None,
+    *, identity: dict[str, Any], form: dict[str, Any]
 ) -> dict[str, Any]:
-    """Pure assembly of the DB-shaped records (no I/O), keyed by table name.
-
-    ``resolution`` records what each free-text input matched (or didn't), so an
-    unmatched role/location is visible when inspecting the staged data.
-    """
+    """Pure assembly of the DB-shaped records (no I/O), keyed by table name. The
+    form's dropdown selections are FK ids, so they map straight onto the seeker /
+    profile columns and the preference child rows."""
     seeker_id = _cuid()
     now = _now_iso()
-    name = (identity.get("name") or "").strip()
+    name = (identity.get("name") or form.get("full_name") or "").strip()
     email = (form.get("email") or "").strip() or None
     phone = (identity.get("customer_id") or "").strip() or None
-    experience = _to_int(form.get("years_experience"))
+
+    education_level = _id(form, "education_level_id")
+    course = _id(form, "course_id")
+    specialization = _id(form, "specialization_id")
+    experience_level = _id(form, "experience_level_id")
+    state = _id(form, "state_id")
+    district = _id(form, "district_id")
+    gender = _enum(form, "gender")
+    marital = _enum(form, "marital_status")
+    english = _enum(form, "english_proficiency")
+    current_status = _enum(form, "current_status")
+    year_of_study = _to_int(form.get("current_year_of_study"))
+    current_salary = _to_num(form.get("current_salary"))
+    expected_salary = _to_num(form.get("expected_salary"))
+
+    skill_ids = _id_list(form.get("skill_ids"))
+    location_ids = _id_list(form.get("preferred_location_ids"))
+    role_ids = _id_list(form.get("preferred_role_ids"))
+    category_ids = _id_list(form.get("preferred_category_ids"))
 
     seeker = {
         "id": seeker_id,
@@ -117,7 +158,19 @@ def build_registration_records(
         "fullName": name,
         "email": email,
         "phone": phone,
-        "experience": experience,
+        "gender": gender,
+        "maritalStatus": marital,
+        "englishProficiency": english,
+        "currentStatus": current_status,
+        "currentYearOfStudy": year_of_study,
+        "educationLevelId": education_level,
+        "courseId": course,
+        "specializationId": specialization,
+        "experienceLevelId": experience_level,
+        "preferredStateId": state,
+        "districtId": district,
+        "currentSalary": current_salary,
+        "expectedSalary": expected_salary,
         "status": "ACTIVE",
         "emailVerified": False,
         "phoneVerified": bool(phone),
@@ -129,7 +182,10 @@ def build_registration_records(
     }
 
     # profileCompletion ≈ fraction of the key fields we actually captured.
-    key_fields = [name, email, phone, experience is not None, role, district]
+    key_fields = [
+        name, email, phone, education_level, experience_level, district,
+        bool(skill_ids), bool(location_ids),
+    ]
     completion = round(sum(1 for f in key_fields if f) / len(key_fields) * 100)
     profile = {
         "id": _cuid(),
@@ -138,34 +194,37 @@ def build_registration_records(
         "fullName": name,
         "email": email,
         "phone": phone,
-        "experience": experience,
+        "gender": gender,
+        "maritalStatus": marital,
+        "englishProficiency": english,
+        "currentStatus": current_status,
+        "currentYearOfStudy": year_of_study,
+        "educationLevelId": education_level,
+        "courseId": course,
+        "specializationId": specialization,
+        "experienceLevelId": experience_level,
+        "districtId": district,
+        "currentSalary": current_salary,
+        "expectedSalary": expected_salary,
         "isActive": True,
         "profileCompletion": completion,
         "createdAt": now,
         "updatedAt": now,
     }
 
-    preferred_roles = []
-    if role:
-        preferred_roles.append(
-            {"id": _cuid(), "jobSeekerId": seeker_id, "jobRoleId": role["id"], "createdAt": now}
-        )
-    locations = []
-    if district:
-        locations.append(
-            {"id": _cuid(), "jobSeekerId": seeker_id, "districtId": district["id"], "createdAt": now}
-        )
+    def _children(fk: str, ids: list[str]) -> list[dict[str, Any]]:
+        return [
+            {"id": _cuid(), "jobSeekerId": seeker_id, fk: i, "createdAt": now}
+            for i in ids
+        ]
 
     return {
         "private_job_seekers": seeker,
         "job_seeker_profiles": profile,
-        "private_job_seeker_preferred_roles": preferred_roles,
-        "private_job_seeker_locations": locations,
-        # so unmatched free-text is visible when inspecting the staged record
-        "resolution": {
-            "preferred_role": {"input": form.get("preferred_role") or "", "matched": role},
-            "location": {"input": form.get("location") or "", "matched": district},
-        },
+        "private_job_seeker_skills": _children("skillId", skill_ids),
+        "private_job_seeker_locations": _children("districtId", location_ids),
+        "private_job_seeker_preferred_roles": _children("jobRoleId", role_ids),
+        "private_job_seeker_categories": _children("categoryId", category_ids),
     }
 
 

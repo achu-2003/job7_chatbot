@@ -10,46 +10,67 @@ _IDENTITY = {
 }
 
 
+_FULL_FORM = {
+    "full_name": "Asha Rao", "email": "asha@example.com",
+    "gender": "female", "marital_status": "single",
+    "state_id": "st1", "district_id": "d1",
+    "current_status": "working", "current_year_of_study": "",
+    "education_level_id": "edu1", "course_id": "c1", "specialization_id": "sp1",
+    "experience_level_id": "x1", "current_salary": "18000", "expected_salary": "25000",
+    "english_proficiency": "intermediate",
+    "skill_ids": ["sk1", "sk2"], "preferred_location_ids": ["d1", "d2"],
+    "preferred_category_ids": ["cat1"], "preferred_role_ids": ["r1", "r2"],
+}
+
+
 def test_build_registration_records_full():
-    form = {"email": "asha@example.com", "years_experience": "3",
-            "preferred_role": "Backend Developer", "location": "Chennai"}
-    role = {"id": "role_cuid", "name": "Backend Developer", "slug": "backend-developer"}
-    district = {"id": "dist_cuid", "name": "Chennai", "slug": "chennai"}
-    out = build_registration_records(identity=_IDENTITY, form=form, role=role, district=district)
+    out = build_registration_records(identity=_IDENTITY, form=_FULL_FORM)
 
     seeker = out["private_job_seekers"]
     assert seeker["fullName"] == "Asha Rao"
     assert seeker["email"] == "asha@example.com"
     assert seeker["phone"] == "919876543210"
-    assert seeker["experience"] == 3
-    assert seeker["registrationSource"] == "whatsapp"
-    assert seeker["onboardingDone"] is True
+    # enum fields normalised to the UPPER form the DB stores
+    assert seeker["gender"] == "FEMALE" and seeker["maritalStatus"] == "SINGLE"
+    assert seeker["englishProficiency"] == "INTERMEDIATE" and seeker["currentStatus"] == "WORKING"
+    # FK ids map straight through
+    assert seeker["educationLevelId"] == "edu1" and seeker["experienceLevelId"] == "x1"
+    assert seeker["preferredStateId"] == "st1" and seeker["districtId"] == "d1"
+    assert seeker["currentSalary"] == 18000.0 and seeker["expectedSalary"] == 25000.0
+    assert seeker["registrationSource"] == "whatsapp" and seeker["onboardingDone"] is True
     assert seeker["id"].startswith("c")
 
     profile = out["job_seeker_profiles"]
-    assert profile["jobSeekerId"] == seeker["id"]
-    assert profile["relationType"] == "SELF"
-    assert profile["profileCompletion"] == 100        # all 6 key fields present
+    assert profile["jobSeekerId"] == seeker["id"] and profile["relationType"] == "SELF"
+    assert profile["profileCompletion"] == 100        # all key fields present
 
-    roles = out["private_job_seeker_preferred_roles"]
-    assert len(roles) == 1
-    assert roles[0]["jobRoleId"] == "role_cuid" and roles[0]["jobSeekerId"] == seeker["id"]
-    locs = out["private_job_seeker_locations"]
-    assert len(locs) == 1 and locs[0]["districtId"] == "dist_cuid"
-    assert out["resolution"]["preferred_role"]["matched"]["id"] == "role_cuid"
+    sid = seeker["id"]
+    assert [r["skillId"] for r in out["private_job_seeker_skills"]] == ["sk1", "sk2"]
+    assert [r["districtId"] for r in out["private_job_seeker_locations"]] == ["d1", "d2"]
+    assert [r["jobRoleId"] for r in out["private_job_seeker_preferred_roles"]] == ["r1", "r2"]
+    assert [r["categoryId"] for r in out["private_job_seeker_categories"]] == ["cat1"]
+    assert all(r["jobSeekerId"] == sid for r in out["private_job_seeker_skills"])
 
 
-def test_build_registration_unmatched_role_and_location():
-    form = {"email": "sam@x.com", "years_experience": "",
-            "preferred_role": "Wizard", "location": "Atlantis"}
-    out = build_registration_records(identity=_IDENTITY, form=form, role=None, district=None)
-    assert out["private_job_seeker_preferred_roles"] == []   # no FK → no child row
-    assert out["private_job_seeker_locations"] == []
-    assert out["job_seeker_profiles"]["experience"] is None
-    # name + email + phone present (3 of 6) → 50%
+def test_build_registration_minimal():
+    # Only the required fields → empty preference rows, partial completion.
+    form = {"full_name": "Sam", "email": "sam@x.com", "preferred_location_ids": ["d9"]}
+    out = build_registration_records(identity=_IDENTITY, form=form)
+    assert out["private_job_seeker_preferred_roles"] == []
+    assert out["private_job_seeker_skills"] == []
+    assert out["private_job_seeker_categories"] == []
+    assert [r["districtId"] for r in out["private_job_seeker_locations"]] == ["d9"]
+    assert out["private_job_seekers"]["currentSalary"] is None
+    # name + email + phone + location (4 of 8 key fields) → 50%
     assert out["job_seeker_profiles"]["profileCompletion"] == 50
-    assert out["resolution"]["location"]["input"] == "Atlantis"
-    assert out["resolution"]["location"]["matched"] is None
+
+
+async def test_prepare_registration_passes_ids_through():
+    # The dropdowns are id-valued, so prepare_registration no longer resolves
+    # any text — it just assembles the records from the submitted ids.
+    out = await ob.prepare_registration(identity=_IDENTITY, form=_FULL_FORM)
+    assert out["private_job_seeker_preferred_roles"][0]["jobRoleId"] == "r1"
+    assert out["private_job_seeker_locations"][0]["districtId"] == "d1"
 
 
 def test_known_apply_fields():
@@ -83,18 +104,3 @@ def test_build_application_record():
     assert built["profile_update"] == {"resume": "http://cv/me", "expectedSalary": 30000}
 
 
-async def test_prepare_registration_resolves_fk_ids(monkeypatch):
-    async def fake_role(name):
-        return {"id": "r1", "name": name, "slug": "x"}
-
-    async def fake_dist(name):
-        return {"id": "d1", "name": name, "slug": "y"}
-
-    monkeypatch.setattr(ob.LookupRepository, "find_job_role", fake_role)
-    monkeypatch.setattr(ob.LookupRepository, "find_district", fake_dist)
-
-    form = {"email": "a@b.com", "years_experience": "2",
-            "preferred_role": "Dev", "location": "Chennai"}
-    out = await ob.prepare_registration(identity=_IDENTITY, form=form)
-    assert out["private_job_seeker_preferred_roles"][0]["jobRoleId"] == "r1"
-    assert out["private_job_seeker_locations"][0]["districtId"] == "d1"

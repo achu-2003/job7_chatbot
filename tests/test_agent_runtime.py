@@ -362,9 +362,8 @@ async def test_form_just_submitted_shows_welcome_and_menu():
     _stub_memory(rt, facts={"full_name": "Achuthan E"}, onboarded=True, welcomed=False)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "hi")
-    assert "welcome back" in out["response"].lower()
+    assert "registered successfully" in out["response"].lower()   # one-time confirmation
     assert "achuthan" in out["response"].lower()
-    assert "looking for" in out["response"].lower()
     # the 3 menu buttons ride along
     titles = [b["reply"]["title"]
               for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]

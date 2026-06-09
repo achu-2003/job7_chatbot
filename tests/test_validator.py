@@ -92,3 +92,50 @@ def test_validator_allows_response_without_numbers():
         vector_hits=[],
     )
     assert res.valid
+
+
+def test_validator_flags_fabricated_job_count():
+    # The classic bug: "We have 69 open jobs ..." with no overview/search result
+    # backing it. With allowed_counts provided (empty → nothing grounded), the
+    # count is a fabrication.
+    v = HallucinationValidator()
+    res = v.validate(
+        "We have 69 open jobs — Sales (15), IT (18), Admin (3). Which area interests you?",
+        sql_rows=[], vector_hits=[], allowed_counts=set(),
+    )
+    assert not res.valid
+    assert any("unsupported_job_count:69" in o for o in (res.offending or []))
+    assert any("unsupported_category_count:15" in o for o in (res.offending or []))
+
+
+def test_validator_allows_grounded_job_count():
+    # When the turn really fetched the overview, the total + category counts are
+    # grounded and pass.
+    v = HallucinationValidator()
+    res = v.validate(
+        "We have 4 open jobs — Technician (2), Admin (1), IT (1). Which area interests you?",
+        sql_rows=[], vector_hits=[], allowed_counts={4, 2, 1},
+    )
+    assert res.valid, res.offending
+
+
+def test_validator_count_check_disabled_without_allowed_counts():
+    # Back-compat: callers that don't compute counts (allowed_counts=None) skip
+    # the count check entirely — a count phrase is not flagged.
+    v = HallucinationValidator()
+    res = v.validate(
+        "We have 69 open jobs right now.",
+        sql_rows=[], vector_hits=[],
+    )
+    assert res.valid
+
+
+def test_validator_allows_count_the_candidate_used():
+    # Echoing a number the candidate themselves mentioned is not a fabrication.
+    v = HallucinationValidator()
+    res = v.validate(
+        "Sure — here are 3 roles for you.",
+        sql_rows=[], vector_hits=[], allowed_counts=set(),
+        customer_query="show me 3 roles",
+    )
+    assert res.valid, res.offending

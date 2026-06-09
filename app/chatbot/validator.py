@@ -36,6 +36,18 @@ _PRICE_RX = re.compile(
 _JOB_RX = re.compile(r"\bJOB[-_](?=[A-Z0-9]*\d)[A-Z0-9]{4,}\b", re.IGNORECASE)
 _APP_RX = re.compile(r"\bAPP[-_](?=[A-Z0-9]*\d)[A-Z0-9]{4,}\b", re.IGNORECASE)
 
+# Aggregate job-count claims the model might fabricate: "69 open jobs", "3 roles",
+# "5 openings". In this app totals/counts come ONLY from deterministic nodes or a
+# tool result — the LLM responder has no business inventing one — so any count it
+# states must be backed by the turn's results (see ``allowed_counts`` in validate).
+_JOB_COUNT_RX = re.compile(
+    r"\b(\d{1,5})\s+(?:open\s+|live\s+|available\s+|current\s+|new\s+)*"
+    r"(?:jobs?|roles?|openings?|positions?|vacancies|vacancy)\b",
+    re.IGNORECASE,
+)
+# Category breakdown counts: "Sales (15)", "IT (18)".
+_CATEGORY_COUNT_RX = re.compile(r"\(\s*(\d{1,5})\s*\)")
+
 # Indian salary shorthand the model writes for large figures: "₹15 LPA",
 # "₹15 lakh", "₹15L", "₹30k", "₹1.5 cr". The stored salary_min/max are raw
 # integers (e.g. 1_500_000), so we must scale the quoted number by its unit
@@ -134,8 +146,27 @@ class HallucinationValidator:
         sql_rows: list[dict[str, Any]],
         vector_hits: list[dict[str, Any]],
         customer_query: str | None = None,
+        allowed_counts: set[int] | None = None,
     ) -> ValidationResult:
         offending: list[str] = []
+
+        # Job-count grounding: when ``allowed_counts`` is provided (the responder
+        # passes the counts actually present in this turn's tool results), any
+        # "N jobs"/"N roles" or category "(N)" the model states must be one of
+        # them — or a number the candidate themselves used. A count from nowhere
+        # (e.g. a stale "69 open jobs" copied from memory or the prompt example)
+        # is a fabrication. ``None`` disables the check (back-compat for callers
+        # that don't compute counts).
+        if allowed_counts is not None:
+            allowed = set(allowed_counts)
+            if customer_query:
+                for m in re.finditer(r"\b(\d{1,5})\b", customer_query):
+                    allowed.add(int(m.group(1)))
+            for rx, tag in ((_JOB_COUNT_RX, "unsupported_job_count"),
+                            (_CATEGORY_COUNT_RX, "unsupported_category_count")):
+                for m in rx.finditer(response):
+                    if int(m.group(1)) not in allowed:
+                        offending.append(f"{tag}:{m.group(1)}")
 
         # Allowed salary figures: those returned by the job rows plus any number
         # the candidate already supplied (e.g. their expected salary). Echoing

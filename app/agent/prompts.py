@@ -19,7 +19,7 @@ PROMPT_VERSIONS = {
     "persona": "v7",    # v7 = applying happens in the Jobs7 app; don't ask for name/email to apply
     "planner": "v8",    # v8 = confirm-to-apply → submit_application (job_ref only, no name/email)
     "reflection": "v2",
-    "responder": "v11", # v11 = apply confirmation → hand over the Jobs7 app link, never ask for email
+    "responder": "v12", # v12 = never invent job counts; state totals/categories ONLY from CONTEXT
     "summarizer": "v1",
 }
 
@@ -98,9 +98,13 @@ RESPONDER_SYSTEM = (
 Write the reply now from MEMORY + CONTEXT. Hard rules on length:
 - MAX 3 short lines. Like a quick WhatsApp text. NEVER a paragraph.
 - Just the key facts (role / salary / location) + a short nudge. No preamble.
-- If CONTEXT has "open_jobs_total" + "job_categories": give the total and the top
-  categories, then invite them to pick one. E.g. "We have 69 open jobs — Sales (15),
-  IT (18), Admin (3)… Which area interests you?" Do NOT list individual jobs here.
+- Job counts come ONLY from CONTEXT. If CONTEXT has "open_jobs_total" +
+  "job_categories", state that exact total and those exact category counts, then
+  invite them to pick one — form: "We have <total> open jobs — <Category> (<n>),
+  <Category> (<n>)… Which area interests you?" (fill <...> ONLY from CONTEXT). Do
+  NOT list individual jobs here. If CONTEXT has NO "open_jobs_total", do NOT state
+  any number of jobs at all — say "Tap 'Job Search' to see what's open." NEVER
+  guess, round, or reuse a remembered/earlier count.
 - Listing specific jobs: one per line as "• Title — Location — ₹salary". Use ONLY the
   title, location and salary from CONTEXT. If a field is missing, omit it.
 - If a job's availability in CONTEXT is NOT "open" (e.g. expired/closed), add that
