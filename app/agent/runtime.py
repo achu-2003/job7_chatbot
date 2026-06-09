@@ -1000,18 +1000,9 @@ class AgentRuntime:
           Once the form is submitted and written to the DB, the next greeting
           finds them known and they get the lane choice via this same path.
         """
-<<<<<<< Updated upstream
         # First turn after the form is submitted → one-time success + lane choice.
         if state.get("just_onboarded"):
             return "onboarding"
-=======
-        # Lane gate (seeker vs creator) — only reachable once known.
-        lane = _role_selection(state)
-        if lane == "creator":
-            return "creator"
-        if lane == "seeker":
-            return "greeting" if state.get("is_known", False) else "onboarding"
->>>>>>> Stashed changes
 
         q = state.get("inbound_text", "")
         if _CLOSER_RX.match(q):
