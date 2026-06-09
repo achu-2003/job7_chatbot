@@ -25,6 +25,14 @@ def _tokens(s: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", (s or "").lower())
 
 
+def search_terms(text: str) -> str:
+    """The meaningful words of a typed query, with filler ('job', 'show', …)
+    stripped — used to match a specific role against job titles. 'Welder job' →
+    'welder'; 'data entry operator jobs' → 'data entry operator'."""
+    toks = [t for t in _tokens(text) if t not in _STOP and len(t) >= 3]
+    return " ".join(toks).strip()
+
+
 def _acronym(name: str) -> str:
     """First letter of each real word — 'Information Technology' -> 'it'."""
     words = [w for w in re.findall(r"[A-Za-z]+", name) if len(w) > 1]

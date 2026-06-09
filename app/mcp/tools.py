@@ -247,6 +247,15 @@ async def get_job_core(*, tenant_id: str, ref: str) -> dict[str, Any] | None:
     return _compact_job(row) if row else None
 
 
+async def search_jobs_by_title_core(
+    *, tenant_id: str, query: str, limit: int = 8
+) -> list[dict[str, Any]]:
+    """Deterministic title search for a typed specific role ('welder' → Welder
+    openings). Returns compact job rows. Empty when nothing matches."""
+    rows = await JobRepository.search_by_title(query, limit=limit, tenant_id=tenant_id)
+    return [_compact_job(r) for r in rows]
+
+
 async def search_jobs_core(
     vector: VectorStore,
     *,

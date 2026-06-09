@@ -30,6 +30,7 @@ from langgraph.graph import END, START, StateGraph
 
 from app import onboarding
 from app.agent import jobflow
+from app.agent.browse import search_terms
 from app.agent.context import is_followup
 from app.agent.identity import extract_name, is_plausible_name
 from app.agent.nodes.humanizer import build_delivery_plan
@@ -56,6 +57,7 @@ from app.mcp.tools import (
     list_category_jobs_core,
     list_jobs_overview_core,
     recommend_jobs_core,
+    search_jobs_by_title_core,
 )
 from app.vector.store import VectorStore
 from app.memory.gateway import MemoryGateway
@@ -247,6 +249,7 @@ class AgentRuntime:
         self._jobs_overview = list_jobs_overview_core
         self._recommend = recommend_jobs_core
         self._job_lookup = get_job_core
+        self._title_search = search_jobs_by_title_core
         self._graph = self._build_graph()
 
     # ---- nodes (bound coroutine methods) ----------------------------
@@ -311,7 +314,38 @@ class AgentRuntime:
         # Typed path: an application/status turn must not be hijacked into browse.
         if _ORDER_HINT_RX.search(text):
             return {}
-        return await self._browse_category(state, text, offset=0)
+        # A typed category → its role list; otherwise try matching a specific role
+        # by job title ("welder" → Welder openings). Only if both miss do we fall
+        # through to the planner (FAQ / chit-chat / status are handled there).
+        return (
+            await self._browse_category(state, text, offset=0)
+            or await self._browse_role_search(state, text)
+        )
+
+    async def _browse_role_search(self, state: AgentState, text: str) -> dict[str, Any]:
+        """A typed specific role (not a category) → the matching job cards,
+        straight from a deterministic title search (no LLM)."""
+        query = search_terms(text)
+        if len(query) < 3:
+            return {}
+        try:
+            jobs = await self._title_search(
+                tenant_id=state["tenant_id"], query=query, limit=5
+            )
+        except Exception as exc:  # noqa: BLE001 — a search miss must never break the turn
+            log.warning("title_search_failed", error=str(exc)[:200])
+            return {}
+        if not jobs:
+            return {}
+        cards, body = jobflow.job_cards(jobs, limit=5)
+        plural = "opening" if len(jobs) == 1 else "openings"
+        header = f"{len(jobs)} {plural} matching “{query.title()}”:"
+        await self._save_browse(state, {"stage": "results"})
+        return {
+            "intent": "browse", "did_browse": True, "used_llm": False,
+            "draft_response": f"{header}\n\n{body}", "whatsapp_messages": cards,
+            "catalog_hits": jobs,
+        }
 
     async def _category_jobs(self, state: AgentState, category: str) -> tuple[str, list[dict[str, Any]]]:
         """Resolve a category phrase to (exact name, all its jobs), or ('', [])."""

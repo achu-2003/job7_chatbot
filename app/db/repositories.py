@@ -199,6 +199,37 @@ class JobRepository:
         return rows, sql
 
     @staticmethod
+    async def search_by_title(
+        query: str, *, limit: int = 8, tenant_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Deterministic title match for a typed role ('welder' → Welder jobs).
+        Matches the whole phrase first; if nothing, OR-matches each word so a
+        multi-word query still finds something. Live openings only."""
+        words = [w for w in re.findall(r"[a-z0-9]+", (query or "").lower()) if len(w) >= 3]
+        if not words:
+            return []
+        start = time.perf_counter()
+        async with session_scope() as session:
+            for clause, params in (
+                ("j.title ILIKE :phrase", {"phrase": f"%{' '.join(words)}%"}),
+                (" OR ".join(f"j.title ILIKE :w{i}" for i in range(len(words))),
+                 {f"w{i}": f"%{w}%" for i, w in enumerate(words)}),
+            ):
+                p = dict(params, limit=limit)
+                tenant_sql = _tenant_clause("j", p, tenant_id)
+                sql = text(
+                    JobRepository._SELECT
+                    + f"WHERE {JobRepository._LIVE}{tenant_sql} AND ({clause}) "
+                    + 'ORDER BY j."createdAt" DESC LIMIT :limit'
+                )
+                res = await session.execute(sql, p)
+                rows = [dict(r._mapping) for r in res]
+                if rows:
+                    break
+        SQL_LATENCY.labels(op="job_title_search").observe(time.perf_counter() - start)
+        return rows
+
+    @staticmethod
     async def get_by_ids(
         ids: list[str],
         *,

@@ -51,6 +51,7 @@ def _stub_memory(
     job_lookup: dict | None = None,
     apply_state: dict | None = None,
     registration: dict | None = None,
+    title_jobs: list | None = None,
 ) -> None:
     # Default to a fully-onboarded sender so the identity gate is a no-op and the
     # reasoning tests below exercise the normal path. Onboarding tests pass
@@ -170,6 +171,11 @@ def _stub_memory(
     rt._jobs_overview = fake_overview      # type: ignore[assignment]
     rt._recommend = fake_recommend         # type: ignore[assignment]
     rt._job_lookup = fake_job_lookup       # type: ignore[assignment]
+
+    async def fake_title_search(**kw):
+        return title_jobs or []
+
+    rt._title_search = fake_title_search   # type: ignore[assignment]
     # expose action-call logs for assertions
     rt._test_saved = saved_calls           # type: ignore[attr-defined]
     rt._test_applied = applied_calls       # type: ignore[attr-defined]
@@ -600,14 +606,33 @@ async def test_category_browse_shows_tappable_role_list():
     assert len(out["delivery_plan"]) == 1                          # single bubble
 
 
-async def test_non_category_message_falls_through_to_agent():
-    """When the message names no category, browse returns nothing and the normal
-    planner path runs."""
+async def test_typed_specific_role_shows_matching_job_cards():
+    """Typing a specific role that's NOT a category ('Welder job') runs a
+    deterministic title search and shows the matching job cards — no LLM."""
     rt = _runtime()
-    _stub_memory(rt, browse=None)
+    welders = [
+        {"job_ref": "w1", "title": "Welder", "location": "Chennai",
+         "salary_min": 20000, "salary_max": 30000, "employment_type": "full_time"},
+        {"job_ref": "w2", "title": "Senior Welder", "location": "Coimbatore"},
+    ]
+    _stub_memory(rt, browse=None, title_jobs=welders)   # not a category; title search hits
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Welder job")
+    cards = out["whatsapp_messages"]
+    assert len(cards) == 2
+    assert cards[0]["interactive"]["action"]["buttons"][0]["reply"]["id"] == "apply:w1"
+    assert "matching" in out["response"].lower() and "Welder" in out["response"]
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
+
+
+async def test_non_category_no_title_match_falls_through_to_agent():
+    """When the message names no category AND no job title matches, browse returns
+    nothing and the normal planner path runs."""
+    rt = _runtime()
+    _stub_memory(rt, browse=None, title_jobs=[])         # category miss + title miss
     rt.llm = _FakeLLM(plans=[{"goal": "greet", "direct_answer": True, "steps": []}],
                       reply="Found some roles!")
-    out = await _handle(rt, "python developer roles")
+    out = await _handle(rt, "tell me a joke")
     assert out["response"] == "Found some roles!"
     assert rt.llm.json_calls == ["agent_plan"]
 
