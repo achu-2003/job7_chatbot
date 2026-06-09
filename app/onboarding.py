@@ -191,7 +191,7 @@ def build_registration_records(
         "phoneVerified": bool(phone),
         "onboardingDone": True,
         "willingToRelocate": relocate,
-        "registrationSource": "whatsapp",
+        "registrationSource": "WHATSAPP_BOT",
         "createdAt": now,
         "updatedAt": now,
     }

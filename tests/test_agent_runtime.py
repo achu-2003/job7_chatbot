@@ -37,11 +37,14 @@ def _runtime() -> AgentRuntime:
     return AgentRuntime(vector=_FakeVector(), memory=SimpleNamespace())
 
 
+_UNSET = object()
+
+
 def _stub_memory(
     rt: AgentRuntime,
     *,
     facts: dict | None = None,
-    candidate: dict | None = None,
+    candidate: object = _UNSET,
     onboarded: bool = True,
     welcomed: bool = True,
     browse: dict | None = None,
@@ -58,6 +61,18 @@ def _stub_memory(
     # facts={} / onboarded=False (and optionally a candidate) to drive the gate.
     if facts is None:
         facts = {"full_name": "Asha", "email": "asha@example.com"}
+
+    # "Known" is now decided ONLY by the job-board DB lookup. So an unspecified
+    # candidate defaults to a real DB record when ``onboarded`` (the established
+    # user the reasoning tests assume), and to None when not (onboarding tests).
+    # Pass candidate=... explicitly to override, or candidate=None to force a new
+    # number even with onboarded=True.
+    if candidate is _UNSET:
+        candidate = (
+            {"id": 1, "full_name": facts.get("full_name") or "Asha",
+             "email": facts.get("email") or "known@example.com"}
+            if onboarded else None
+        )
 
     async def fake_load(**kw):
         return {
@@ -391,33 +406,17 @@ async def test_form_link_sent_as_cta_button_when_https(monkeypatch):
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
-async def test_form_submission_completes_onboarding():
-    """Once the form is submitted (present in Redis), the gate opens and the
-    sender is handled normally — greeted by name here, with 0 LLM."""
+async def test_db_known_user_gets_lane_choice():
+    """A number found in the job-board DB is known → greeted by name with the
+    Job Seeker / Job Creator lane choice, with 0 LLM (no onboarding)."""
     rt = _runtime()
-    _stub_memory(rt, facts={"full_name": "Achuthan E"}, onboarded=True)
+    _stub_memory(rt, candidate={"id": 7, "full_name": "Achuthan E", "email": "a@x.com"})
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "hi")
     assert "achuthan" in out["response"].lower()    # past the gate → greeted by name
     titles = [b["reply"]["title"]
               for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
     assert titles == ["Job Seeker", "Job Creator"]   # lane choice, not the name/form ask
-    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
-
-
-async def test_form_just_submitted_shows_success_and_lane_choice():
-    """The first turn after the form is submitted gets a one-time success message
-    WITH the Job Seeker / Job Creator lane choice (0 LLM) — a freshly-registered
-    candidate picks where to go next."""
-    rt = _runtime()
-    _stub_memory(rt, facts={"full_name": "Achuthan E"}, onboarded=True, welcomed=False)
-    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
-    out = await _handle(rt, "hi")
-    assert "registered successfully" in out["response"].lower()   # one-time confirmation
-    assert "achuthan" in out["response"].lower()
-    titles = [b["reply"]["title"]
-              for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
-    assert titles == ["Job Seeker", "Job Creator"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 

@@ -193,15 +193,6 @@ def _onboard_form_cta_body(name: str | None) -> str:
     )
 
 
-def _onboard_success(name: str | None) -> str:
-    """One-time confirmation shown the first time a candidate messages after
-    submitting the onboarding form (carries the Job Seeker / Job Creator lane
-    choice, set in _onboarding_response)."""
-    who = f" {_first_name(name)}" if name else ""
-    return (
-        f"You're registered successfully{who}! ✅\n\n"
-        "Are you here to find a job, or to post jobs and hire?"
-    )
 
 
 def _trim_result(res: Any) -> Any:
@@ -702,14 +693,13 @@ class AgentRuntime:
     async def _identify(self, state: AgentState) -> dict[str, Any]:
         """Decide whether the sender is a known person or a new number to onboard.
 
-        Known = a registered job-seeker in the job board (lookup by phone) OR a
-        new number that has completed onboarding: their name (captured in chat)
-        plus a short self-hosted web form (email/experience/role) whose data is
-        kept in Redis only. Until both are done the sender is routed to the
-        onboarding response — first asked for the name, then handed the form
-        link — and all normal job help is gated. Name capture/storage is the
-        persist node's job; we reuse the SAME name extractor here so the field we
-        ask for is exactly the one persist will (or won't) store.
+        Known is decided SOLELY by the job-board DB (phone lookup) — never by a
+        Redis-cached name or a staged form. A new number (not in the DB) is always
+        onboarded: first asked for its name (captured in chat), then handed the
+        tokenised form link, until the submitted form is written to the DB (after
+        which the phone lookup finds it and the sender is known). The cached name
+        is used only to prefill the form / avoid re-asking — it never makes a
+        not-in-DB sender count as registered.
         """
         facts = dict(state.get("customer_facts") or {})
         phone = (state.get("customer_id") or "").strip()
@@ -762,39 +752,17 @@ class AgentRuntime:
                 "customer_facts": facts,
             }
 
-        # 2) NOT in the active table → a new number we must ONBOARD. Step one is
-        # the name (captured in chat); step two is a short self-hosted web form
-        # (email, experience, preferred role/location) whose data we keep in
-        # Redis only — never the business DB. Job help is gated until that form
-        # is submitted.
+        # 2) NOT in the DB → a new number we must ONBOARD, regardless of any
+        # Redis-cached name/form. Step one is the name (captured in chat); step
+        # two is the tokenised web form. Once submitted, the form is written to
+        # the DB (JobSeekerRepository), so the NEXT turn's phone lookup (step 1)
+        # finds them and they're known — no Redis gate involved. The cached name
+        # only prefills the form / avoids re-asking; it never grants known status.
         name = facts.get("full_name") or extract_name(
             text, assistant_prompt=self._last_assistant(state)
         )
         if not name:
             return {"is_known": False, "onboarding_prompt": _ONBOARD_ASK_NAME}
-
-        form = await self.gateway.onboarding(
-            tenant_id=state["tenant_id"], conversation_id=state["conversation_id"],
-        )
-        if form:
-            # Form submitted → fully onboarded. Seed name/email from it so the
-            # bot can greet/help right away. The FIRST turn after submission gets
-            # a one-time success message; later turns proceed normally.
-            facts["full_name"] = facts.get("full_name") or form.get("name") or name
-            if form.get("email"):
-                facts["email"] = facts.get("email") or form.get("email")
-            if not form.get("welcomed"):
-                await self.gateway.mark_onboarding_welcomed(
-                    tenant_id=state["tenant_id"],
-                    conversation_id=state["conversation_id"],
-                )
-                return {
-                    "is_known": True,
-                    "just_onboarded": True,
-                    "onboarding_prompt": _onboard_success(facts.get("full_name") or name),
-                    "customer_facts": facts,
-                }
-            return {"is_known": True, "customer_facts": facts}
 
         token = await self.gateway.onboarding_token(
             tenant_id=state["tenant_id"], customer_id=phone,
@@ -819,18 +787,16 @@ class AgentRuntime:
         """0-LLM reply that asks a new number for their name/email (or welcomes
         them once both are in). The value they give is stored by the persist
         node via the shared identity extractors."""
-        out: dict[str, Any] = {
+        # Onboarding turns (ask-name / form-link) keep whatever interactive
+        # payload identify set (e.g. the form-link cta button). Once the form is
+        # submitted and written to the DB, the next turn's phone lookup makes the
+        # sender known and they get the Job Seeker / Job Creator lane choice via
+        # the normal greeting path — there's no separate post-form turn here.
+        return {
             "intent": "onboarding",
             "draft_response": state.get("onboarding_prompt") or _ONBOARD_ASK_NAME,
             "used_llm": False,
         }
-        # The one-time "profile complete" success message offers the Job Seeker /
-        # Job Creator lane choice — a freshly-registered candidate picks where to
-        # go next, the same hub a known sender gets on greeting. (Earlier
-        # onboarding steps keep identify's form-link cta, never overwritten here.)
-        if state.get("just_onboarded"):
-            out["whatsapp_interactive"] = _role_choice_message(out["draft_response"])
-        return out
 
     @staticmethod
     def _last_assistant(state: AgentState) -> str | None:
@@ -1026,18 +992,26 @@ class AgentRuntime:
     def _route_after_identify(
         self, state: AgentState
     ) -> Literal["onboarding", "greeting", "role_select", "creator", "agent"]:
-        """Routing gate, keyed on whether the number is already ours.
+        """Routing gate, keyed on whether the number is in the job-board DB.
 
-        * KNOWN number (in the job-board DB, or already onboarded) → a greeting
-          opens the Job Seeker / Job Creator choice; picking one runs that flow.
-        * NEW number (not in our DB) → straight to onboarding (ask name → form);
-          the lane choice is only offered AFTER they've registered — that's the
-          one-time post-form success turn (``just_onboarded``), which carries the
-          lane buttons.
+        * KNOWN number (DB phone lookup hit) → a greeting opens the Job Seeker /
+          Job Creator choice; picking one runs that flow.
+        * NEW number (not in the DB) → straight to onboarding (ask name → form).
+          Once the form is submitted and written to the DB, the next greeting
+          finds them known and they get the lane choice via this same path.
         """
+<<<<<<< Updated upstream
         # First turn after the form is submitted → one-time success + lane choice.
         if state.get("just_onboarded"):
             return "onboarding"
+=======
+        # Lane gate (seeker vs creator) — only reachable once known.
+        lane = _role_selection(state)
+        if lane == "creator":
+            return "creator"
+        if lane == "seeker":
+            return "greeting" if state.get("is_known", False) else "onboarding"
+>>>>>>> Stashed changes
 
         q = state.get("inbound_text", "")
         if _CLOSER_RX.match(q):

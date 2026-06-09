@@ -37,7 +37,7 @@ def test_build_registration_records_full():
     assert seeker["educationLevelId"] == "edu1" and seeker["experienceLevelId"] == "x1"
     assert seeker["preferredStateId"] == "st1" and seeker["districtId"] == "d1"
     assert seeker["currentSalary"] == 18000.0 and seeker["expectedSalary"] == 25000.0
-    assert seeker["registrationSource"] == "whatsapp" and seeker["onboardingDone"] is True
+    assert seeker["registrationSource"] == "WHATSAPP_BOT" and seeker["onboardingDone"] is True
     assert seeker["id"].startswith("c")
 
     profile = out["job_seeker_profiles"]
