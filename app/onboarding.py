@@ -133,6 +133,7 @@ def build_registration_records(
     email = (form.get("email") or "").strip() or None
     phone = (identity.get("customer_id") or "").strip() or None
 
+    profile_id = _cuid()
     education_level = _id(form, "education_level_id")
     course = _id(form, "course_id")
     specialization = _id(form, "specialization_id")
@@ -143,14 +144,24 @@ def build_registration_records(
     marital = _enum(form, "marital_status")
     english = _enum(form, "english_proficiency")
     current_status = _enum(form, "current_status")
+    work_mode = _enum(form, "work_mode")
     year_of_study = _to_int(form.get("current_year_of_study"))
+    year_of_passing = _to_int(form.get("year_of_passing"))
     current_salary = _to_num(form.get("current_salary"))
     expected_salary = _to_num(form.get("expected_salary"))
+    dob = (form.get("date_of_birth") or "").strip() or None
+    city = (form.get("city") or "").strip() or None
+    job_types = [str(t).strip().upper() for t in _id_list(form.get("job_types"))]
+    abroad = str(form.get("interested_in_abroad") or "").strip().lower() in {"yes", "true", "1", "on"}
 
     skill_ids = _id_list(form.get("skill_ids"))
     location_ids = _id_list(form.get("preferred_location_ids"))
     role_ids = _id_list(form.get("preferred_role_ids"))
     category_ids = _id_list(form.get("preferred_category_ids"))
+    other_state_ids = _id_list(form.get("other_state_ids"))
+    # languages: list of {languageId, speak, write} pre-parsed by the route
+    languages = form.get("languages") if isinstance(form.get("languages"), list) else []
+    relocate = bool(other_state_ids or abroad)
 
     seeker = {
         "id": seeker_id,
@@ -160,22 +171,26 @@ def build_registration_records(
         "phone": phone,
         "gender": gender,
         "maritalStatus": marital,
+        "dateOfBirth": dob,
+        "city": city,
         "englishProficiency": english,
         "currentStatus": current_status,
         "currentYearOfStudy": year_of_study,
         "educationLevelId": education_level,
         "courseId": course,
         "specializationId": specialization,
+        "yearOfPassing": year_of_passing,
         "experienceLevelId": experience_level,
         "preferredStateId": state,
         "districtId": district,
         "currentSalary": current_salary,
         "expectedSalary": expected_salary,
+        "workFromHomePreference": work_mode,
         "status": "ACTIVE",
         "emailVerified": False,
         "phoneVerified": bool(phone),
         "onboardingDone": True,
-        "willingToRelocate": False,
+        "willingToRelocate": relocate,
         "registrationSource": "whatsapp",
         "createdAt": now,
         "updatedAt": now,
@@ -183,12 +198,13 @@ def build_registration_records(
 
     # profileCompletion ≈ fraction of the key fields we actually captured.
     key_fields = [
-        name, email, phone, education_level, experience_level, district,
-        bool(skill_ids), bool(location_ids),
+        name, email, phone, gender, dob, education_level, specialization,
+        experience_level or expected_salary, district, bool(skill_ids),
+        bool(category_ids), bool(location_ids),
     ]
     completion = round(sum(1 for f in key_fields if f) / len(key_fields) * 100)
     profile = {
-        "id": _cuid(),
+        "id": profile_id,
         "jobSeekerId": seeker_id,
         "relationType": "SELF",
         "fullName": name,
@@ -196,35 +212,60 @@ def build_registration_records(
         "phone": phone,
         "gender": gender,
         "maritalStatus": marital,
+        "dateOfBirth": dob,
+        "city": city,
         "englishProficiency": english,
         "currentStatus": current_status,
         "currentYearOfStudy": year_of_study,
         "educationLevelId": education_level,
         "courseId": course,
         "specializationId": specialization,
+        "yearOfPassing": year_of_passing,
         "experienceLevelId": experience_level,
         "districtId": district,
         "currentSalary": current_salary,
         "expectedSalary": expected_salary,
+        "workFromHomePreference": work_mode,
+        "jobTypes": job_types,
+        "interestedInAbroad": abroad,
+        "willingToRelocate": relocate,
         "isActive": True,
         "profileCompletion": completion,
         "createdAt": now,
         "updatedAt": now,
     }
 
-    def _children(fk: str, ids: list[str]) -> list[dict[str, Any]]:
-        return [
-            {"id": _cuid(), "jobSeekerId": seeker_id, fk: i, "createdAt": now}
-            for i in ids
-        ]
+    def _seeker_children(fk: str, ids: list[str]) -> list[dict[str, Any]]:
+        return [{"id": _cuid(), "jobSeekerId": seeker_id, fk: i, "createdAt": now} for i in ids]
+
+    def _profile_children(fk: str, ids: list[str]) -> list[dict[str, Any]]:
+        return [{"id": _cuid(), "profileId": profile_id, fk: i, "createdAt": now} for i in ids]
+
+    language_rows = [
+        {
+            "id": _cuid(), "profileId": profile_id,
+            "languageId": lang.get("languageId"),
+            "speakLevel": (lang.get("speak") or None),
+            "writeLevel": (lang.get("write") or None),
+            "createdAt": now,
+        }
+        for lang in languages if isinstance(lang, dict) and lang.get("languageId")
+    ]
 
     return {
         "private_job_seekers": seeker,
         "job_seeker_profiles": profile,
-        "private_job_seeker_skills": _children("skillId", skill_ids),
-        "private_job_seeker_locations": _children("districtId", location_ids),
-        "private_job_seeker_preferred_roles": _children("jobRoleId", role_ids),
-        "private_job_seeker_categories": _children("categoryId", category_ids),
+        # seeker-side preference links
+        "private_job_seeker_skills": _seeker_children("skillId", skill_ids),
+        "private_job_seeker_locations": _seeker_children("districtId", location_ids),
+        "private_job_seeker_preferred_roles": _seeker_children("jobRoleId", role_ids),
+        "private_job_seeker_categories": _seeker_children("categoryId", category_ids),
+        # profile-side links
+        "profile_skills": _profile_children("skillId", skill_ids),
+        "profile_categories": _profile_children("categoryId", category_ids),
+        "profile_preferred_roles": _profile_children("jobRoleId", role_ids),
+        "profile_other_states": _profile_children("otherStateId", other_state_ids),
+        "profile_languages": language_rows,
     }
 
 

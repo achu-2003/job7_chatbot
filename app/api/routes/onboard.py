@@ -14,7 +14,6 @@ Form bodies are parsed manually (urlencoded) so we don't depend on
 """
 from __future__ import annotations
 
-import asyncio
 import html
 import json
 from typing import Any
@@ -28,7 +27,7 @@ from fastapi.responses import HTMLResponse
 from app.api.deps import get_memory
 from app.config import get_settings
 from app.core.logging import get_logger
-from app.db.repositories import LookupRepository
+from app.db.repositories import JobSeekerRepository, LookupRepository
 from app.onboarding import prepare_registration
 
 router = APIRouter()
@@ -37,20 +36,42 @@ log = get_logger("onboard")
 # Dropdown sources fetched to render the form (id-valued options).
 _OPTION_KINDS = (
     "states", "districts", "education_levels", "courses", "specializations",
-    "experience_levels", "skills", "roles", "categories",
+    "experience_levels", "skills", "roles", "categories", "other_states",
+    "languages",
 )
 
-# Fixed enum options (stored as plain text columns on private_job_seekers).
+# Fixed enum options (stored as plain text / array columns on the seeker/profile).
+_I_AM_A = (("STUDENT", "Student"), ("FRESHER", "Fresher - First Job"), ("EXPERIENCED", "Experienced"))
 _GENDER = (("MALE", "Male"), ("FEMALE", "Female"), ("OTHER", "Other"))
 _MARITAL = (("SINGLE", "Single"), ("MARRIED", "Married"))
 _ENGLISH = (("BASIC", "Basic"), ("INTERMEDIATE", "Intermediate"), ("FLUENT", "Fluent"))
-_CURRENT_STATUS = (("STUDENT", "Student"), ("WORKING", "Working"))
+_JOB_TYPES = (
+    ("FULL_TIME", "Full-time"), ("PART_TIME", "Part-time"), ("CONTRACT", "Contract"),
+    ("INTERNSHIP", "Internship"), ("FREELANCE", "Freelance"), ("TEMPORARY", "Temporary"),
+    ("WORK_FROM_HOME", "Work From Home"), ("WALK_IN", "Walk-In"),
+)
+_WORK_MODE = (("ON_SITE", "On-site"), ("REMOTE", "Remote"), ("HYBRID", "Hybrid"))
+_YESNO = (("yes", "Yes"), ("no", "No"))
+# value = the lower bound (₹/month), stored as expected_salary.
+_SALARY = (
+    ("5000", "₹5,000 - ₹10,000"), ("10000", "₹10,000 - ₹15,000"),
+    ("15000", "₹15,000 - ₹20,000"), ("20000", "₹20,000 - ₹25,000"),
+    ("25000", "₹25,000 - ₹35,000"), ("35000", "₹35,000 - ₹50,000"),
+    ("50000", "₹50,000 - ₹75,000"), ("75000", "₹75,000 - ₹1,00,000"),
+    ("100000", "₹1,00,000+"),
+)
 
 
 async def _load_options() -> dict[str, list[dict[str, Any]]]:
-    """Fetch every dropdown's options concurrently (read-only reference data)."""
-    results = await asyncio.gather(*(LookupRepository.options(k) for k in _OPTION_KINDS))
-    return dict(zip(_OPTION_KINDS, results))
+    """Fetch every dropdown's options (read-only reference data).
+
+    Loaded SEQUENTIALLY, not concurrently: firing all lookups at once opened a
+    Postgres connection per query and tripped 'sorry, too many clients already',
+    so some lists silently came back empty (skills/categories/roles/specs blank).
+    One connection at a time is plenty fast for a form render and never starves
+    the pool.
+    """
+    return {k: await LookupRepository.options(k) for k in _OPTION_KINDS}
 
 
 @router.get("/form", response_class=HTMLResponse)
@@ -59,7 +80,9 @@ async def onboarding_form(request: Request, token: str = Query(default="")) -> H
     if not identity:
         return HTMLResponse(_expired_html(), status_code=404)
     opts = await _load_options()
-    return HTMLResponse(_form_html(token, identity.get("name") or "", opts))
+    return HTMLResponse(
+        _form_html(token, identity.get("name") or "", identity.get("customer_id") or "", opts)
+    )
 
 
 @router.post("/submit", response_class=HTMLResponse)
@@ -78,49 +101,51 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
         return HTMLResponse(_expired_html(), status_code=400)
 
     name = one("full_name") or one("name")
+    # Languages: each can be marked Speak and/or Write (checkboxes by language id).
+    speak_ids, write_ids = set(many("lang_speak")), set(many("lang_write"))
+    languages = [
+        {
+            "languageId": lid,
+            "speak": "FLUENT" if lid in speak_ids else None,
+            "write": "FLUENT" if lid in write_ids else None,
+        }
+        for lid in (speak_ids | write_ids)
+    ]
 
-    async def _reject(message: str) -> HTMLResponse:
-        return HTMLResponse(
-            _form_html(token, name, await _load_options(), error=message),
-            status_code=400,
-        )
-
-    email = one("email")
-    if "@" not in email or "." not in email.split("@")[-1]:
-        return await _reject("Please enter a valid email address.")
-    if not name:
-        return await _reject("Please enter your full name.")
-    preferred_location_ids = many("preferred_location_ids")
-    if not preferred_location_ids:
-        return await _reject("Please choose at least one preferred location.")
-
+    # The wizard's "Skip for now" lets any step be skipped, so the server accepts
+    # partial data — the client enforces the per-step required (*) fields on Next.
     form = {
         # name kept under both keys (identify reads "name"; staging reads "full_name")
         "name": name,
         "full_name": name,
-        "email": email,
+        "current_status": one("current_status"),
         "gender": one("gender"),
         "marital_status": one("marital_status"),
+        "date_of_birth": one("date_of_birth"),
         "state_id": one("state_id"),
         "district_id": one("district_id"),
-        "current_status": one("current_status"),
-        "current_year_of_study": one("current_year_of_study"),
+        "city": one("city"),
         "education_level_id": one("education_level_id"),
         "course_id": one("course_id"),
         "specialization_id": one("specialization_id"),
+        "year_of_passing": one("year_of_passing"),
         "experience_level_id": one("experience_level_id"),
-        "current_salary": one("current_salary"),
         "expected_salary": one("expected_salary"),
-        "english_proficiency": one("english_proficiency"),
+        "work_mode": one("work_mode"),
+        "job_types": many("job_types"),
+        "interested_in_abroad": one("interested_in_abroad"),
         "skill_ids": many("skill_ids"),
-        "preferred_location_ids": preferred_location_ids,
         "preferred_category_ids": many("preferred_category_ids"),
         "preferred_role_ids": many("preferred_role_ids"),
+        "preferred_location_ids": many("preferred_location_ids"),
+        "other_state_ids": many("other_state_ids"),
+        "languages": languages,
     }
     # Back-compat text fields the recommendation menu reads (first selection).
     first_role = (form["preferred_role_ids"] or [None])[0]
     form["preferred_role"] = await LookupRepository.name_for("roles", first_role) or ""
-    form["location"] = await LookupRepository.name_for("districts", preferred_location_ids[0]) or ""
+    first_loc = (form["preferred_location_ids"] or [None])[0]
+    form["location"] = await LookupRepository.name_for("districts", first_loc) or ""
 
     memory = get_memory(request)
     identity = await memory.save_onboarding(token, form)
@@ -128,9 +153,9 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
         return HTMLResponse(_expired_html(), status_code=404)
 
     # Build the DB-ready registration payload (private_job_seekers +
-    # job_seeker_profiles + child rows, with role/location resolved to FK ids by
-    # READING the lookup tables) and STAGE it in Redis. Nothing is written to the
-    # business DB yet — this lets us verify the shape before enabling real INSERTs.
+    # job_seeker_profiles + child rows) and STAGE it in Redis (always — it's the
+    # safe backup / inspection copy).
+    payload: dict[str, Any] | None = None
     try:
         payload = await prepare_registration(identity=identity, form=form)
         await memory.save_registration(
@@ -138,6 +163,15 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
         )
     except Exception as exc:  # noqa: BLE001 — staging must never fail the submission
         log.warning("registration_stage_failed", error=str(exc)[:200])
+
+    # Write to the LIVE job board only when explicitly enabled (REGISTER_IN_DB).
+    # A DB failure is logged but never fails the form — the Redis copy still holds.
+    if payload is not None and get_settings().register_in_db:
+        try:
+            res = await JobSeekerRepository.create(payload, commit=True)
+            log.info("registration_db_written", seeker_id=res["seeker_id"], children=res["children"])
+        except Exception as exc:  # noqa: BLE001
+            log.error("registration_db_write_failed", error=str(exc)[:300])
 
     number = re.sub(r"\D", "", get_settings().whatsapp_business_number or "")
     return HTMLResponse(_success_html(identity.get("name") or "", business_number=number))
@@ -182,6 +216,28 @@ _PAGE = """\
   .ts-opt{{padding:9px 12px;font-size:14px;cursor:pointer}}
   .ts-opt.active,.ts-opt:hover{{background:#202c33}}
   .ts-empty{{padding:9px 12px;color:#6b7d88;font-size:13px}}
+  .prog{{display:flex;gap:12px;margin:0 0 22px;flex-wrap:wrap;align-items:center}}
+  .prog span{{width:28px;height:28px;border-radius:50%;background:#202c33;color:#8696a0;display:flex;
+              align-items:center;justify-content:center;font-size:13px;font-weight:700;border:1px solid #2a3942;
+              transition:background .15s}}
+  .prog span.on{{background:#00a884;color:#fff;border-color:#00a884}}
+  .step{{display:none}} .step.on{{display:block}}
+  .chips{{display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 4px}}
+  .chip{{padding:9px 14px;border:1px solid #2a3942;border-radius:20px;background:#202c33;color:#e9edef;
+         font-size:14px;cursor:pointer;user-select:none}}
+  .chip.on{{background:#005c4b;border-color:#00a884;color:#fff}}
+  .chips.invalid,.ts.invalid .ts-box,.dob.invalid select,select.invalid,input.invalid{{border-color:#ff6b6b}}
+  .nav{{display:flex;gap:10px;align-items:center;margin-top:24px}}
+  .nav button{{margin-top:0}}
+  .nav .back{{background:#2a3942;color:#e9edef;width:auto;flex:none;padding:12px 16px}}
+  .nav .skip{{background:transparent;color:#8696a0;width:auto;flex:none;padding:12px 4px;font-weight:500}}
+  .nav .next{{flex:1}}
+  .dob{{display:flex;gap:8px}}
+  .lang{{border:1px solid #2a3942;border-radius:10px;padding:10px 12px;margin:8px 0}}
+  .lang .nm{{font-weight:600;margin-bottom:8px}}
+  .lang label{{display:inline-flex;align-items:center;gap:6px;margin:0 16px 0 0;color:#cfd9de;font-size:14px}}
+  .lang input{{width:auto}}
+  .ro{{background:#161f25;color:#8696a0}}
 </style></head><body><div class="card">{body}</div></body></html>"""
 
 
@@ -294,80 +350,198 @@ tokenSelect(document.getElementById("ts_skills"), "skill_ids", SKILLS, "Type a s
 tokenSelect(document.getElementById("ts_locations"), "preferred_location_ids", LOC_OPTS, "Type a district...");
 tokenSelect(document.getElementById("ts_categories"), "preferred_category_ids", CATEGORIES, "Type a category...");
 tokenSelect(document.getElementById("ts_roles"), "preferred_role_ids", ROLES, "Type a job role...");
+tokenSelect(document.getElementById("ts_other_states"), "other_state_ids", OTHER_STATES, "Type a state...");
+
+// ---- chip groups (single / multi-select → hidden inputs) ----
+function chipGroup(group){
+  var name = group.getAttribute("data-name"), multi = group.getAttribute("data-multi") === "1";
+  group.querySelectorAll(".chip").forEach(function(chip){
+    chip.addEventListener("click", function(){
+      if(multi){ chip.classList.toggle("on"); }
+      else { group.querySelectorAll(".chip").forEach(function(c){ c.classList.remove("on"); }); chip.classList.add("on"); }
+      group.classList.remove("invalid");
+      group.querySelectorAll("input.cv").forEach(function(h){ h.remove(); });
+      group.querySelectorAll(".chip.on").forEach(function(c){
+        var h = document.createElement("input"); h.type = "hidden"; h.className = "cv";
+        h.name = name; h.value = c.getAttribute("data-val"); group.appendChild(h);
+      });
+    });
+  });
+}
+document.querySelectorAll(".chips").forEach(chipGroup);
+
+// ---- date of birth combiner (Day / Month / Year → YYYY-MM-DD) ----
+(function(){
+  var d = document.getElementById("dob_d"), m = document.getElementById("dob_m"),
+      y = document.getElementById("dob_y"), hid = document.getElementById("date_of_birth");
+  if(!d) return;
+  for(var i=1;i<=31;i++){ var o=document.createElement("option"); o.value=i; o.textContent=i; d.appendChild(o); }
+  ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"].forEach(function(nm,i){
+    var o=document.createElement("option"); o.value=i+1; o.textContent=nm; m.appendChild(o); });
+  var ny=new Date().getFullYear(); for(var yr=ny-15; yr>=ny-70; yr--){ var o=document.createElement("option"); o.value=yr; o.textContent=yr; y.appendChild(o); }
+  function pad(n){ return String(n).length<2 ? "0"+n : ""+n; }
+  function upd(){ hid.value=(d.value&&m.value&&y.value)?(y.value+"-"+pad(m.value)+"-"+pad(d.value)):""; if(hid.value) d.parentNode.classList.remove("invalid"); }
+  [d,m,y].forEach(function(s){ s.addEventListener("change", upd); });
+})();
+
+// ---- step wizard (Next validates required, Skip / Back navigate) ----
+var steps = [].slice.call(document.querySelectorAll(".step"));
+var dots = [].slice.call(document.querySelectorAll(".prog span"));
+var cur = 0;
+function show(i){
+  cur = i;
+  steps.forEach(function(s,k){ s.classList.toggle("on", k===i); });
+  dots.forEach(function(s,k){ s.classList.toggle("on", k<=i); });
+  window.scrollTo(0,0);
+  document.getElementById("nextBtn").textContent = (i===steps.length-1) ? "Finish Setup" : "Next";
+  document.getElementById("backBtn").style.visibility = i===0 ? "hidden" : "visible";
+}
+function valid(step){
+  var ok = true;
+  step.querySelectorAll("[data-req]").forEach(function(el){
+    var bad = false;
+    if(el.classList.contains("chips")) bad = !el.querySelector(".chip.on");
+    else if(el.classList.contains("ts")) bad = !el.querySelector("input[type=hidden]");
+    else if(el.classList.contains("dob")) bad = !document.getElementById("date_of_birth").value;
+    else if(el.tagName === "SELECT") bad = !el.value;
+    else bad = !((el.value||"").trim());
+    el.classList.toggle("invalid", bad); if(bad) ok = false;
+  });
+  return ok;
+}
+function advance(){ if(cur===steps.length-1) document.getElementById("profForm").submit(); else show(cur+1); }
+document.getElementById("nextBtn").addEventListener("click", function(){ if(valid(steps[cur])) advance(); });
+document.getElementById("skipBtn").addEventListener("click", advance);
+document.getElementById("backBtn").addEventListener("click", function(){ if(cur>0) show(cur-1); });
+show(0);
 """
 
 
+def _chips(name: str, options, *, multi: bool = False, req: bool = False) -> str:
+    """A pill chip-group → hidden inputs (single or multi select)."""
+    attrs = f' data-name="{_esc(name)}"'
+    if multi:
+        attrs += ' data-multi="1"'
+    if req:
+        attrs += ' data-req="1"'
+    btns = "".join(f'<span class="chip" data-val="{_esc(v)}">{_esc(l)}</span>' for v, l in options)
+    return f'<div class="chips"{attrs}>{btns}</div>'
+
+
+def _R() -> str:
+    return '<span class="req">*</span>'
+
+
 def _form_html(
-    token: str, name: str, opts: dict[str, list[dict[str, Any]]], *, error: str = ""
+    token: str, name: str, phone: str, opts: dict[str, list[dict[str, Any]]], *, error: str = ""
 ) -> str:
     safe_name = _esc(name)
     err = f'<div class="err">{_esc(error)}</div>' if error else ""
-    greeting = f"Hi {safe_name}, " if safe_name else ""
-
     o = opts  # shorthand
+    dots = "".join(f"<span>{i}</span>" for i in range(1, 10))
+    langs = "".join(
+        f'<div class="lang"><div class="nm">{_esc(l["name"])}</div>'
+        f'<label><input type="checkbox" name="lang_speak" value="{_esc(l["id"])}"> Speak</label>'
+        f'<label><input type="checkbox" name="lang_write" value="{_esc(l["id"])}"> Write</label></div>'
+        for l in o["languages"]
+    )
+
     body = f"""\
-<h1>Complete your profile</h1>
-<p class="sub">{greeting}fill these so we can match you with the right roles. Fields marked <span class="req">*</span> are required.</p>
+<h1>Complete Your Profile</h1>
+<div class="prog">{dots}</div>
 {err}
-<form method="post" action="/onboard/submit">
+<form method="post" action="/onboard/submit" id="profForm">
   <input type="hidden" name="token" value="{_esc(token)}">
+  <input type="hidden" name="date_of_birth" id="date_of_birth">
 
-  <fieldset><legend>1 · Basic info</legend>
-    <label>Full name <span class="req">*</span></label>
-    <input type="text" name="full_name" value="{safe_name}" placeholder="Your full name" required>
-    <label>Email <span class="req">*</span></label>
-    <input type="email" name="email" placeholder="you@example.com" required>
-    <label>Gender</label>
-    <select name="gender">{_options_html(_GENDER, placeholder="Select…")}</select>
-    <label>Marital status</label>
-    <select name="marital_status">{_options_html(_MARITAL, placeholder="Select…")}</select>
-    <label>State</label>
-    <select name="state_id" id="state_id">{_options_html(o["states"], placeholder="Select state…")}</select>
-    <label>District</label>
-    <select name="district_id" id="district_id"><option value="">Select a state first…</option></select>
-    <label>Current status</label>
-    <select name="current_status">{_options_html(_CURRENT_STATUS, placeholder="Select…")}</select>
-    <label>Year of study <span class="hint">(if a student)</span></label>
-    <input type="number" name="current_year_of_study" min="1" max="6" placeholder="e.g. 3">
-  </fieldset>
+  <section class="step"><h1>Personal Info</h1>
+    <label>I am a {_R()}</label>
+    {_chips("current_status", _I_AM_A, req=True)}
+    <label>Full Name {_R()}</label>
+    <input type="text" name="full_name" value="{safe_name}" placeholder="Your full name" data-req>
+    <label>Mobile Number</label>
+    <input type="text" class="ro" value="{_esc(phone)}" readonly>
+    <label>Gender {_R()}</label>
+    {_chips("gender", _GENDER, req=True)}
+    <label>Marital Status {_R()}</label>
+    {_chips("marital_status", _MARITAL, req=True)}
+  </section>
 
-  <fieldset><legend>2 · Education</legend>
-    <label>Education level</label>
-    <select name="education_level_id">{_options_html(o["education_levels"], placeholder="Select…")}</select>
-    <label>Course</label>
+  <section class="step"><h1>Birth &amp; Location</h1>
+    <label>Date of Birth {_R()}</label>
+    <div class="dob" data-req>
+      <select id="dob_d"><option value="">Day</option></select>
+      <select id="dob_m"><option value="">Month</option></select>
+      <select id="dob_y"><option value="">Year</option></select>
+    </div>
+    <label>State {_R()}</label>
+    <select name="state_id" id="state_id" data-req>{_options_html(o["states"], placeholder="Select state…")}</select>
+    <label>District {_R()}</label>
+    <select name="district_id" id="district_id" data-req><option value="">Select a state first…</option></select>
+    <label>City / Area</label>
+    <input type="text" name="city" placeholder="Enter city name">
+  </section>
+
+  <section class="step"><h1>Education</h1>
+    <label>Education Level {_R()}</label>
+    <select name="education_level_id" data-req>{_options_html(o["education_levels"], placeholder="Select…")}</select>
+    <label>Course / Degree</label>
     <select name="course_id" id="course_id">{_options_html(o["courses"], placeholder="Select…")}</select>
-    <label>Specialization</label>
-    <select name="specialization_id" id="specialization_id"><option value="">Select a course first…</option></select>
-  </fieldset>
+    <label>Specialization {_R()}</label>
+    <select name="specialization_id" id="specialization_id" data-req><option value="">Select a course first…</option></select>
+    <label>Year of Passing</label>
+    <input type="number" name="year_of_passing" min="1970" max="2035" placeholder="e.g. 2024">
+  </section>
 
-  <fieldset><legend>3 · Experience</legend>
-    <label>Experience level</label>
+  <section class="step"><h1>Skills</h1>
+    <p class="sub">Select at least 1 skill to get better job matches.</p>
+    <label>Selected Skills {_R()}</label>
+    <div id="ts_skills" data-req></div>
+  </section>
+
+  <section class="step"><h1>Job Preferences</h1>
+    <label>Preferred Job Categories {_R()}</label>
+    <div id="ts_categories" data-req></div>
+    <label>Job Type</label>
+    {_chips("job_types", _JOB_TYPES, multi=True)}
+    <label>Work Mode Preference</label>
+    {_chips("work_mode", _WORK_MODE)}
+  </section>
+
+  <section class="step"><h1>Salary &amp; Experience</h1>
+    <label>Expected Monthly Salary {_R()}</label>
+    {_chips("expected_salary", _SALARY, req=True)}
+    <label>Do you have work experience?</label>
+    {_chips("has_experience", _YESNO)}
+    <label>Experience level <span class="hint">(if experienced)</span></label>
     <select name="experience_level_id">{_options_html(o["experience_levels"], placeholder="Select…")}</select>
-    <label>Current monthly salary (₹)</label>
-    <input type="number" name="current_salary" min="0" step="500" placeholder="e.g. 18000">
-    <label>Expected monthly salary (₹)</label>
-    <input type="number" name="expected_salary" min="0" step="500" placeholder="e.g. 25000">
-    <label>English proficiency</label>
-    <select name="english_proficiency">{_options_html(_ENGLISH, placeholder="Select…")}</select>
-  </fieldset>
+  </section>
 
-  <fieldset><legend>4 · Skills</legend>
-    <label>Skills</label>
-    <div id="ts_skills"></div>
-    <p class="hint">Type to search, then tap a suggestion to add it.</p>
-  </fieldset>
-
-  <fieldset><legend>5 · Preferences</legend>
-    <label>Preferred locations <span class="req">*</span></label>
-    <div id="ts_locations"></div>
-    <label>Preferred job categories</label>
-    <div id="ts_categories"></div>
-    <label>Preferred job roles</label>
+  <section class="step"><h1>Preferred Roles</h1>
+    <p class="sub">Pick the roles you'd like us to match you with.</p>
+    <label>Preferred Job Roles</label>
     <div id="ts_roles"></div>
-    <p class="hint">Type to search; pick at least one preferred location.</p>
-  </fieldset>
+  </section>
 
-  <button type="submit">Submit</button>
+  <section class="step"><h1>Preferred Work Locations</h1>
+    <label>Cities / Districts {_R()}</label>
+    <div id="ts_locations" data-req></div>
+    <label>Other States</label>
+    <div id="ts_other_states"></div>
+    <label>Interested in working abroad?</label>
+    {_chips("interested_in_abroad", _YESNO)}
+  </section>
+
+  <section class="step"><h1>Language Mastery</h1>
+    <p class="sub">Which languages can you speak and write? This helps us match you.</p>
+    {langs}
+  </section>
+
+  <div class="nav">
+    <button type="button" class="back" id="backBtn">← Back</button>
+    <button type="button" class="skip" id="skipBtn">Skip for now</button>
+    <button type="button" class="next" id="nextBtn">Next</button>
+  </div>
 </form>
 <script>
 const SKILLS = {_js_rows(o["skills"])};
@@ -376,6 +550,7 @@ const CATEGORIES = {_js_rows(o["categories"])};
 const STATES = {_js_rows(o["states"])};
 const DISTRICTS = {_js_rows(o["districts"])};
 const SPECS = {_js_rows(o["specializations"])};
+const OTHER_STATES = {_js_rows(o["other_states"])};
 </script>
 <script>{_FORM_JS}</script>"""
     return _PAGE.format(body=body)

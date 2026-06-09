@@ -204,6 +204,10 @@ class Settings(BaseSettings):
     public_base_url: str = "http://localhost:8000"
     # How long a generated form link / stored submission lives in Redis.
     onboarding_ttl_seconds: int = 7 * 24 * 3600
+    # When True, a submitted onboarding form is ALSO written to the live job board
+    # (private_job_seekers + job_seeker_profiles + child rows). Default False keeps
+    # the safe Redis-only staging; flip to true (REGISTER_IN_DB=true) once verified.
+    register_in_db: bool = False
     # The business's DIALABLE WhatsApp number (digits, international format, e.g.
     # "919876543210" — NOT the meta_phone_number_id). Used to build the "Back to
     # chat" wa.me deep link on the form's success page so the candidate returns to

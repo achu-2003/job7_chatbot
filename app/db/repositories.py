@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 import time
 import uuid
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -30,7 +31,7 @@ from app.core.exceptions import UnsafeSQLError
 from app.core.logging import get_logger
 from app.core.metrics import SQL_LATENCY
 from app.core.tenancy import get_current_tenant_id
-from app.db.session import session_scope
+from app.db.session import get_engine, session_scope
 
 log = get_logger("repositories")
 
@@ -534,6 +535,8 @@ class LookupRepository:
         "categories":       ("private_job_categories", False, "name", None),
         "states":           ("states", False, "name", None),
         "districts":        ("districts", False, "name", "stateId"),
+        "other_states":     ("private_other_state_masters", True, '"displayOrder" NULLS LAST, name', None),
+        "languages":        ("languages", True, '"displayOrder" NULLS LAST, name', None),
     }
 
     @staticmethod
@@ -578,3 +581,93 @@ class LookupRepository:
             return row._mapping["name"] if row else None
         except Exception:  # noqa: BLE001
             return None
+
+
+# ---------------------------------------------------------------
+# Job-seeker registration WRITE (live job board) — flag-gated
+# ---------------------------------------------------------------
+
+# Tables with an updatedAt column (set to now() on insert alongside createdAt).
+_WITH_UPDATED_AT = {"private_job_seekers", "job_seeker_profiles"}
+# Columns that are Postgres ENUMs → need an explicit CAST on insert.
+_ENUM_CASTS = {
+    "private_job_seekers": {"status": '"JobSeekerStatus"'},
+    "job_seeker_profiles": {"relationType": '"RelationType"'},
+}
+# Preference child tables, inserted after the seeker + profile (FK order).
+_CHILD_TABLES = (
+    "private_job_seeker_skills", "private_job_seeker_locations",
+    "private_job_seeker_preferred_roles", "private_job_seeker_categories",
+    "profile_skills", "profile_categories", "profile_preferred_roles",
+    "profile_other_states", "profile_languages",
+)
+
+
+def _prep_row(table: str, row: dict[str, Any]) -> dict[str, Any]:
+    """Make a staged row insertable: drop the server-set timestamps (the SQL uses
+    now()), coerce dateOfBirth from 'YYYY-MM-DD' to a datetime (asyncpg rejects a
+    bare string for a timestamp), and drop an empty jobTypes so the column default
+    applies (an empty array has no inferable element type)."""
+    r = dict(row)
+    r.pop("createdAt", None)
+    r.pop("updatedAt", None)
+    dob = r.get("dateOfBirth")
+    if isinstance(dob, str) and dob:
+        try:
+            r["dateOfBirth"] = datetime.strptime(dob[:10], "%Y-%m-%d")
+        except ValueError:
+            r["dateOfBirth"] = None
+    if table == "job_seeker_profiles" and not r.get("jobTypes"):
+        r.pop("jobTypes", None)
+    return r
+
+
+def _insert_sql(table: str, row: dict[str, Any]) -> str:
+    casts = _ENUM_CASTS.get(table, {})
+    cols = list(row.keys())
+    ts = ["createdAt"] + (["updatedAt"] if table in _WITH_UPDATED_AT else [])
+    col_sql = ", ".join([f'"{c}"' for c in cols] + [f'"{t}"' for t in ts])
+    val_sql = ", ".join(
+        [f"CAST(:{c} AS {casts[c]})" if c in casts else f":{c}" for c in cols]
+        + ["now()"] * len(ts)
+    )
+    return f"INSERT INTO {table} ({col_sql}) VALUES ({val_sql})"
+
+
+class JobSeekerRepository:
+    """WRITE path: register a candidate on the live job board.
+
+    Inserts ``private_job_seekers`` → ``job_seeker_profiles`` → every preference
+    child row in ONE transaction. ``commit=False`` is a DRY RUN — every statement
+    runs against the DB (so all type / FK / enum constraints are exercised) and is
+    then rolled back, writing nothing.
+    """
+
+    @staticmethod
+    async def create(payload: dict[str, Any], *, commit: bool = True) -> dict[str, Any]:
+        seeker = _prep_row("private_job_seekers", payload["private_job_seekers"])
+        profile = _prep_row("job_seeker_profiles", payload["job_seeker_profiles"])
+        counts: dict[str, int] = {}
+        start = time.perf_counter()
+        async with get_engine().connect() as conn:
+            trans = await conn.begin()
+            try:
+                await conn.execute(text(_insert_sql("private_job_seekers", seeker)), seeker)
+                await conn.execute(text(_insert_sql("job_seeker_profiles", profile)), profile)
+                for table in _CHILD_TABLES:
+                    rows = payload.get(table) or []
+                    for row in rows:
+                        r = _prep_row(table, row)
+                        await conn.execute(text(_insert_sql(table, r)), r)
+                    counts[table] = len(rows)
+                await (trans.commit() if commit else trans.rollback())
+            except Exception:
+                await trans.rollback()
+                raise
+        SQL_LATENCY.labels(op="jobseeker_register").observe(time.perf_counter() - start)
+        return {
+            "committed": commit,
+            "seeker_id": seeker["id"],
+            "profile_id": profile["id"],
+            "children": counts,
+        }

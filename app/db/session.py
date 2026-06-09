@@ -22,11 +22,20 @@ async def init_engine() -> None:
     if _engine is not None:
         return
     settings = get_settings()
+    # The DB is a SHARED Postgres cluster with a low max_connections, so keep a
+    # small, well-behaved pool: at most pool_size+max_overflow = 5 connections
+    # per process. pool_recycle drops connections after 15 min (so a crashed/
+    # reloaded process can't leave them idle forever), pool_pre_ping skips dead
+    # ones, and application_name tags our connections so they're identifiable in
+    # pg_stat_activity (the earlier 'too many clients' pile-up was untagged).
     _engine = create_async_engine(
         settings.database_url,
-        pool_size=5,
-        max_overflow=5,
+        pool_size=3,
+        max_overflow=2,
+        pool_timeout=30,
+        pool_recycle=900,
         pool_pre_ping=True,
+        connect_args={"server_settings": {"application_name": "job7_chatbot"}},
         future=True,
     )
     _sessionmaker = async_sessionmaker(

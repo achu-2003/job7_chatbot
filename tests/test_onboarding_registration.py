@@ -12,7 +12,7 @@ _IDENTITY = {
 
 _FULL_FORM = {
     "full_name": "Asha Rao", "email": "asha@example.com",
-    "gender": "female", "marital_status": "single",
+    "gender": "female", "marital_status": "single", "date_of_birth": "2000-01-01",
     "state_id": "st1", "district_id": "d1",
     "current_status": "working", "current_year_of_study": "",
     "education_level_id": "edu1", "course_id": "c1", "specialization_id": "sp1",
@@ -61,8 +61,8 @@ def test_build_registration_minimal():
     assert out["private_job_seeker_categories"] == []
     assert [r["districtId"] for r in out["private_job_seeker_locations"]] == ["d9"]
     assert out["private_job_seekers"]["currentSalary"] is None
-    # name + email + phone + location (4 of 8 key fields) → 50%
-    assert out["job_seeker_profiles"]["profileCompletion"] == 50
+    # name + email + phone + location present (4 of 12 key fields) → 33%
+    assert out["job_seeker_profiles"]["profileCompletion"] == 33
 
 
 async def test_prepare_registration_passes_ids_through():
