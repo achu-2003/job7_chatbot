@@ -688,10 +688,25 @@ class AgentRuntime:
             log.info("dropping_implausible_cached_name", value=str(facts["full_name"])[:40])
             facts.pop("full_name", None)
 
+        # Remember the Job Seeker / Job Creator lane the MOMENT it's picked, so we
+        # never ask again — later turns read it back from customer_facts and route
+        # straight into that lane's flow.
+        picked_lane = _role_selection(state)
+        if picked_lane and picked_lane != facts.get("lane"):
+            facts["lane"] = picked_lane
+            if phone:
+                try:
+                    await self.gateway.semantic.remember_fact(
+                        tenant_id=state["tenant_id"], customer_id=phone,
+                        key="lane", value=picked_lane, confidence=1.0, source="chat",
+                    )
+                except Exception as exc:  # noqa: BLE001 — best-effort, never block the turn
+                    log.warning("lane_persist_failed", error=str(exc)[:200])
+
         # No phone (HTTP chat / non-WhatsApp callers) → we can't key on a number,
         # so don't gate — let the turn flow normally.
         if not phone:
-            return {"is_known": True}
+            return {"is_known": True, "customer_facts": facts}
 
         # 1) Existence is decided by the ACTIVE job-board table, re-checked every
         # turn — never by the cache. A hit → known; the active record's name/email
@@ -990,13 +1005,6 @@ class AgentRuntime:
         if state.get("just_onboarded"):
             return "onboarding"
 
-        # Lane gate (seeker vs creator) — only reachable once known.
-        lane = _role_selection(state)
-        if lane == "creator":
-            return "creator"
-        if lane == "seeker":
-            return "greeting" if state.get("is_known", False) else "onboarding"
-
         q = state.get("inbound_text", "")
         if _CLOSER_RX.match(q):
             return "greeting"
@@ -1004,8 +1012,18 @@ class AgentRuntime:
         # New numbers must register first — no lane choice until they're known.
         if not state.get("is_known", False):
             return "onboarding"
-        # Known senders: a greeting opens the Job Seeker / Job Creator choice;
-        # anything else goes to the reasoning agent.
+
+        # Lane is REMEMBERED: the tap this turn wins, otherwise the stored choice
+        # from customer_facts. Once a lane is known we never re-ask.
+        picked = _role_selection(state)
+        lane = picked or (state.get("customer_facts") or {}).get("lane")
+        if lane == "creator":
+            return "creator"                       # recruiter flow, every turn
+        if lane == "seeker":
+            # Show the seeker hub (Job Search / Application Status / Recommended)
+            # on the selection tap or on a greeting; otherwise reason normally.
+            return "greeting" if (picked or _GREETING_RX.match(q)) else "agent"
+        # No lane chosen yet → ask once on a greeting; otherwise proceed.
         if _GREETING_RX.match(q):
             return "role_select"
         return "agent"

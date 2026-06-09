@@ -61,6 +61,39 @@ def test_job_card_text_shows_location_when_not_remote():
     assert "🏠" not in card
 
 
+def test_job_card_text_renders_rich_details():
+    job = {
+        "job_ref": "ssm-tower-office", "title": "Office Staff", "location": "Chennai",
+        "work_mode": "OFFICE", "employment_type": "full_time",
+        "salary_min": 20000, "salary_max": 45000, "vacancies": 10,
+        "experience_min": 0, "experience_max": None,
+        "qualification_level": "10TH_ABOVE", "english_level": "BASIC",
+        "age_min": 18, "age_max": 35,
+        "description": "DIRECT JOINING ONLY\n\n\nCOMPANY NAME: SSM PRIVATE LIMITED\n\nLOCATION: Chennai Guindy",
+    }
+    card = jobflow.job_card_text(job, idx=1)
+    assert card.startswith("1️⃣ Office Staff")
+    assert "📍 Chennai · Office" in card
+    assert "💼 Full-time" in card
+    assert "🧰 Any experience" in card
+    assert "🎓 10th & above" in card
+    assert "🗣️ English: Basic" in card
+    assert "🎂 Age 18–35 yrs" in card
+    assert "💰 ₹20,000–45,000/month" in card
+    assert "👥 10 vacancies" in card
+    assert "🆔 ssm-tower-office" in card
+    assert "COMPANY NAME: SSM PRIVATE LIMITED" in card     # description included
+    assert "\n\n\n" not in card                            # blank-line runs collapsed
+
+
+def test_job_card_text_experience_range_and_caps_description():
+    job = {"job_ref": "r", "title": "Dev", "experience_min": 2, "experience_max": 5,
+           "description": "word " * 600}
+    card = jobflow.job_card_text(job)
+    assert "🧰 2–5 yrs experience" in card
+    assert len(card) <= 1000                               # capped to WhatsApp body limit
+
+
 def test_role_list_paginates_with_more_row():
     jobs = [_job(f"r{i}", f"Role {i}", "Chennai") for i in range(15)]
     payload, _ = jobflow.role_list_message(jobs, category="IT", offset=0)

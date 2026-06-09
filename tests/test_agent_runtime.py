@@ -158,6 +158,13 @@ def _stub_memory(
     rt.gateway.registration = fake_registration            # type: ignore[assignment]
     rt.gateway.update_registration_profile = fake_update_reg_profile  # type: ignore[assignment]
     rt.gateway.save_application = fake_save_application     # type: ignore[assignment]
+    fact_calls: list = []
+
+    async def fake_remember_fact(**kw):
+        fact_calls.append(kw)
+
+    rt.gateway.semantic.remember_fact = fake_remember_fact  # type: ignore[attr-defined]
+    rt._test_facts = fact_calls            # type: ignore[attr-defined]
     rt._candidate_lookup = fake_lookup     # type: ignore[assignment]
     rt._category_browse = fake_browse      # type: ignore[assignment]
     rt._jobs_overview = fake_overview      # type: ignore[assignment]
@@ -192,10 +199,10 @@ def test_graph_has_reasoning_pipeline():
 
 
 async def test_greeting_offers_role_choice():
-    """The 'hi' greeting now opens with the Job Seeker / Job Creator lane choice
-    (two reply buttons) — deterministically, 0 LLM."""
+    """A 'hi' from a sender with NO chosen lane yet opens the Job Seeker / Job
+    Creator choice (two reply buttons) — deterministically, 0 LLM."""
     rt = _runtime()
-    _stub_memory(rt)
+    _stub_memory(rt)                                  # default facts have no "lane"
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "hi")
     cta = out["whatsapp_interactive"]["interactive"]
@@ -203,6 +210,43 @@ async def test_greeting_offers_role_choice():
     titles = [b["reply"]["title"] for b in cta["action"]["buttons"]]
     assert titles == ["Job Seeker", "Job Creator"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
+
+
+async def test_lane_choice_is_remembered_on_tap():
+    """Tapping 'Job Seeker' shows the seeker hub AND persists the lane so it's
+    never asked again."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Asha"})    # no lane yet
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Job Seeker", interactive_id="role:seeker")
+    titles = [b["reply"]["title"] for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
+    assert titles == ["Job Search", "Application Status", "Recommended Jobs"]
+    # lane was written to customer_facts
+    assert any(c.get("key") == "lane" and c.get("value") == "seeker"
+               for c in rt._test_facts)              # type: ignore[attr-defined]
+
+
+async def test_remembered_seeker_lane_skips_the_question():
+    """A returning Job Seeker saying 'hi' goes straight to the seeker hub — the
+    lane question is NOT shown again."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Asha", "lane": "seeker"})
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "hi")
+    titles = [b["reply"]["title"] for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
+    assert titles == ["Job Search", "Application Status", "Recommended Jobs"]
+    assert "Job Seeker" not in titles                 # not re-asked
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
+
+
+async def test_remembered_creator_lane_goes_to_creator_flow():
+    """A returning Job Creator's messages flow to the recruiter lane, no re-ask."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Asha", "lane": "creator"})
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "hi")
+    assert "hiring" in out["response"].lower() or "coming soon" in out["response"].lower()
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
 def test_planner_context_is_lean_no_summary_pollution():

@@ -119,28 +119,114 @@ def job_ref(job: dict[str, Any]) -> str:
     return _ref(job)
 
 
+_WORK_MODE_LABEL = {
+    "OFFICE": "Office", "WORK_FROM_HOME": "Work From Home", "WFH": "Work From Home",
+    "HYBRID": "Hybrid", "FIELD": "Field work", "REMOTE": "Remote",
+}
+_QUALIFICATION_LABEL = {
+    "BELOW_10TH": "Below 10th", "10TH_ABOVE": "10th & above",
+    "12TH_ABOVE": "12th & above", "DIPLOMA_ABOVE": "Diploma & above",
+    "DEGREE_ABOVE": "Degree & above", "GRADUATE": "Graduate", "ANY": "Any qualification",
+}
+# WhatsApp interactive body cap is 1024 chars; keep headroom for safety.
+_CARD_MAX = 1000
+
+
+def _experience_label(jmin: Any, jmax: Any) -> str | None:
+    lo = _int_or_none(jmin)
+    hi = _int_or_none(jmax)
+    if lo is None and hi is None:
+        return None
+    if (lo in (None, 0)) and (hi in (None, 0)):
+        return "Any experience"
+    if lo and hi:
+        return f"{lo}–{hi} yrs experience"
+    if hi:
+        return f"Up to {hi} yrs experience"
+    return f"{lo}+ yrs experience"
+
+
+def _age_label(amin: Any, amax: Any) -> str | None:
+    lo, hi = _int_or_none(amin), _int_or_none(amax)
+    if lo and hi:
+        return f"Age {lo}–{hi} yrs"
+    if hi:
+        return f"Age up to {hi} yrs"
+    if lo:
+        return f"Age {lo}+ yrs"
+    return None
+
+
+def _int_or_none(v: Any) -> int | None:
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_description(desc: str | None) -> str:
+    """Collapse blank-line runs but keep the description's line structure."""
+    if not desc:
+        return ""
+    out: list[str] = []
+    for ln in str(desc).splitlines():
+        ln = ln.strip()
+        if not ln and (not out or not out[-1]):
+            continue
+        out.append(ln)
+    return "\n".join(out).strip()
+
+
 def job_card_text(job: dict[str, Any], idx: int | None = None) -> str:
-    """The emoji detail card for one job. Renders only fields that exist; WFH is
-    inferred from the location (the data has no explicit remote flag, and no
-    experience column — so experience is intentionally omitted)."""
+    """The detailed emoji card for one job — title, location/work-mode,
+    employment type, experience, qualification, English, age, salary, vacancies,
+    reference, and a (space-permitting) description excerpt. Capped to the
+    WhatsApp interactive body limit; the structured lines always survive and the
+    description fills whatever room is left."""
     title = job.get("title") or "Role"
-    head = f"{_num(idx)} {title}".strip() if idx else title
-    lines = [head]
+    lines = [f"{_num(idx)} {title}".strip() if idx else title]
+
     loc = job.get("location")
-    if infer_wfh(loc):
+    wm = _WORK_MODE_LABEL.get(str(job.get("work_mode") or "").upper(), "")
+    if wm == "Work From Home" or (not wm and infer_wfh(loc)):
         lines.append("🏠 Work From Home")
-    elif loc:
-        lines.append(f"📍 {loc}")
+    elif loc or wm:
+        lines.append("📍 " + " · ".join(x for x in (loc, wm) if x))
+
     etype = (job.get("employment_type") or "").lower()
     if etype:
         lines.append(f"💼 {_EMPLOYMENT_LABEL.get(etype, etype.replace('_', ' ').title())}")
+    exp = _experience_label(job.get("experience_min"), job.get("experience_max"))
+    if exp:
+        lines.append(f"🧰 {exp}")
+    qual = _QUALIFICATION_LABEL.get(str(job.get("qualification_level") or "").upper()) or (
+        ", ".join(str(q) for q in (job.get("qualifications") or [])) or None
+    )
+    if qual:
+        lines.append(f"🎓 {qual}")
+    eng = job.get("english_level")
+    if eng:
+        lines.append(f"🗣️ English: {str(eng).title()}")
+    age = _age_label(job.get("age_min"), job.get("age_max"))
+    if age:
+        lines.append(f"🎂 {age}")
     pay = salary_display(job.get("salary_min"), job.get("salary_max"))
     if pay:
         lines.append(f"💰 {pay}")
+    vac = _int_or_none(job.get("vacancies"))
+    if vac:
+        lines.append(f"👥 {vac} vacanc{'y' if vac == 1 else 'ies'}")
     ref = _ref(job)
     if ref:
         lines.append(f"🆔 {ref}")
-    return "\n".join(lines)
+
+    card = "\n".join(lines)
+    desc = _clean_description(job.get("description"))
+    if desc:
+        budget = _CARD_MAX - len(card) - 6
+        if budget > 60:
+            card += "\n\n📋 " + _trunc(desc, budget)
+    return card
 
 
 def _num(idx: int | None) -> str:

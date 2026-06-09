@@ -79,9 +79,13 @@ async def test_search_jobs_returns_compact_rows(monkeypatch):
     assert out == [{
         "id": "j1", "job_ref": "JOB-AB1001", "title": "Senior Backend Engineer",
         "department": "Engineering", "location": "Bengaluru",
-        "employment_type": "full_time", "seniority": "senior",
+        "employment_type": "full_time", "work_mode": None, "seniority": "senior",
         "salary_min": 2500000.0, "salary_max": 4000000.0, "salary_currency": "INR",
-        "skills": ["python", "fastapi"], "availability": "open",
+        "salary_period": None,
+        "experience_min": None, "experience_max": None, "vacancies": None,
+        "qualification_level": None, "qualifications": [], "english_level": None,
+        "age_min": None, "age_max": None,
+        "skills": ["python", "fastapi"], "description": None, "availability": "open",
     }]
 
 

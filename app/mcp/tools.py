@@ -154,11 +154,24 @@ def _compact_job(row: dict[str, Any]) -> dict[str, Any]:
         "department": row.get("department_name"),
         "location": row.get("location"),
         "employment_type": row.get("employment_type"),
+        "work_mode": row.get("work_mode"),
         "seniority": row.get("seniority"),
         "salary_min": _jsonable(row.get("salary_min")),
         "salary_max": _jsonable(row.get("salary_max")),
         "salary_currency": row.get("salary_currency"),
+        "salary_period": row.get("salary_period"),
+        "experience_min": _jsonable(row.get("experience_min")),
+        "experience_max": _jsonable(row.get("experience_max")),
+        "vacancies": _jsonable(row.get("vacancies")),
+        "qualification_level": row.get("qualification_level"),
+        "qualifications": row.get("qualifications") or [],
+        "english_level": row.get("english_level"),
+        "age_min": _jsonable(row.get("age_min")),
+        "age_max": _jsonable(row.get("age_max")),
         "skills": row.get("skills") or [],
+        # full description for the detailed WhatsApp card (not sent to the LLM
+        # context, which uses the flat job shape in app/agent/context.py)
+        "description": row.get("description"),
         "availability": _availability(status),
     }
 
