@@ -151,6 +151,9 @@ def build_registration_records(
     expected_salary = _to_num(form.get("expected_salary"))
     dob = (form.get("date_of_birth") or "").strip() or None
     city = (form.get("city") or "").strip() or None
+    institution = (form.get("institution") or "").strip() or None
+    resume = (form.get("resume") or "").strip() or None
+    resumes = [resume] if resume else []
     job_types = [str(t).strip().upper() for t in _id_list(form.get("job_types"))]
     abroad = str(form.get("interested_in_abroad") or "").strip().lower() in {"yes", "true", "1", "on"}
 
@@ -179,12 +182,14 @@ def build_registration_records(
         "educationLevelId": education_level,
         "courseId": course,
         "specializationId": specialization,
+        "institution": institution,
         "yearOfPassing": year_of_passing,
         "experienceLevelId": experience_level,
         "preferredStateId": state,
         "districtId": district,
         "currentSalary": current_salary,
         "expectedSalary": expected_salary,
+        "resumes": resumes,
         "workFromHomePreference": work_mode,
         "status": "ACTIVE",
         "emailVerified": False,
@@ -220,11 +225,13 @@ def build_registration_records(
         "educationLevelId": education_level,
         "courseId": course,
         "specializationId": specialization,
+        "institution": institution,
         "yearOfPassing": year_of_passing,
         "experienceLevelId": experience_level,
         "districtId": district,
         "currentSalary": current_salary,
         "expectedSalary": expected_salary,
+        "resumes": resumes,
         "workFromHomePreference": work_mode,
         "jobTypes": job_types,
         "interestedInAbroad": abroad,

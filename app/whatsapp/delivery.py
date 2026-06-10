@@ -58,6 +58,25 @@ async def _post(settings: Any, to_number: str, payload: dict[str, Any], client: 
     return resp.status_code
 
 
+async def send_message(
+    settings: Any,
+    to_number: str,
+    payload: dict[str, Any],
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> int:
+    """Send a single Cloud API message payload (text or interactive) and return
+    the HTTP status. Used for proactive pushes (e.g. the post-registration menu)."""
+    own_client = client is None
+    if own_client:
+        client = httpx.AsyncClient(timeout=30.0)
+    try:
+        return await _post(settings, to_number, payload, client)
+    finally:
+        if own_client:
+            await client.aclose()
+
+
 async def deliver(
     settings: Any,
     to_number: str,

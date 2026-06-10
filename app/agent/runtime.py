@@ -115,10 +115,10 @@ def _menu_buttons_message(body: str) -> dict[str, Any]:
 # title truncation; the exact title text doubles as the web/typed path.
 _ROLE_BUTTONS = (
     ("role:seeker", "Job Seeker"),
-    ("role:creator", "Job Creator"),
+    ("role:creator", "Employer"),
 )
 _ROLE_SEEKER_RX = re.compile(r"^\s*job\s*seeker\s*$", re.IGNORECASE)
-_ROLE_CREATOR_RX = re.compile(r"^\s*job\s*creator\s*$", re.IGNORECASE)
+_ROLE_CREATOR_RX = re.compile(r"^\s*(employer|job\s*creator|creator)\s*$", re.IGNORECASE)
 
 
 def _role_choice_message(body: str) -> dict[str, Any]:
@@ -838,8 +838,8 @@ class AgentRuntime:
         who = f" {first}" if first else ""
         body = (
             f"Hi{who}! Welcome to Jobs7. 👋\n\n"
-            "Are you here to find a job, or to post jobs and hire?\n\n"
-            'Tap an option below (or reply "Job Seeker" / "Job Creator").'
+            "Are you here to find a job, or to hire as an employer?\n\n"
+            'Tap an option below (or reply "Job Seeker" / "Employer").'
         )
         return {
             "intent": "role_select",

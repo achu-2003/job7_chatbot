@@ -229,7 +229,7 @@ async def test_greeting_offers_role_choice():
     cta = out["whatsapp_interactive"]["interactive"]
     assert cta["type"] == "button"
     titles = [b["reply"]["title"] for b in cta["action"]["buttons"]]
-    assert titles == ["Job Seeker", "Job Creator"]
+    assert titles == ["Job Seeker", "Employer"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
 
 
@@ -416,7 +416,7 @@ async def test_db_known_user_gets_lane_choice():
     assert "achuthan" in out["response"].lower()    # past the gate → greeted by name
     titles = [b["reply"]["title"]
               for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
-    assert titles == ["Job Seeker", "Job Creator"]   # lane choice, not the name/form ask
+    assert titles == ["Job Seeker", "Employer"]   # lane choice, not the name/form ask
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
@@ -445,7 +445,7 @@ async def test_known_user_greeted_by_name():
     assert "reg" in out["response"].lower()              # greeted by name
     titles = [b["reply"]["title"]
               for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
-    assert titles == ["Job Seeker", "Job Creator"]
+    assert titles == ["Job Seeker", "Employer"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 

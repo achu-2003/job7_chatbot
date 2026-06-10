@@ -42,8 +42,11 @@ def test_form_renders_nine_step_wizard():
     # embedded option data + stepper JS
     assert "const OTHER_STATES =" in out and "Software Developer" in out
     assert "function valid(" in out and 'id="nextBtn"' in out
-    # email is NOT collected in this form (not in the screenshots)
-    assert 'name="email"' not in out
+    # contact + education + salary inputs
+    assert 'name="email"' in out
+    assert 'name="resume"' in out
+    assert 'name="institution"' in out
+    assert 'name="current_salary"' in out
 
 
 def test_form_marks_required_fields():
@@ -65,7 +68,7 @@ def test_form_escapes_name_to_prevent_injection():
 
 
 def test_success_and_expired_pages_render():
-    assert "successfully" in _success_html("Prasanth").lower()
+    assert "registration successful" in _success_html("Prasanth").lower()
     assert "Prasanth" in _success_html("Prasanth")
     assert "expired" in _expired_html().lower()
 
@@ -74,7 +77,8 @@ def test_success_page_has_back_to_chat_button():
     # With a business number → a wa.me deep link (pre-filled so one tap returns
     # to the chat); without → a plain Close button.
     out = _success_html("Prasanth", business_number="919876543210")
-    assert "https://wa.me/919876543210?text=Hi" in out
+    assert "https://wa.me/919876543210" in out
+    assert "?text=" not in out          # no pre-filled message — menu is already pushed
     assert "Back to chat" in out
     plain = _success_html("Prasanth")
     assert "window.close()" in plain

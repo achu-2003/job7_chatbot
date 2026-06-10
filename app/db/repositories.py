@@ -643,8 +643,8 @@ _CHILD_TABLES = (
 def _prep_row(table: str, row: dict[str, Any]) -> dict[str, Any]:
     """Make a staged row insertable: drop the server-set timestamps (the SQL uses
     now()), coerce dateOfBirth from 'YYYY-MM-DD' to a datetime (asyncpg rejects a
-    bare string for a timestamp), and drop an empty jobTypes so the column default
-    applies (an empty array has no inferable element type)."""
+    bare string for a timestamp), and drop empty array columns (jobTypes, resumes)
+    so the column default applies (an empty array has no inferable element type)."""
     r = dict(row)
     r.pop("createdAt", None)
     r.pop("updatedAt", None)
@@ -654,8 +654,9 @@ def _prep_row(table: str, row: dict[str, Any]) -> dict[str, Any]:
             r["dateOfBirth"] = datetime.strptime(dob[:10], "%Y-%m-%d")
         except ValueError:
             r["dateOfBirth"] = None
-    if table == "job_seeker_profiles" and not r.get("jobTypes"):
-        r.pop("jobTypes", None)
+    for arr_col in ("jobTypes", "resumes"):
+        if arr_col in r and not r[arr_col]:
+            r.pop(arr_col, None)
     return r
 
 

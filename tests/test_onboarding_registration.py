@@ -52,6 +52,22 @@ def test_build_registration_records_full():
     assert all(r["jobSeekerId"] == sid for r in out["private_job_seeker_skills"])
 
 
+def test_build_registration_maps_email_salary_institution_resume():
+    form = {
+        "full_name": "Asha Rao", "email": "asha@example.com",
+        "current_salary": "18000", "institution": "Anna University",
+        "resume": "https://drive.google.com/cv", "preferred_location_ids": ["d1"],
+    }
+    out = build_registration_records(identity=_IDENTITY, form=form)
+    seeker, profile = out["private_job_seekers"], out["job_seeker_profiles"]
+    assert seeker["email"] == "asha@example.com"
+    assert seeker["currentSalary"] == 18000.0
+    assert seeker["institution"] == "Anna University"
+    assert seeker["resumes"] == ["https://drive.google.com/cv"]
+    assert profile["institution"] == "Anna University"
+    assert profile["resumes"] == ["https://drive.google.com/cv"]
+
+
 def test_build_registration_minimal():
     # Only the required fields → empty preference rows, partial completion.
     form = {"full_name": "Sam", "email": "sam@x.com", "preferred_location_ids": ["d9"]}

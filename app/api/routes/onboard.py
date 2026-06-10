@@ -25,10 +25,16 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse
 
 from app.api.deps import get_memory
+from app.chatbot import wa_format as wa
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.db.repositories import JobSeekerRepository, LookupRepository
 from app.onboarding import prepare_registration
+from app.whatsapp import delivery as wa_delivery
+
+# The post-registration lane menu pushed to WhatsApp. Ids must match
+# app.agent.runtime._role_selection (role:seeker / role:creator).
+_LANE_BUTTONS = (("role:seeker", "Job Seeker"), ("role:creator", "Employer"))
 
 router = APIRouter()
 log = get_logger("onboard")
@@ -118,6 +124,7 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
         # name kept under both keys (identify reads "name"; staging reads "full_name")
         "name": name,
         "full_name": name,
+        "email": one("email"),
         "current_status": one("current_status"),
         "gender": one("gender"),
         "marital_status": one("marital_status"),
@@ -128,9 +135,12 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
         "education_level_id": one("education_level_id"),
         "course_id": one("course_id"),
         "specialization_id": one("specialization_id"),
+        "institution": one("institution"),
         "year_of_passing": one("year_of_passing"),
         "experience_level_id": one("experience_level_id"),
+        "current_salary": one("current_salary"),
         "expected_salary": one("expected_salary"),
+        "resume": one("resume"),
         "work_mode": one("work_mode"),
         "job_types": many("job_types"),
         "interested_in_abroad": one("interested_in_abroad"),
@@ -173,7 +183,28 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
         except Exception as exc:  # noqa: BLE001
             log.error("registration_db_write_failed", error=str(exc)[:300])
 
-    number = re.sub(r"\D", "", get_settings().whatsapp_business_number or "")
+    settings = get_settings()
+    # PROACTIVELY push the "registration successful" message + the Job Seeker /
+    # Employer menu to WhatsApp, so it appears the moment they return to the chat
+    # — no typing needed. Mark onboarding welcomed so the bot doesn't also send its
+    # own one-time success on the next message.
+    phone = re.sub(r"\D", "", identity.get("customer_id") or "")
+    if phone:
+        first = (identity.get("name") or "").split()[0] if identity.get("name") else ""
+        who = f", {first}" if first else ""
+        body = (
+            f"🎉 Registration successful{who}!\n\nYour profile is all set. How can "
+            "I help you today — are you here to find a job, or to hire as an employer?"
+        )
+        try:
+            await wa_delivery.send_message(settings, phone, wa.buttons_message(body, _LANE_BUTTONS))
+            await memory.mark_onboarding_welcomed(
+                identity["conversation_id"], tenant_id=identity["tenant_id"]
+            )
+        except Exception as exc:  # noqa: BLE001 — proactive push is best-effort
+            log.warning("onboard_push_failed", error=str(exc)[:200])
+
+    number = re.sub(r"\D", "", settings.whatsapp_business_number or "")
     return HTMLResponse(_success_html(identity.get("name") or "", business_number=number))
 
 
@@ -343,6 +374,16 @@ function tokenSelect(host, name, options, ph){
 cascade("state_id", "district_id", DISTRICTS, "Select district...");
 cascade("course_id", "specialization_id", SPECS, "Select specialization...");
 
+// Chrome may autofill the State select from a saved address — force it back to
+// the "Select state…" placeholder so nothing is pre-chosen until the user picks.
+(function(){
+  var st = document.getElementById("state_id");
+  if(!st) return;
+  function reset(){ if(st.value){ st.value = ""; } }
+  reset();
+  setTimeout(reset, 200); setTimeout(reset, 600);
+})();
+
 var STATE_NAME = {}; STATES.forEach(function(s){ STATE_NAME[s[0]] = s[1]; });
 var LOC_OPTS = DISTRICTS.map(function(d){ return [d[0], d[1], STATE_NAME[d[2]] || ""]; });
 
@@ -450,7 +491,7 @@ def _form_html(
 <h1>Complete Your Profile</h1>
 <div class="prog">{dots}</div>
 {err}
-<form method="post" action="/onboard/submit" id="profForm">
+<form method="post" action="/onboard/submit" id="profForm" autocomplete="off">
   <input type="hidden" name="token" value="{_esc(token)}">
   <input type="hidden" name="date_of_birth" id="date_of_birth">
 
@@ -461,6 +502,10 @@ def _form_html(
     <input type="text" name="full_name" value="{safe_name}" placeholder="Your full name" data-req>
     <label>Mobile Number</label>
     <input type="text" class="ro" value="{_esc(phone)}" readonly>
+    <label>Email</label>
+    <input type="email" name="email" placeholder="you@example.com">
+    <label>Resume link <span class="hint">(Google Drive, Dropbox, etc.)</span></label>
+    <input type="url" name="resume" placeholder="https://…">
     <label>Gender {_R()}</label>
     {_chips("gender", _GENDER, req=True)}
     <label>Marital Status {_R()}</label>
@@ -475,11 +520,11 @@ def _form_html(
       <select id="dob_y"><option value="">Year</option></select>
     </div>
     <label>State {_R()}</label>
-    <select name="state_id" id="state_id" data-req>{_options_html(o["states"], placeholder="Select state…")}</select>
+    <select name="state_id" id="state_id" data-req autocomplete="off">{_options_html(o["states"], placeholder="Select state…")}</select>
     <label>District {_R()}</label>
-    <select name="district_id" id="district_id" data-req><option value="">Select a state first…</option></select>
+    <select name="district_id" id="district_id" data-req autocomplete="off"><option value="">Select a state first…</option></select>
     <label>City / Area</label>
-    <input type="text" name="city" placeholder="Enter city name">
+    <input type="text" name="city" placeholder="Enter city name" autocomplete="off">
   </section>
 
   <section class="step"><h1>Education</h1>
@@ -489,6 +534,8 @@ def _form_html(
     <select name="course_id" id="course_id">{_options_html(o["courses"], placeholder="Select…")}</select>
     <label>Specialization {_R()}</label>
     <select name="specialization_id" id="specialization_id" data-req><option value="">Select a course first…</option></select>
+    <label>Institution / College</label>
+    <input type="text" name="institution" placeholder="e.g. Anna University">
     <label>Year of Passing</label>
     <input type="number" name="year_of_passing" min="1970" max="2035" placeholder="e.g. 2024">
   </section>
@@ -511,6 +558,8 @@ def _form_html(
   <section class="step"><h1>Salary &amp; Experience</h1>
     <label>Expected Monthly Salary {_R()}</label>
     {_chips("expected_salary", _SALARY, req=True)}
+    <label>Current Monthly Salary (₹) <span class="hint">(if working)</span></label>
+    <input type="number" name="current_salary" min="0" step="500" placeholder="e.g. 18000">
     <label>Do you have work experience?</label>
     {_chips("has_experience", _YESNO)}
     <label>Experience level <span class="hint">(if experienced)</span></label>
@@ -559,8 +608,9 @@ const OTHER_STATES = {_js_rows(o["other_states"])};
 def _success_html(name: str, *, business_number: str = "") -> str:
     who = f", {html.escape(name)}" if name else ""
     # A "Back to chat" button that returns the candidate to WhatsApp. With the
-    # business number configured it's a wa.me deep link (pre-filled "Hi" so one
-    # tap sends it and the bot replies with the welcome + menu); otherwise it's a
+    # business number configured it's a wa.me deep link that simply reopens the
+    # chat — NO pre-filled text, because the bot already pushed the registration
+    # success + menu, so the conversation just continues. Otherwise it's a
     # best-effort window.close(). This button only appears AFTER a submission, so
     # a candidate who merely opens the form and leaves is never let past the gate.
     if business_number:
@@ -568,7 +618,7 @@ def _success_html(name: str, *, business_number: str = "") -> str:
         # page cannot force-close a tab the user navigated to, so we redirect
         # rather than call window.close().
         close = (
-            f'<a class="btn" href="https://wa.me/{business_number}?text=Hi">'
+            f'<a class="btn" href="https://wa.me/{business_number}">'
             "Back to chat</a>"
         )
     else:
@@ -583,9 +633,9 @@ def _success_html(name: str, *, business_number: str = "") -> str:
     body = f"""\
 <div class="ok">
   <div class="tick">&#10003;</div>
-  <h1>Profile submitted successfully{who}!</h1>
-  <p class="sub">Your details are saved. Tap below to head back to WhatsApp —
-  we'll start matching you with roles right away.</p>
+  <h1>Registration successful{who}!</h1>
+  <p class="sub">Your profile is saved. Tap below to head back to WhatsApp —
+  your menu is already waiting in the chat.</p>
   {close}
 </div>"""
     return _PAGE.format(body=body)
