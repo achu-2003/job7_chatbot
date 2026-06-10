@@ -45,7 +45,7 @@ from app.agent.state import AgentState
 from app.chatbot import wa_format as wa
 from app.chatbot.memory import ConversationMemory
 from app.chatbot.validator import HallucinationValidator
-from app.db.repositories import CandidateRepository
+from app.db.repositories import CandidateRepository, JobSeekerRepository
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.core.metrics import AGENT_LOOPS
@@ -119,6 +119,26 @@ _ROLE_BUTTONS = (
 )
 _ROLE_SEEKER_RX = re.compile(r"^\s*job\s*seeker\s*$", re.IGNORECASE)
 _ROLE_CREATOR_RX = re.compile(r"^\s*(employer|job\s*creator|creator)\s*$", re.IGNORECASE)
+
+
+# ---- employer (job-poster) flow --------------------------------------
+# The verified-employer hub. Button ids are structured (emp:<action>) so the
+# creator node can route a tap deterministically (post / candidates / my jobs).
+_EMP_MENU_BUTTONS = (
+    ("emp:post", "Post a Job"),
+    ("emp:candidates", "View Candidates"),
+    ("emp:myjobs", "My Jobs"),
+)
+# Typed (not tapped) employer commands → the same actions as the menu buttons.
+# Anything else a VERIFIED employer types is treated as a candidate search query
+# (by skill / role / category).
+_EMP_MENU_RX = re.compile(r"^\s*(menu|back|home|options?|start)\s*$", re.IGNORECASE)
+_EMP_VIEW_RX = re.compile(
+    r"^\s*(view\s*candidates?|all\s*candidates?|show\s*(me\s*)?candidates?|candidates?|list\s*candidates?)\s*$",
+    re.IGNORECASE,
+)
+_EMP_POST_RX = re.compile(r"^\s*(post\s*(a\s*)?job|create\s*(a\s*)?job)\s*$", re.IGNORECASE)
+_EMP_JOBS_RX = re.compile(r"^\s*(my\s*jobs?|posted\s*jobs?)\s*$", re.IGNORECASE)
 
 
 def _role_choice_message(body: str) -> dict[str, Any]:
@@ -241,6 +261,8 @@ class AgentRuntime:
         self._recommend = recommend_jobs_core
         self._job_lookup = get_job_core
         self._title_search = search_jobs_by_title_core
+        self._list_candidates = JobSeekerRepository.list_candidates
+        self._search_candidates = JobSeekerRepository.search_candidates
         self._graph = self._build_graph()
 
     # ---- nodes (bound coroutine methods) ----------------------------
@@ -752,18 +774,25 @@ class AgentRuntime:
                 "customer_facts": facts,
             }
 
-        # 2) NOT in the DB → a new number we must ONBOARD, regardless of any
-        # Redis-cached name/form. Step one is the name (captured in chat); step
-        # two is the tokenised web form. Once submitted, the form is written to
-        # the DB (JobSeekerRepository), so the NEXT turn's phone lookup (step 1)
-        # finds them and they're known — no Redis gate involved. The cached name
-        # only prefills the form / avoids re-asking; it never grants known status.
+        # 2a) EMPLOYER lane (creator) onboards through its OWN Redis flow
+        # (app/api/routes/employer.py), NOT the seeker job board. So for a creator
+        # we must NOT prepare the seeker onboarding form here — doing so leaks its
+        # cta_url "Open form" button into state, and a later text-only employer
+        # reply (e.g. full candidate details) would deliver that stale button
+        # instead. Hand straight off to the creator flow.
+        if (picked_lane or facts.get("lane")) == "creator":
+            return {"is_known": False, "customer_facts": facts}
+
+        # 2b) NOT in the DB → a new seeker we ONBOARD via the tokenised web form.
+        # The lane choice is asked FIRST (route_after_identify → role_select), so
+        # by the time we reach the onboarding node the sender has picked Job
+        # Seeker. The form itself collects the full name (editable field), so we
+        # hand over the link straight away — no separate in-chat name question.
+        # Once submitted, the form is written to the DB (JobSeekerRepository), so
+        # the NEXT turn's phone lookup (step 1) finds them and they're known.
         name = facts.get("full_name") or extract_name(
             text, assistant_prompt=self._last_assistant(state)
         )
-        if not name:
-            return {"is_known": False, "onboarding_prompt": _ONBOARD_ASK_NAME}
-
         token = await self.gateway.onboarding_token(
             tenant_id=state["tenant_id"], customer_id=phone,
             conversation_id=state["conversation_id"], name=name,
@@ -849,23 +878,277 @@ class AgentRuntime:
             "whatsapp_interactive": _role_choice_message(body),
         }
 
+    # ---- employer (job-poster) lane: Stages 1-5 -----------------------
+    # The whole employer record is staged in Redis (keyed by phone). This node is
+    # a small state machine over that record:
+    #   Stage 1  no record            → hand over the registration form
+    #   Stage 2  record, KYC ≠ VERIFY → hand over the KYC form / "under review"
+    #   Stage 3  verified             → the employer menu
+    #   Stage 4  emp:post tap         → hand over the post-a-job form
+    #   Stage 5  emp:candidates tap   → masked list (name + experience); full
+    #            details only after a (simulated) unlock/payment.
+
+    def _creator_reply(self, body: str, *, interactive: dict[str, Any] | None = None) -> dict[str, Any]:
+        # Always set whatsapp_interactive (even to None) so a text-only employer
+        # reply explicitly CLEARS any interactive payload an earlier node may have
+        # staged — never lets a stale button (e.g. a leaked onboarding cta) ride
+        # out on top of an employer message.
+        return {
+            "intent": "role_creator", "used_llm": False,
+            "single_bubble": True, "draft_response": body,
+            "whatsapp_interactive": interactive,
+        }
+
+    async def _employer_form_prompt(
+        self, state: AgentState, *, path: str, body: str, cta: str
+    ) -> dict[str, Any]:
+        """Mint the employer form token and reply with a tappable link (cta_url on
+        https; inline-link text otherwise + as the WhatsApp fallback)."""
+        phone = (state.get("customer_id") or "").strip()
+        facts = state.get("customer_facts") or {}
+        token = await self.gateway.employer_token(
+            tenant_id=state["tenant_id"], phone=phone,
+            conversation_id=state["conversation_id"], name=facts.get("full_name"),
+        )
+        link = f"{get_settings().public_base_url.rstrip('/')}/employer/{path}?token={token}"
+        interactive = (
+            wa.cta_url_message(body=body, display_text=cta, url=link)
+            if link.startswith("https://") else None
+        )
+        return self._creator_reply(f"{body}\n{link}", interactive=interactive)
+
     async def _creator_response(self, state: AgentState) -> dict[str, Any]:
-        """Placeholder for the Job Creator lane. The recruiter experience isn't
-        built yet, so acknowledge and point them at the team — the routing is in
-        place so building it out later is purely additive."""
+        """Employer lane entry point — dispatches on the staged Redis record."""
+        phone = (state.get("customer_id") or "").strip()
+        first = _first_name((state.get("customer_facts") or {}).get("full_name"))
+        who = f", {first}" if first else ""
+        prefix, action = jobflow.split_id(state.get("button_id"))
+
+        emp = await self.gateway.employer(tenant_id=state["tenant_id"], phone=phone) if phone else None
+
+        # Stage 1 — not registered yet → hand over the company registration form.
+        if not emp:
+            body = (
+                f"Welcome to Jobs7 for employers{who}! 🙌\n\n"
+                "Let's set up your company profile so you can post jobs and reach "
+                "candidates. Tap below to register (takes a minute)."
+            )
+            return await self._employer_form_prompt(
+                state, path="register", body=body, cta="Register company"
+            )
+
+        kyc = (emp.get("private_employers") or {}).get("kycStatus") or "NOT_SUBMITTED"
+        verified = kyc == "VERIFIED"
+
+        # In-flow button taps (emp:<action>) are explicit user intent.
+        if prefix == "emp":
+            return await self._employer_action(state, emp, action, verified=verified, kyc=kyc)
+
+        # Stage 2 — registered but not verified → the KYC gate.
+        if not verified:
+            return await self._employer_kyc_gate(state, emp, kyc)
+
+        # Stage 3 — verified. Typed commands map to the menu actions; a greeting /
+        # "menu" shows the hub; ANYTHING ELSE the employer types is treated as a
+        # candidate SEARCH by skill / role / category.
+        q = (state.get("inbound_text") or "").strip()
+        if not q or _GREETING_RX.match(q) or _EMP_MENU_RX.match(q):
+            return self._employer_menu_reply(state, emp)
+        if _EMP_VIEW_RX.match(q):
+            return await self._employer_view_candidates(state, emp)
+        if _EMP_POST_RX.match(q):
+            return await self._employer_form_prompt(
+                state, path="post-job",
+                body="Let's post a job. Tap below to fill in the role details.",
+                cta="Post a Job",
+            )
+        if _EMP_JOBS_RX.match(q):
+            return self._employer_my_jobs(state, emp)
+        return await self._employer_search_candidates(state, emp, q)
+
+    async def _employer_action(
+        self, state: AgentState, emp: dict[str, Any], action: str, *,
+        verified: bool, kyc: str,
+    ) -> dict[str, Any]:
+        """Route an emp:<action> tap. Anything that needs candidate data or job
+        posting is gated behind KYC — an unverified tap falls back to the gate."""
+        if not verified:
+            return await self._employer_kyc_gate(state, emp, kyc)
+        if action == "post":
+            return await self._employer_form_prompt(
+                state, path="post-job",
+                body="Let's post a job. Tap below to fill in the role details.",
+                cta="Post a Job",
+            )
+        if action == "candidates":
+            return await self._employer_view_candidates(state, emp)
+        if action == "unlock":
+            return await self._employer_unlock(state, emp)
+        if action == "pay":
+            return await self._employer_pay(state, emp)
+        if action == "myjobs":
+            return self._employer_my_jobs(state, emp)
+        # menu / unknown → the hub
+        return self._employer_menu_reply(state, emp)
+
+    async def _employer_kyc_gate(
+        self, state: AgentState, emp: dict[str, Any], kyc: str
+    ) -> dict[str, Any]:
+        """Stage 2. PENDING means submitted & awaiting review; anything else
+        (NOT_SUBMITTED / REJECTED) prompts the KYC form."""
+        if kyc == "PENDING":
+            return self._creator_reply(
+                "📋 Your KYC is under review — we'll notify you here as soon as your "
+                "business is verified, then you can view full candidate details."
+            )
         first = _first_name((state.get("customer_facts") or {}).get("full_name"))
         who = f", {first}" if first else ""
         body = (
-            f"Thanks for your interest in hiring through Jobs7{who}! 🙌\n\n"
-            "The job-poster experience is coming soon. For now, reply here and our "
-            "team will help you post your roles and reach candidates."
+            f"Almost there{who}! Verify your business to unlock candidate details. "
+            "Tap below to submit your KYC (GST/PAN or a business proof)."
         )
-        return {
-            "intent": "role_creator",
-            "draft_response": body,
-            "used_llm": False,
-            "single_bubble": True,
-        }
+        return await self._employer_form_prompt(state, path="kyc", body=body, cta="Verify Business")
+
+    def _employer_menu_reply(self, state: AgentState, emp: dict[str, Any]) -> dict[str, Any]:
+        """Stage 3 — the verified employer hub."""
+        company = (emp.get("private_employers") or {}).get("companyName") or "your company"
+        body = (
+            f"You're verified — *{company}* ✅\n\n"
+            "What would you like to do today?"
+        )
+        return self._creator_reply(body, interactive=wa.buttons_message(body, _EMP_MENU_BUTTONS))
+
+    @staticmethod
+    def _candidate_experience(c: dict[str, Any]) -> str:
+        return (c.get("experience_level") or "Experience not specified")
+
+    @staticmethod
+    def _fmt_list(values: Any, n: int) -> str:
+        items = [str(v).strip() for v in (values or []) if str(v).strip()]
+        return ", ".join(items[:n])
+
+    def _render_candidates(
+        self, emp: dict[str, Any], cands: list[dict[str, Any]], *,
+        header_masked: str, header_full: str,
+    ) -> dict[str, Any]:
+        """Tiered candidate render. Role + skills are shown in BOTH tiers (they're
+        not contact data). Tier 1 (verified, not paid) stops there + an Unlock
+        button; Tier 2 (paid) also reveals phone / email / location. Masking
+        happens HERE so locked fields never leave the server."""
+        paid = bool(emp.get("paid"))
+        lines = [header_full if paid else header_masked, ""]
+        for c in cands:
+            lines.append(f"👤 *{c.get('full_name')}* · {self._candidate_experience(c)}")
+            roles = self._fmt_list(c.get("roles"), 3)
+            if roles:
+                lines.append(f"   💼 {roles}")
+            skills = self._fmt_list(c.get("skills"), 6)
+            if skills:
+                lines.append(f"   🛠️ {skills}")
+            if paid:
+                if c.get("phone"):
+                    lines.append(f"   📞 {c['phone']}")
+                if c.get("email"):
+                    lines.append(f"   ✉️ {c['email']}")
+                loc = c.get("city") or c.get("district")
+                if loc:
+                    lines.append(f"   📍 {loc}")
+            lines.append("")
+        if paid:
+            return self._creator_reply("\n".join(lines).rstrip())
+        # Tier 1 — role/skills shown, but contact + resume locked behind payment.
+        lines += [
+            "🔒 Contact details and resume are locked. Unlock to view phone, email & "
+            "the full profile, and reach out.",
+        ]
+        body = "\n".join(lines)
+        return self._creator_reply(
+            body, interactive=wa.buttons_message(body, [("emp:unlock", "🔓 Unlock details")])
+        )
+
+    async def _employer_view_candidates(
+        self, state: AgentState, emp: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Stage 5 — the full (unfiltered) candidate list."""
+        cands = await self._list_candidates(limit=8)
+        if not cands:
+            return self._creator_reply(
+                "No candidates are available right now — I'll have fresh profiles for "
+                "you soon. 👍"
+            )
+        return self._render_candidates(
+            emp, cands,
+            header_masked="*Candidates available* 👥",
+            header_full="*Candidates — full details unlocked* 🔓",
+        )
+
+    async def _employer_search_candidates(
+        self, state: AgentState, emp: dict[str, Any], query: str
+    ) -> dict[str, Any]:
+        """Stage 5 — candidate search by skill / role / category. Same tiered
+        masking as the full list; an empty result nudges back to the menu."""
+        cands = await self._search_candidates(query=query, limit=8)
+        if not cands:
+            body = (
+                f"No candidates found matching *{query}*. Try another skill or role "
+                "(e.g. “welder”, “sales”, “python”), or tap below."
+            )
+            return self._creator_reply(body, interactive=wa.buttons_message(body, _EMP_MENU_BUTTONS))
+        return self._render_candidates(
+            emp, cands,
+            header_masked=f"*Candidates matching “{query}”* 👥",
+            header_full=f"*Candidates matching “{query}” — full details* 🔓",
+        )
+
+    async def _employer_unlock(self, state: AgentState, emp: dict[str, Any]) -> dict[str, Any]:
+        """Payment gate. Already paid → just show full details; otherwise offer a
+        (simulated, test-mode) payment confirmation."""
+        if emp.get("paid"):
+            return await self._employer_view_candidates(state, emp)
+        body = (
+            "🔓 *Unlock full candidate details*\n\n"
+            "Get contact info, resumes and complete profiles for all candidates with "
+            "a one-time payment.\n\n_(Test mode — tap Confirm Payment to simulate.)_"
+        )
+        return self._creator_reply(
+            body, interactive=wa.buttons_message(body, [("emp:pay", "Confirm Payment")])
+        )
+
+    async def _employer_pay(self, state: AgentState, emp: dict[str, Any]) -> dict[str, Any]:
+        """Simulate a successful payment: set the unlock entitlement, then reveal
+        the full candidate details."""
+        phone = (state.get("customer_id") or "").strip()
+        updated = await self.gateway.update_employer(
+            tenant_id=state["tenant_id"], phone=phone, fields={"paid": True}
+        )
+        emp = updated or {**emp, "paid": True}
+        res = await self._employer_view_candidates(state, emp)
+        res["draft_response"] = (
+            "✅ Payment successful — full candidate details unlocked!\n\n"
+            + res.get("draft_response", "")
+        )
+        return res
+
+    def _employer_my_jobs(self, state: AgentState, emp: dict[str, Any]) -> dict[str, Any]:
+        """List the jobs this employer has posted (Redis-staged)."""
+        jobs = emp.get("jobs") or []
+        if not jobs:
+            body = "You haven't posted any jobs yet. Tap below to post your first one."
+            return self._creator_reply(
+                body, interactive=wa.buttons_message(body, [("emp:post", "Post a Job")])
+            )
+        lines = [f"*Your posted jobs ({len(jobs)})*", ""]
+        for j in jobs:
+            pj = j.get("private_jobs") or {}
+            title = pj.get("title") or j.get("title") or "Untitled role"
+            ref = j.get("ref") or "—"
+            status = pj.get("status") or j.get("status") or "PENDING"
+            line = f"• *{title}* ({ref}) — {status}"
+            vac = pj.get("vacancies")
+            if vac:
+                line += f" · {vac} vacanc" + ("y" if int(vac) == 1 else "ies")
+            lines.append(line)
+        return self._creator_reply("\n".join(lines))
 
     async def _planner(self, state: AgentState) -> dict[str, Any]:
         return await plan(
@@ -994,13 +1277,18 @@ class AgentRuntime:
     ) -> Literal["onboarding", "greeting", "role_select", "creator", "agent"]:
         """Routing gate, keyed on whether the number is in the job-board DB.
 
-        * KNOWN number (DB phone lookup hit) → a greeting opens the Job Seeker /
-          Job Creator choice; picking one runs that flow.
-        * NEW number (not in the DB) → straight to onboarding (ask name → form).
-          Once the form is submitted and written to the DB, the next greeting
-          finds them known and they get the lane choice via this same path.
+        The lane is ALWAYS asked first — a brand-new number's very first message
+        opens the Job Seeker / Employer choice before anything else:
+
+        * Job Seeker  → the tokenised onboarding form link; once submitted (and
+          written to the DB) the next turn finds them known and the seeker
+          conversation continues (search / status / recommendations).
+        * Employer    → its OWN Redis-staged registration form + employer flow.
+
+        Once a lane is chosen it's remembered (customer_facts), so it's never
+        re-asked. A KNOWN seeker greeting re-opens the seeker hub.
         """
-        # First turn after the form is submitted → one-time success + lane choice.
+        # First turn after the seeker form is submitted → one-time success path.
         if state.get("just_onboarded"):
             return "onboarding"
 
@@ -1008,24 +1296,31 @@ class AgentRuntime:
         if _CLOSER_RX.match(q):
             return "greeting"
 
-        # New numbers must register first — no lane choice until they're known.
-        if not state.get("is_known", False):
-            return "onboarding"
-
         # Lane is REMEMBERED: the tap this turn wins, otherwise the stored choice
         # from customer_facts. Once a lane is known we never re-ask.
+        #
+        # The EMPLOYER lane runs its OWN registration (staged in Redis), so it
+        # bypasses the seeker job-board / onboarding gate — a creator tap or a
+        # remembered creator lane goes straight to the employer flow whether or
+        # not this number is a registered job-seeker.
         picked = _role_selection(state)
         lane = picked or (state.get("customer_facts") or {}).get("lane")
         if lane == "creator":
-            return "creator"                       # recruiter flow, every turn
+            return "creator"                       # employer flow, every turn
+
         if lane == "seeker":
-            # Show the seeker hub (Job Search / Application Status / Recommended)
-            # on the selection tap or on a greeting; otherwise reason normally.
+            # New seeker (not yet in the DB) → the onboarding form link; known
+            # seeker → the hub on a tap/greeting, otherwise reason normally.
+            if not state.get("is_known", False):
+                return "onboarding"
             return "greeting" if (picked or _GREETING_RX.match(q)) else "agent"
-        # No lane chosen yet → ask once on a greeting; otherwise proceed.
-        if _GREETING_RX.match(q):
-            return "role_select"
-        return "agent"
+
+        # No lane chosen yet. A KNOWN number that just reasons normally (non-
+        # greeting) is left on the agent path; everyone else — including every
+        # brand-new number — is asked the lane FIRST.
+        if state.get("is_known", False) and not _GREETING_RX.match(q):
+            return "agent"
+        return "role_select"
 
     def _memory_context(self, state: AgentState, *, for_planner: bool = False) -> str | None:
         """Compress durable memory into a short block.

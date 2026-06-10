@@ -146,6 +146,27 @@ class MemoryGateway:
             conversation_id, tenant_id=tenant_id
         )
 
+    # ---- employer flow (Redis-only job-poster profile) --------------
+
+    async def employer(
+        self, *, tenant_id: str, phone: str
+    ) -> dict[str, Any] | None:
+        """The staged employer record for this phone, or None if not registered."""
+        return await self.short_term.get_employer(phone, tenant_id=tenant_id)
+
+    async def update_employer(
+        self, *, tenant_id: str, phone: str, fields: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        return await self.short_term.update_employer(phone, fields, tenant_id=tenant_id)
+
+    async def employer_token(
+        self, *, tenant_id: str, phone: str, conversation_id: str, name: str | None
+    ) -> str:
+        """Get/create this employer's form token (register / KYC / post-job)."""
+        return await self.short_term.ensure_employer_token(
+            phone, tenant_id=tenant_id, conversation_id=conversation_id, name=name,
+        )
+
     async def set_focus_product(
         self, *, conversation_id: str, tenant_id: str, product_id: str, doc: str
     ) -> None:

@@ -574,6 +574,9 @@ class LookupRepository:
         "districts":        ("districts", False, "name", "stateId"),
         "other_states":     ("private_other_state_masters", True, '"displayOrder" NULLS LAST, name', None),
         "languages":        ("languages", True, '"displayOrder" NULLS LAST, name', None),
+        # employer-side reference data (Stage 1 registration form)
+        "industries":       ("private_industry_masters", True, '"displayOrder" NULLS LAST, name', None),
+        "designations":     ("private_employer_designations", True, '"displayOrder" NULLS LAST, name', None),
     }
 
     @staticmethod
@@ -625,12 +628,19 @@ class LookupRepository:
 # ---------------------------------------------------------------
 
 # Tables with an updatedAt column (set to now() on insert alongside createdAt).
-_WITH_UPDATED_AT = {"private_job_seekers", "job_seeker_profiles"}
+_WITH_UPDATED_AT = {"private_job_seekers", "job_seeker_profiles", "private_jobs"}
 # Columns that are Postgres ENUMs → need an explicit CAST on insert.
 _ENUM_CASTS = {
     "private_job_seekers": {"status": '"JobSeekerStatus"'},
     "job_seeker_profiles": {"relationType": '"RelationType"'},
+    "private_jobs": {
+        "jobType": '"PrivateJobType"', "status": '"PrivateJobStatus"',
+        "workMode": '"WorkMode"', "salaryPeriod": '"SalaryPeriod"',
+    },
 }
+# Columns whose staged 'YYYY-MM-DD[ ...]' string must become a real datetime
+# before insert (asyncpg rejects a bare string for a timestamp column).
+_TS_STRING_COLS = ("dateOfBirth", "interviewDate", "expiresAt", "featuredUntil")
 # Preference child tables, inserted after the seeker + profile (FK order).
 _CHILD_TABLES = (
     "private_job_seeker_skills", "private_job_seeker_locations",
@@ -642,21 +652,23 @@ _CHILD_TABLES = (
 
 def _prep_row(table: str, row: dict[str, Any]) -> dict[str, Any]:
     """Make a staged row insertable: drop the server-set timestamps (the SQL uses
-    now()), coerce dateOfBirth from 'YYYY-MM-DD' to a datetime (asyncpg rejects a
-    bare string for a timestamp), and drop empty array columns (jobTypes, resumes)
-    so the column default applies (an empty array has no inferable element type)."""
+    now()), coerce date/timestamp strings to datetimes (asyncpg rejects a bare
+    string for a timestamp), and drop EMPTY array columns so the column default
+    applies (an empty array has no inferable element type)."""
     r = dict(row)
     r.pop("createdAt", None)
     r.pop("updatedAt", None)
-    dob = r.get("dateOfBirth")
-    if isinstance(dob, str) and dob:
-        try:
-            r["dateOfBirth"] = datetime.strptime(dob[:10], "%Y-%m-%d")
-        except ValueError:
-            r["dateOfBirth"] = None
-    for arr_col in ("jobTypes", "resumes"):
-        if arr_col in r and not r[arr_col]:
-            r.pop(arr_col, None)
+    for col in _TS_STRING_COLS:
+        v = r.get(col)
+        if isinstance(v, str) and v:
+            try:
+                r[col] = datetime.strptime(v[:10], "%Y-%m-%d")
+            except ValueError:
+                r[col] = None
+    # Drop any empty list/tuple so the column's array default (e.g. text[]) applies.
+    for k in list(r):
+        if isinstance(r[k], (list, tuple)) and not r[k]:
+            r.pop(k, None)
     return r
 
 
@@ -709,3 +721,114 @@ class JobSeekerRepository:
             "profile_id": profile["id"],
             "children": counts,
         }
+
+    @staticmethod
+    async def list_candidates(*, limit: int = 8) -> list[dict[str, Any]]:
+        """Active job-seekers for the employer 'view candidates' flow. Returns the
+        FULL rows (incl. aggregated ``skills`` + preferred ``roles``); the caller
+        masks them by entitlement tier (name + years of experience only until the
+        employer has paid)."""
+        sql = text(
+            """
+            SELECT js.id, js."fullName" AS full_name, js.email, js.phone, js.city,
+                   el.name AS experience_level, d.name AS district,
+                   array_agg(DISTINCT sk.name) FILTER (WHERE sk.name IS NOT NULL) AS skills,
+                   array_agg(DISTINCT jr.name) FILTER (WHERE jr.name IS NOT NULL) AS roles
+            FROM private_job_seekers js
+            LEFT JOIN private_experience_levels el ON el.id = js."experienceLevelId"
+            LEFT JOIN districts d ON d.id = js."districtId"
+            LEFT JOIN private_job_seeker_skills jss ON jss."jobSeekerId" = js.id
+            LEFT JOIN private_skills sk ON sk.id = jss."skillId"
+            LEFT JOIN private_job_seeker_preferred_roles jsr ON jsr."jobSeekerId" = js.id
+            LEFT JOIN private_job_roles jr ON jr.id = jsr."jobRoleId"
+            WHERE js.status = 'ACTIVE' AND js."fullName" IS NOT NULL
+            GROUP BY js.id, js."fullName", js.email, js.phone, js.city,
+                     el.name, d.name, js."createdAt"
+            ORDER BY js."createdAt" DESC NULLS LAST
+            LIMIT :limit
+            """
+        )
+        try:
+            async with session_scope() as session:
+                rows = (await session.execute(sql, {"limit": limit})).fetchall()
+            return [dict(r._mapping) for r in rows]
+        except Exception as exc:  # noqa: BLE001 — a lookup miss must not break the flow
+            log.warning("list_candidates_failed", error=str(exc)[:200])
+            return []
+
+    @staticmethod
+    async def search_candidates(*, query: str, limit: int = 8) -> list[dict[str, Any]]:
+        """Active job-seekers whose SKILL, preferred ROLE, or CATEGORY matches the
+        employer's free-text query. Same row shape as ``list_candidates`` plus an
+        aggregated ``skills`` list; the caller masks by entitlement tier."""
+        q = (query or "").strip()
+        if not q:
+            return []
+        sql = text(
+            """
+            WITH matched AS (
+                SELECT DISTINCT js.id
+                FROM private_job_seekers js
+                LEFT JOIN private_job_seeker_skills jss ON jss."jobSeekerId" = js.id
+                LEFT JOIN private_skills sk ON sk.id = jss."skillId"
+                LEFT JOIN private_job_seeker_preferred_roles jsr ON jsr."jobSeekerId" = js.id
+                LEFT JOIN private_job_roles jr ON jr.id = jsr."jobRoleId"
+                LEFT JOIN private_job_seeker_categories jsc ON jsc."jobSeekerId" = js.id
+                LEFT JOIN private_job_categories cat ON cat.id = jsc."categoryId"
+                WHERE js.status = 'ACTIVE' AND js."fullName" IS NOT NULL
+                  AND (sk.name ILIKE :q OR jr.name ILIKE :q OR cat.name ILIKE :q)
+            )
+            SELECT js.id, js."fullName" AS full_name, js.email, js.phone, js.city,
+                   el.name AS experience_level, d.name AS district,
+                   array_agg(DISTINCT sk2.name) FILTER (WHERE sk2.name IS NOT NULL) AS skills,
+                   array_agg(DISTINCT jr2.name) FILTER (WHERE jr2.name IS NOT NULL) AS roles
+            FROM private_job_seekers js
+            JOIN matched m ON m.id = js.id
+            LEFT JOIN private_experience_levels el ON el.id = js."experienceLevelId"
+            LEFT JOIN districts d ON d.id = js."districtId"
+            LEFT JOIN private_job_seeker_skills jss2 ON jss2."jobSeekerId" = js.id
+            LEFT JOIN private_skills sk2 ON sk2.id = jss2."skillId"
+            LEFT JOIN private_job_seeker_preferred_roles jsr2 ON jsr2."jobSeekerId" = js.id
+            LEFT JOIN private_job_roles jr2 ON jr2.id = jsr2."jobRoleId"
+            GROUP BY js.id, js."fullName", js.email, js.phone, js.city,
+                     el.name, d.name, js."createdAt"
+            ORDER BY js."createdAt" DESC NULLS LAST
+            LIMIT :limit
+            """
+        )
+        try:
+            async with session_scope() as session:
+                rows = (await session.execute(sql, {"q": f"%{q}%", "limit": limit})).fetchall()
+            return [dict(r._mapping) for r in rows]
+        except Exception as exc:  # noqa: BLE001 — a lookup miss must not break the flow
+            log.warning("search_candidates_failed", error=str(exc)[:200])
+            return []
+
+
+# ---------------------------------------------------------------
+# Job posting WRITE (live job board) — flag-gated, with dry-run
+# ---------------------------------------------------------------
+
+
+class JobPostRepository:
+    """WRITE path: post a job to the live job board (``private_jobs``).
+
+    ``commit=False`` is a DRY RUN — the INSERT runs against the DB (so every
+    type / enum / FK / NOT-NULL constraint is exercised) and is then rolled back,
+    writing nothing. Used to verify a staged ``private_jobs`` record is storable.
+    """
+
+    @staticmethod
+    async def create(payload: dict[str, Any], *, commit: bool = True) -> dict[str, Any]:
+        job = _prep_row("private_jobs", payload["private_jobs"])
+        start = time.perf_counter()
+        async with get_engine().connect() as conn:
+            trans = await conn.begin()
+            try:
+                await conn.execute(text(_insert_sql("private_jobs", job)), job)
+                await (trans.commit() if commit else trans.rollback())
+            except Exception:
+                await trans.rollback()
+                raise
+        SQL_LATENCY.labels(op="job_post").observe(time.perf_counter() - start)
+        return {"committed": commit, "job_id": job["id"]}

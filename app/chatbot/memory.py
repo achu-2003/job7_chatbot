@@ -453,6 +453,119 @@ class ConversationMemory:
         except json.JSONDecodeError:
             return None
 
+    # ------------------------------------------------------------------
+    # employer (job-poster) flow — Stages 1-5 staged in Redis ONLY (testing).
+    # One durable record per phone holds the DB-shaped private_employers row
+    # plus runtime extras (posted jobs, candidate-unlock entitlement). Keyed by
+    # the bare phone digits so it survives across conversations/sessions.
+    #
+    #   t:{tid}:employer:{digits}            → the staged employer record
+    #   t:{tid}:employer:{digits}:token      → this employer's current form token
+    #   employer:token:{token}               → token → {tenant, customer, conv,
+    #                                           name} (NOT tenant-prefixed; the
+    #                                           form POST only carries the token)
+    # ------------------------------------------------------------------
+    _EMPLOYER_TTL = 30 * 86400  # 30 days — employer data persists for testing
+
+    @staticmethod
+    def _digits(phone: str) -> str:
+        return "".join(ch for ch in (phone or "") if ch.isdigit())
+
+    def _employer_key(self, phone: str, *, tenant_id: str | None = None) -> str:
+        tid = tenant_id or get_current_tenant_id()
+        return f"t:{tid}:employer:{self._digits(phone)}"
+
+    def _employer_token_fwd_key(self, phone: str, *, tenant_id: str | None = None) -> str:
+        tid = tenant_id or get_current_tenant_id()
+        return f"t:{tid}:employer:{self._digits(phone)}:token"
+
+    @staticmethod
+    def _employer_token_key(token: str) -> str:
+        return f"employer:token:{token}"
+
+    async def get_employer(
+        self, phone: str, *, tenant_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """The staged employer record for this phone, or None if not registered."""
+        assert self._redis is not None
+        raw = await self._redis.get(self._employer_key(phone, tenant_id=tenant_id))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    async def save_employer(
+        self, phone: str, record: dict[str, Any], *, tenant_id: str | None = None
+    ) -> None:
+        """Persist the employer record (Redis only — never the business DB)."""
+        assert self._redis is not None
+        await self._redis.setex(
+            self._employer_key(phone, tenant_id=tenant_id),
+            self._EMPLOYER_TTL,
+            json.dumps(record, default=str),
+        )
+        log.info("employer_saved", phone=self._digits(phone))
+
+    async def update_employer(
+        self, phone: str, fields: dict[str, Any], *, tenant_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Shallow-merge top-level fields into the staged record (e.g. paid=True).
+        Returns the updated record, or None if the employer isn't registered."""
+        rec = await self.get_employer(phone, tenant_id=tenant_id)
+        if rec is None:
+            return None
+        rec.update(fields)
+        await self.save_employer(phone, rec, tenant_id=tenant_id)
+        return rec
+
+    async def add_employer_job(
+        self, phone: str, job: dict[str, Any], *, tenant_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Append a posted job to the employer's record (Redis only)."""
+        rec = await self.get_employer(phone, tenant_id=tenant_id)
+        if rec is None:
+            return None
+        jobs = rec.get("jobs") or []
+        jobs.append(job)
+        rec["jobs"] = jobs
+        await self.save_employer(phone, rec, tenant_id=tenant_id)
+        return rec
+
+    async def ensure_employer_token(
+        self, phone: str, *, tenant_id: str, conversation_id: str, name: str | None
+    ) -> str:
+        """Return this employer's form token (for register / KYC / post-job),
+        minting one (and the reverse token→identity map) on first use. Reused
+        across turns + forms; TTL/identity refreshed each call."""
+        assert self._redis is not None
+        ttl = get_settings().onboarding_ttl_seconds
+        identity = json.dumps({
+            "tenant_id": tenant_id, "customer_id": phone,
+            "conversation_id": conversation_id, "name": name or "",
+        })
+        fwd = self._employer_token_fwd_key(phone, tenant_id=tenant_id)
+        token = await self._redis.get(fwd)
+        if not token:
+            token = uuid.uuid4().hex
+            await self._redis.setex(fwd, ttl, token)
+        await self._redis.setex(self._employer_token_key(token), ttl, identity)
+        await self._redis.expire(fwd, ttl)
+        return token
+
+    async def get_employer_identity(self, token: str) -> dict[str, Any] | None:
+        """Resolve an employer form token back to its identity (for the form page
+        + submission). None if unknown/expired."""
+        assert self._redis is not None
+        raw = await self._redis.get(self._employer_token_key(token))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
     async def save_onboarding(
         self, token: str, data: dict[str, Any]
     ) -> dict[str, Any] | None:

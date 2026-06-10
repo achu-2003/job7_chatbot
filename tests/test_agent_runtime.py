@@ -55,6 +55,9 @@ def _stub_memory(
     apply_state: dict | None = None,
     registration: dict | None = None,
     title_jobs: list | None = None,
+    employer: dict | None = None,
+    candidates: list | None = None,
+    search_results: list | None = None,
 ) -> None:
     # Default to a fully-onboarded sender so the identity gate is a no-op and the
     # reasoning tests below exercise the normal path. Onboarding tests pass
@@ -191,6 +194,34 @@ def _stub_memory(
         return title_jobs or []
 
     rt._title_search = fake_title_search   # type: ignore[assignment]
+
+    # ---- employer (job-poster) lane stubs ----
+    employer_state = {"rec": employer}     # mutable so a simulated payment sticks
+
+    async def fake_employer(**kw):
+        return employer_state["rec"]
+
+    async def fake_employer_token(**kw):
+        return "etok123"
+
+    async def fake_update_employer(*, fields, **kw):
+        rec = dict(employer_state["rec"] or {})
+        rec.update(fields)
+        employer_state["rec"] = rec
+        return rec
+
+    async def fake_list_candidates(**kw):
+        return candidates or []
+
+    async def fake_search_candidates(*, query, **kw):
+        return search_results if search_results is not None else (candidates or [])
+
+    rt.gateway.employer = fake_employer            # type: ignore[assignment]
+    rt.gateway.employer_token = fake_employer_token  # type: ignore[assignment]
+    rt.gateway.update_employer = fake_update_employer  # type: ignore[assignment]
+    rt._list_candidates = fake_list_candidates     # type: ignore[assignment]
+    rt._search_candidates = fake_search_candidates  # type: ignore[assignment]
+
     # expose action-call logs for assertions
     rt._test_saved = saved_calls           # type: ignore[attr-defined]
     rt._test_applied = applied_calls       # type: ignore[attr-defined]
@@ -260,13 +291,21 @@ async def test_remembered_seeker_lane_skips_the_question():
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
-async def test_remembered_creator_lane_goes_to_creator_flow():
-    """A returning Job Creator's messages flow to the recruiter lane, no re-ask."""
+async def test_remembered_creator_lane_goes_to_creator_flow(monkeypatch):
+    """A returning employer with NO staged profile is taken straight to the
+    employer registration form — the lane question is not re-asked."""
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "public_base_url", "https://abc.ngrok-free.app")
     rt = _runtime()
-    _stub_memory(rt, facts={"full_name": "Asha", "lane": "creator"})
+    _stub_memory(rt, facts={"full_name": "Asha", "lane": "creator"}, employer=None)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "hi")
-    assert "hiring" in out["response"].lower() or "coming soon" in out["response"].lower()
+    assert "register" in out["response"].lower()
+    cta = out["whatsapp_interactive"]["interactive"]
+    assert cta["type"] == "cta_url"
+    assert "/employer/register?token=etok123" in cta["action"]["parameters"]["url"]
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
@@ -352,28 +391,28 @@ async def test_tool_path_plans_executes_reflects_responds():
     assert rt.llm.chat_calls == ["agent_respond"]
 
 
-async def test_unknown_number_is_asked_for_name():
-    """A number with no job-board record and no captured name is asked to
-    introduce itself — with zero LLM calls — instead of being helped. (A non-
-    greeting message skips the lane choice and hits the onboarding gate.)"""
+async def test_unknown_number_is_asked_lane_first():
+    """A brand-new number's FIRST message opens the Job Seeker / Employer choice
+    (lane is always asked before any onboarding) — with zero LLM calls."""
     rt = _runtime()
     _stub_memory(rt, facts={}, onboarded=False)   # nothing on file, no DB candidate
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "i need a job")
-    assert "full name" in out["response"].lower()
+    titles = [b["reply"]["title"]
+              for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
+    assert titles == ["Job Seeker", "Employer"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
 
 
-async def test_name_known_but_form_not_submitted_gets_form_link(monkeypatch):
-    """Name captured, form not yet submitted → the gate hands over the form link
-    (and keeps gating job help), with zero LLM calls. With a non-https base URL
-    the link is inline text, no cta button. Pin the base URL so the test doesn't
-    depend on the ambient .env (which may set an https ngrok URL)."""
+async def test_seeker_lane_hands_over_form_link(monkeypatch):
+    """A new number on the Job Seeker lane (not yet submitted) gets the form link
+    straight away — no in-chat name question — with zero LLM calls. With a non-
+    https base URL the link is inline text, no cta button."""
     from app.config import get_settings
 
     monkeypatch.setattr(get_settings(), "public_base_url", "http://localhost:8000")
     rt = _runtime()
-    _stub_memory(rt, facts={"full_name": "Achuthan E"}, onboarded=False)
+    _stub_memory(rt, facts={"full_name": "Achuthan E", "lane": "seeker"}, onboarded=False)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "tell me about jobs")
     assert "form" in out["response"].lower()
@@ -390,7 +429,7 @@ async def test_form_link_sent_as_cta_button_when_https(monkeypatch):
 
     monkeypatch.setattr(get_settings(), "public_base_url", "https://abc.ngrok-free.app")
     rt = _runtime()
-    _stub_memory(rt, facts={"full_name": "Partha"}, onboarded=False)
+    _stub_memory(rt, facts={"full_name": "Partha", "lane": "seeker"}, onboarded=False)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "list jobs")
 
@@ -420,15 +459,16 @@ async def test_db_known_user_gets_lane_choice():
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
-async def test_new_number_hi_goes_straight_to_onboarding():
-    """A number NOT in our DB (and not onboarded) that says 'hi' is asked for its
-    name — the lane choice is NOT offered until they've registered."""
+async def test_new_number_hi_offers_lane_choice():
+    """A number NOT in our DB saying 'hi' is offered the Job Seeker / Employer
+    choice first (lane is asked before onboarding)."""
     rt = _runtime()
     _stub_memory(rt, facts={}, onboarded=False)   # no DB candidate, no form
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "hi")
-    assert "full name" in out["response"].lower()                 # onboarding ask-name
-    assert out.get("whatsapp_interactive") is None                # no lane buttons yet
+    titles = [b["reply"]["title"]
+              for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
+    assert titles == ["Job Seeker", "Employer"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
@@ -479,26 +519,205 @@ async def test_seeker_tap_offers_quick_reply_menu():
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
 
 
-async def test_creator_tap_shows_stub():
-    """Tapping 'Job Creator' (role:creator) routes to the placeholder recruiter
-    reply — deterministically, 0 LLM, no menu buttons."""
+async def test_creator_tap_starts_employer_registration(monkeypatch):
+    """Tapping 'Employer' (role:creator) with no staged profile hands over the
+    company registration form — deterministically, 0 LLM."""
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "public_base_url", "https://abc.ngrok-free.app")
     rt = _runtime()
-    _stub_memory(rt, facts={"full_name": "Achuthan E"})
+    _stub_memory(rt, facts={"full_name": "Achuthan E"}, employer=None)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
-    out = await _handle(rt, "Job Creator", interactive_id="role:creator")
-    assert "coming soon" in out["response"].lower()
-    assert out.get("whatsapp_interactive") is None
+    out = await _handle(rt, "Employer", interactive_id="role:creator")
+    assert "register" in out["response"].lower()
+    cta = out["whatsapp_interactive"]["interactive"]
+    assert cta["type"] == "cta_url"
+    assert "/employer/register?token=etok123" in cta["action"]["parameters"]["url"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
 
 
-async def test_new_number_seeker_tap_starts_onboarding():
-    """An unknown number that taps 'Job Seeker' enters onboarding (asked for a
-    name) — the existing-user check + onboarding happen after the lane choice."""
+# --- employer flow: Stages 2-5 -------------------------------------------
+
+def _employer(*, kyc="VERIFIED", paid=False, jobs=None):
+    return {
+        "private_employers": {"companyName": "Acme Technologies", "kycStatus": kyc},
+        "paid": paid,
+        "jobs": jobs or [],
+    }
+
+
+async def test_registered_employer_unverified_gets_kyc_gate(monkeypatch):
+    """A registered employer whose KYC isn't VERIFIED is sent to the KYC form."""
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "public_base_url", "https://abc.ngrok-free.app")
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Asha", "lane": "creator"},
+                 employer=_employer(kyc="NOT_SUBMITTED"))
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "hi")
+    assert "verify" in out["response"].lower()
+    assert "/employer/kyc?token=etok123" in out["whatsapp_interactive"]["interactive"]["action"]["parameters"]["url"]
+
+
+async def test_kyc_under_review_message():
+    """KYC PENDING (submitted, awaiting) → an 'under review' note, no form."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"lane": "creator"}, employer=_employer(kyc="PENDING"))
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "hi")
+    assert "under review" in out["response"].lower()
+    assert out.get("whatsapp_interactive") is None
+
+
+async def test_verified_employer_sees_menu():
+    """A verified employer greeting gets the employer hub (3 buttons)."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"lane": "creator"}, employer=_employer())
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "hi")
+    titles = [b["reply"]["title"] for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
+    assert titles == ["Post a Job", "View Candidates", "My Jobs"]
+    assert "acme" in out["response"].lower()
+
+
+async def test_post_job_tap_hands_over_form(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "public_base_url", "https://abc.ngrok-free.app")
+    rt = _runtime()
+    _stub_memory(rt, facts={"lane": "creator"}, employer=_employer())
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Post a Job", interactive_id="emp:post")
+    assert "/employer/post-job?token=etok123" in out["whatsapp_interactive"]["interactive"]["action"]["parameters"]["url"]
+
+
+async def test_view_candidates_masked_until_paid():
+    """Verified-but-unpaid employer sees name + experience only, plus an Unlock
+    button — contact details are NOT in the payload. (Employer is NOT a seeker in
+    the DB — onboarded=False — so this also guards the onboarding-form leak.)"""
+    rt = _runtime()
+    _stub_memory(
+        rt, facts={"lane": "creator"}, onboarded=False, employer=_employer(paid=False),
+        candidates=[{"full_name": "Rahul", "experience_level": "2-3 years",
+                     "phone": "9990001111", "email": "rahul@x.com", "city": "Chennai"}],
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "View Candidates", interactive_id="emp:candidates")
+    body = out["response"]
+    assert "Rahul" in body and "2-3 years" in body
+    assert "9990001111" not in body and "rahul@x.com" not in body   # masked
+    titles = [b["reply"]["title"] for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
+    assert any("Unlock" in t for t in titles)
+
+
+async def test_payment_unlocks_full_candidate_details():
+    """Tapping Confirm Payment sets the entitlement and reveals contact details —
+    a TEXT-only reply, so it must NOT leak the seeker onboarding form/button."""
+    rt = _runtime()
+    _stub_memory(
+        rt, facts={"lane": "creator"}, onboarded=False, employer=_employer(paid=False),
+        candidates=[{"full_name": "Rahul", "experience_level": "2-3 years",
+                     "phone": "9990001111", "email": "rahul@x.com", "city": "Chennai"}],
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Confirm Payment", interactive_id="emp:pay")
+    body = out["response"]
+    assert "payment successful" in body.lower()
+    assert "9990001111" in body and "rahul@x.com" in body   # full details now
+    assert "form" not in body.lower()                        # NOT the seeker form
+    # the leaked seeker-form cta button must be cleared on a text-only reply
+    assert out.get("whatsapp_interactive") is None
+
+
+async def test_employer_not_in_seeker_db_never_gets_onboarding_form():
+    """Regression: a verified employer NOT in the seeker DB tapping View
+    Candidates gets candidate details, never the seeker onboarding form/cta."""
+    rt = _runtime()
+    _stub_memory(
+        rt, facts={"lane": "creator"}, onboarded=False, employer=_employer(paid=True),
+        candidates=[{"full_name": "Rahul", "experience_level": "2-3 years",
+                     "phone": "9990001111", "email": "rahul@x.com"}],
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "View Candidates", interactive_id="emp:candidates")
+    assert "Rahul" in out["response"] and "9990001111" in out["response"]
+    assert "/onboard/form" not in (out["response"] or "")
+    assert out.get("whatsapp_interactive") is None           # no leaked Open-form cta
+
+
+async def test_employer_text_search_by_skill_masked():
+    """A verified-but-unpaid employer typing a skill/role gets matching candidates,
+    masked (name + experience), routed through the skill/role search."""
+    rt = _runtime()
+    _stub_memory(
+        rt, facts={"lane": "creator"}, onboarded=False, employer=_employer(paid=False),
+        search_results=[{"full_name": "Vikram", "experience_level": "3-4 years",
+                         "phone": "9991112222", "email": "vik@x.com",
+                         "skills": ["Welding", "Fitting"]}],
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "welder")
+    body = out["response"]
+    assert "Vikram" in body and "welder" in body.lower()       # matched + query echoed
+    assert "9991112222" not in body and "vik@x.com" not in body  # masked
+    titles = [b["reply"]["title"] for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
+    assert any("Unlock" in t for t in titles)
+
+
+async def test_employer_text_search_full_when_paid():
+    """A PAID employer searching by skill sees full details (incl. skills)."""
+    rt = _runtime()
+    _stub_memory(
+        rt, facts={"lane": "creator"}, onboarded=False, employer=_employer(paid=True),
+        search_results=[{"full_name": "Vikram", "experience_level": "3-4 years",
+                         "phone": "9991112222", "email": "vik@x.com",
+                         "roles": ["Welder", "Fitter"], "skills": ["Welding", "Fitting"]}],
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "welding")
+    body = out["response"]
+    assert "Vikram" in body and "9991112222" in body
+    assert "Welder" in body and "Welding" in body              # role + skills shown
+    assert out.get("whatsapp_interactive") is None             # text-only, no leak
+
+
+async def test_employer_search_no_match_nudges_to_menu():
+    """A skill/role query with no matches nudges back to the menu, not an error."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"lane": "creator"}, onboarded=False,
+                 employer=_employer(paid=True), search_results=[])
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "astronaut")
+    assert "no candidates found" in out["response"].lower()
+    titles = [b["reply"]["title"] for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
+    assert titles == ["Post a Job", "View Candidates", "My Jobs"]
+
+
+async def test_unverified_employer_cannot_view_candidates():
+    """An emp:candidates tap before KYC verification falls back to the KYC gate —
+    candidate data is never served."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"lane": "creator"}, employer=_employer(kyc="NOT_SUBMITTED"),
+                 candidates=[{"full_name": "Rahul", "experience_level": "2-3 years"}])
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "View Candidates", interactive_id="emp:candidates")
+    assert "verify" in out["response"].lower()
+    assert "Rahul" not in out["response"]
+
+
+async def test_new_number_seeker_tap_hands_over_form(monkeypatch):
+    """An unknown number that taps 'Job Seeker' is handed the onboarding form link
+    straight away (the form collects the name) — 0 LLM."""
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "public_base_url", "https://abc.ngrok-free.app")
     rt = _runtime()
     _stub_memory(rt, facts={}, onboarded=False)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "Job Seeker", interactive_id="role:seeker")
-    assert "name" in out["response"].lower()             # onboarding ask-name
+    assert "form" in out["response"].lower()
+    assert "/onboard/form?token=tok123" in out["whatsapp_interactive"]["interactive"]["action"]["parameters"]["url"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
 
 

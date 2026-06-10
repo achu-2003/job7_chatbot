@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.responses import Response
 
-from app.api.routes import admin, chat, health, onboard, whatsapp
+from app.api.routes import admin, chat, employer, health, onboard, whatsapp
 from app.config import get_settings
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RequestContextMiddleware
@@ -122,6 +122,7 @@ app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
 app.include_router(admin.router, prefix="/api/v1/admin", tags=["admin"])
 app.include_router(whatsapp.router, prefix="/api/whatsapp", tags=["whatsapp"])
 app.include_router(onboard.router, prefix="/onboard", tags=["onboard"])
+app.include_router(employer.router, prefix="/employer", tags=["employer"])
 
 
 @app.get("/metrics")

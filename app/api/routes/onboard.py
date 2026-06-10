@@ -32,9 +32,15 @@ from app.db.repositories import JobSeekerRepository, LookupRepository
 from app.onboarding import prepare_registration
 from app.whatsapp import delivery as wa_delivery
 
-# The post-registration lane menu pushed to WhatsApp. Ids must match
-# app.agent.runtime._role_selection (role:seeker / role:creator).
-_LANE_BUTTONS = (("role:seeker", "Job Seeker"), ("role:creator", "Employer"))
+# The /onboard form is the SEEKER lane (the employer side has its own form), so
+# after a submission we push the seeker hub directly — the conversation just
+# continues with Job Search / Application Status / Recommended Jobs. Ids must
+# match app.agent.runtime._MENU_BUTTONS.
+_SEEKER_HUB_BUTTONS = (
+    ("menu_search", "Job Search"),
+    ("menu_status", "Application Status"),
+    ("menu_recommend", "Recommended Jobs"),
+)
 
 router = APIRouter()
 log = get_logger("onboard")
@@ -184,20 +190,22 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
             log.error("registration_db_write_failed", error=str(exc)[:300])
 
     settings = get_settings()
-    # PROACTIVELY push the "registration successful" message + the Job Seeker /
-    # Employer menu to WhatsApp, so it appears the moment they return to the chat
-    # — no typing needed. Mark onboarding welcomed so the bot doesn't also send its
-    # own one-time success on the next message.
+    # PROACTIVELY push the "registration successful" message + the seeker hub to
+    # WhatsApp, so it appears the moment they return to the chat — no typing
+    # needed. They reached this form via the Job Seeker lane, so we continue as a
+    # seeker (search / status / recommendations) rather than re-asking the lane.
+    # Mark onboarding welcomed so the bot doesn't also send its own one-time
+    # success on the next message.
     phone = re.sub(r"\D", "", identity.get("customer_id") or "")
     if phone:
         first = (identity.get("name") or "").split()[0] if identity.get("name") else ""
         who = f", {first}" if first else ""
         body = (
-            f"🎉 Registration successful{who}!\n\nYour profile is all set. How can "
-            "I help you today — are you here to find a job, or to hire as an employer?"
+            f"🎉 Registration successful{who}!\n\nYou're all set. Here's what I can "
+            "help you with — just tap an option below."
         )
         try:
-            await wa_delivery.send_message(settings, phone, wa.buttons_message(body, _LANE_BUTTONS))
+            await wa_delivery.send_message(settings, phone, wa.buttons_message(body, _SEEKER_HUB_BUTTONS))
             await memory.mark_onboarding_welcomed(
                 identity["conversation_id"], tenant_id=identity["tenant_id"]
             )

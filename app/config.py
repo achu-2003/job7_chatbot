@@ -208,6 +208,13 @@ class Settings(BaseSettings):
     # (private_job_seekers + job_seeker_profiles + child rows). Default False keeps
     # the safe Redis-only staging; flip to true (REGISTER_IN_DB=true) once verified.
     register_in_db: bool = False
+    # Employer (job-poster) flow — Stages 1-5 are staged in Redis ONLY for testing
+    # (company profile shaped like private_employers, KYC, posted jobs, the
+    # candidate-unlock entitlement). When ``employer_kyc_auto_verify`` is True a
+    # submitted KYC is approved immediately so the gate can be demoed end-to-end;
+    # set EMPLOYER_KYC_AUTO_VERIFY=false to leave it PENDING ("under review") for a
+    # manual/admin approval design.
+    employer_kyc_auto_verify: bool = True
     # The business's DIALABLE WhatsApp number (digits, international format, e.g.
     # "919876543210" — NOT the meta_phone_number_id). Used to build the "Back to
     # chat" wa.me deep link on the form's success page so the candidate returns to
