@@ -83,6 +83,12 @@ _CLOSER_RX = re.compile(
     r"i'?m done|im done|done for now|that'?ll be all|ok bye|thank you bye)[\s!.?]*$",
     re.IGNORECASE,
 )
+# Typed "switch" (and variants) → re-open the Job Seeker / Employer lane choice,
+# so a user can hop between lanes without a menu button.
+_SWITCH_RX = re.compile(
+    r"^\s*(switch|change)(\s*(lane|role|mode|account|profile))?[\s!.?]*$",
+    re.IGNORECASE,
+)
 
 # ---- quick-reply menu (greeting / onboarding success) -------------------
 # Three tappable buttons. A tap comes back as the button TITLE text (see the
@@ -1363,6 +1369,12 @@ class AgentRuntime:
         q = state.get("inbound_text", "")
         if _CLOSER_RX.match(q):
             return "greeting"
+
+        # Typed "switch" → re-open the Job Seeker / Employer lane choice (the
+        # filter), so a user can hop lanes without a menu button. Takes precedence
+        # over the remembered lane; picking one then routes into that flow.
+        if _SWITCH_RX.match(q):
+            return "role_select"
 
         # Lane is REMEMBERED: the tap this turn wins, otherwise the stored choice
         # from customer_facts. Once a lane is known we never re-ask.

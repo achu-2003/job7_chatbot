@@ -800,15 +800,26 @@ class JobSeekerRepository:
     @staticmethod
     async def search_candidates(*, query: str, limit: int = 8) -> list[dict[str, Any]]:
         """Active job-seekers whose SKILL, preferred ROLE, or CATEGORY matches the
-        employer's free-text query. Same row shape as ``list_candidates`` plus an
-        aggregated ``skills`` list; the caller masks by entitlement tier."""
+        employer's free-text query. The query is split into WORDS and a candidate
+        matches if ANY skill/role/category contains ANY word — so "python
+        developer" finds someone with the *Python* skill (and a Developer role),
+        and "python django" finds someone with either. Ranked by how many of the
+        searched skills the candidate has. Same row shape as ``list_candidates``;
+        the caller masks by entitlement tier."""
         q = (query or "").strip()
         if not q:
             return []
+        # Tokenise into words → "%word%" patterns; match any against any field.
+        terms = [t for t in re.split(r"\s+", q.lower()) if len(t) >= 2] or [q.lower()]
+        patterns = [f"%{t}%" for t in terms]
         sql = text(
             """
             WITH matched AS (
-                SELECT DISTINCT js.id
+                SELECT js.id,
+                       count(DISTINCT sk.name)
+                           FILTER (WHERE sk.name ILIKE ANY(:patterns)) AS skill_hits,
+                       bool_or(jr.name ILIKE ANY(:patterns)) AS role_hit,
+                       bool_or(cat.name ILIKE ANY(:patterns)) AS cat_hit
                 FROM private_job_seekers js
                 LEFT JOIN private_job_seeker_skills jss ON jss."jobSeekerId" = js.id
                 LEFT JOIN private_skills sk ON sk.id = jss."skillId"
@@ -817,7 +828,10 @@ class JobSeekerRepository:
                 LEFT JOIN private_job_seeker_categories jsc ON jsc."jobSeekerId" = js.id
                 LEFT JOIN private_job_categories cat ON cat.id = jsc."categoryId"
                 WHERE js.status = 'ACTIVE' AND js."fullName" IS NOT NULL
-                  AND (sk.name ILIKE :q OR jr.name ILIKE :q OR cat.name ILIKE :q)
+                GROUP BY js.id
+                HAVING count(DISTINCT sk.name) FILTER (WHERE sk.name ILIKE ANY(:patterns)) > 0
+                    OR bool_or(jr.name ILIKE ANY(:patterns))
+                    OR bool_or(cat.name ILIKE ANY(:patterns))
             )
             SELECT js.id, js."fullName" AS full_name, js.email, js.phone, js.city,
                    el.name AS experience_level, d.name AS district,
@@ -832,14 +846,16 @@ class JobSeekerRepository:
             LEFT JOIN private_job_seeker_preferred_roles jsr2 ON jsr2."jobSeekerId" = js.id
             LEFT JOIN private_job_roles jr2 ON jr2.id = jsr2."jobRoleId"
             GROUP BY js.id, js."fullName", js.email, js.phone, js.city,
-                     el.name, d.name, js."createdAt"
-            ORDER BY js."createdAt" DESC NULLS LAST
+                     el.name, d.name, js."createdAt", m.skill_hits, m.role_hit
+            ORDER BY m.skill_hits DESC, m.role_hit DESC, js."createdAt" DESC NULLS LAST
             LIMIT :limit
             """
         )
         try:
             async with session_scope() as session:
-                rows = (await session.execute(sql, {"q": f"%{q}%", "limit": limit})).fetchall()
+                rows = (await session.execute(
+                    sql, {"patterns": patterns, "limit": limit}
+                )).fetchall()
             return [dict(r._mapping) for r in rows]
         except Exception as exc:  # noqa: BLE001 — a lookup miss must not break the flow
             log.warning("search_candidates_failed", error=str(exc)[:200])

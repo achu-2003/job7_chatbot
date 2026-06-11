@@ -305,6 +305,20 @@ async def test_remembered_seeker_lane_skips_the_question():
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
+async def test_typing_switch_reopens_lane_choice():
+    """Typing 'switch' re-opens the Job Seeker / Employer lane choice (the filter),
+    overriding the remembered lane — 0 LLM."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Asha", "lane": "seeker"})
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "switch")
+    cta = out["whatsapp_interactive"]["interactive"]
+    assert cta["type"] == "button"
+    titles = [b["reply"]["title"] for b in cta["action"]["buttons"]]
+    assert titles == ["Job Seeker", "Employer"]
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
+
+
 async def test_remembered_creator_lane_goes_to_creator_flow(monkeypatch):
     """A returning employer with NO staged profile is taken straight to the
     employer registration form — the lane question is not re-asked."""
