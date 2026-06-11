@@ -34,15 +34,9 @@ KYC_DOC_TYPES = (
 
 # private_jobs enums (verified against the live jobs7uat schema). Form values ARE
 # the DB enum labels, so no mapping is needed at insert time.
-JOB_TYPES = (
-    ("FULL_TIME", "Full-time"), ("PART_TIME", "Part-time"), ("CONTRACT", "Contract"),
-    ("INTERNSHIP", "Internship"), ("FREELANCE", "Freelance"),
-)
+JOB_TYPES = (("FULL_TIME", "Full Time"), ("PART_TIME", "Part Time"))
 JOB_WORK_MODES = (("OFFICE", "On-site / Office"), ("REMOTE", "Remote"), ("HYBRID", "Hybrid"))
-SALARY_PERIODS = (
-    ("MONTHLY", "Monthly"), ("YEARLY", "Annual"),
-    ("DAILY", "Per day"), ("HOURLY", "Per hour"),
-)
+SALARY_PERIODS = (("MONTHLY", "Monthly"), ("YEARLY", "Annual"))
 # Value labels verified against existing private_jobs rows on jobs7uat.
 EXPERIENCE_TYPES = (
     ("ANY", "Any"), ("FRESHER", "Fresher Only"), ("INTERN", "Intern"), ("EXPERIENCED", "Experienced"),
@@ -190,6 +184,8 @@ def build_job_record(
         radius, radius_type = None, None
 
     loc_type = _enum(form, "job_location_type", "COMPANY_ADDRESS")
+    # Work mode follows the job location: a Remote job is REMOTE, otherwise OFFICE.
+    work_mode = "REMOTE" if loc_type == "REMOTE" else "OFFICE"
     job = {
         "id": jid,
         "title": title,
@@ -202,8 +198,8 @@ def build_job_record(
         "locationDetails": _str(form, "city"),
         "jobLocationType": loc_type,
         "jobType": _enum(form, "job_type", "FULL_TIME"),
-        "workMode": _enum(form, "work_mode", "OFFICE"),
-        "isWorkFromHome": _truthy(form.get("work_from_home")),
+        "workMode": work_mode,
+        "isWorkFromHome": loc_type == "REMOTE" or _truthy(form.get("work_from_home")),
         # experience (year min/max only meaningful for EXPERIENCED)
         "experienceType": _enum(form, "experience_type"),
         "experienceMin": _to_int(form.get("experience_min")) or 0,
@@ -217,7 +213,7 @@ def build_job_record(
         "salaryMin": _to_num(form.get("salary_min")),
         "salaryMax": _to_num(form.get("salary_max")),
         "salaryPeriod": _enum(form, "salary_period", "MONTHLY"),
-        "salaryNegotiable": _truthy(form.get("salary_negotiable")),
+        "salaryNegotiable": False,
         # candidate requirements
         "qualificationLevel": _enum(form, "qualification_level"),
         "genderPreference": _enum(form, "gender_preference"),
@@ -242,6 +238,10 @@ def build_job_record(
         "skills": _csv(form.get("skills")),
         "preferredLanguages": _csv(form.get("preferred_languages")),
         "requiredAssets": _csv(form.get("required_assets")),
+        # candidate location preference (where candidates should be from)
+        "preferredStateId": _str(form, "preferred_state_id"),
+        "preferredDistrictIds": _csv(form.get("preferred_district_ids")),
+        "preferredCityIds": _csv(form.get("preferred_city_ids")),
         # apply methods
         "applyModes": _csv(form.get("apply_modes")) or ["APPLY"],
         "contactPhone": _str(form, "contact_phone"),

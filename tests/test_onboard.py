@@ -34,8 +34,8 @@ def test_form_renders_nine_step_wizard():
     assert 'id="date_of_birth"' in out and 'id="dob_d"' in out
     assert 'name="state_id"' in out and 'name="district_id"' in out
     assert 'name="education_level_id"' in out and 'name="specialization_id"' in out
-    # token pickers (incl. the new other-states one)
-    for tid in ("ts_skills", "ts_locations", "ts_categories", "ts_roles", "ts_other_states"):
+    # token pickers (preferred locations now state-first: pick states → districts)
+    for tid in ("ts_skills", "ts_pref_states", "ts_locations", "ts_categories", "ts_roles"):
         assert f'id="{tid}"' in out, tid
     # languages step → speak/write checkboxes
     assert 'name="lang_speak" value="l1"' in out and 'name="lang_write" value="l2"' in out

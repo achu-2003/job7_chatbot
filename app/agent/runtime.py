@@ -466,29 +466,25 @@ class AgentRuntime:
             )
             return _apply_reply(f"Great — I've noted your interest in {title}. Our team will reach out.")
 
-        pending = [
-            f["key"] for f in onboarding.APPLY_FIELDS
-            if f["key"] not in onboarding.known_apply_fields(reg)
-        ]
-        if not pending:
-            return await self._apply_finalize(state, ref, job, reg, answers={})
-        # Stage the in-progress apply (keep the job so the web resume upload can
-        # finalize without re-looking it up).
+        # ALWAYS ask for the resume on apply (skippable) — even if one is already
+        # on file, the candidate can attach a fresh CV or just skip. Stage the
+        # in-progress apply (keep the job so the web resume upload can finalize
+        # without re-looking it up).
         await self._save_apply(
             state, {"job_ref": ref, "job_title": title, "job": job,
-                    "pending": pending, "answers": {}}
+                    "pending": ["resume"], "answers": {}}
         )
-        # The only apply-time field is the resume → hand over a tappable upload
-        # button (web file picker) instead of asking for an attachment.
+        # Hand over a tappable Upload Resume button (web file picker) instead of
+        # asking for a clip→document attachment.
         return await self._apply_resume_prompt(state, title)
 
     async def _apply_resume_prompt(self, state: AgentState, title: str) -> dict[str, Any]:
-        """Resume step: a friendly 'Upload Resume' web button (file picker) + inline
-        link, with 'send the file here / reply skip' as fallbacks."""
+        """Resume step: a friendly 'Upload Resume' web button (file picker) plus a
+        separate 'Skip' button. WhatsApp can't put a URL button and a reply button
+        in ONE message, so we send two: the upload cta, then the Skip button."""
         body = (
             f"Let's apply for {title}.\n\nAlmost done — upload your resume (PDF/DOC) "
-            "to finish. Tap below to choose a file. You can also send it here as a "
-            "document, or reply 'skip'."
+            "to finish. Tap below to choose a file, or send it here as a document."
         )
         out = _apply_reply(body)
         try:
@@ -497,11 +493,15 @@ class AgentRuntime:
             )
             link = f"{get_settings().public_base_url.rstrip('/')}/onboard/resume?token={token}"
             if link.startswith("https://"):
-                out["whatsapp_interactive"] = wa.cta_url_message(
-                    body=body, display_text="📎 Upload Resume", url=link,
-                )
+                out["whatsapp_messages"] = [
+                    wa.cta_url_message(body=body, display_text="📎 Upload Resume", url=link),
+                    wa.buttons_message(
+                        "Don't have it handy right now? You can skip this step.",
+                        [("apply_skip", "Skip")],
+                    ),
+                ]
             else:
-                out["draft_response"] = f"{body}\n{link}"
+                out["draft_response"] = f"{body}\n{link}\n\nOr reply 'skip'."
         except Exception as exc:  # noqa: BLE001 — fall back to chat-only resume capture
             log.warning("apply_resume_token_failed", error=str(exc)[:200])
         return out

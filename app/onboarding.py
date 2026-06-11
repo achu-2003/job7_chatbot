@@ -300,12 +300,16 @@ def build_application_record(
     seeker = registration.get("private_job_seekers") or {}
     profile = registration.get("job_seeker_profiles") or {}
     now = _now_iso()
+    # When the candidate skips the resume on this apply, fall back to whatever is
+    # already on their profile (so a skip still attaches their CV if they have one).
+    existing = profile.get("resume") or (profile.get("resumes") or [None])[0]
+    resume = answers.get("resume") or existing
     application = {
         "id": _cuid(),
         "jobId": job.get("id"),
         "jobSeekerId": seeker.get("id"),
         "profileId": profile.get("id"),
-        "resume": answers.get("resume"),
+        "resume": resume,
         "coverLetter": answers.get("cover_note"),
         "screeningAnswers": None,
         "status": "PENDING",

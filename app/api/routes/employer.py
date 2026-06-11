@@ -32,20 +32,12 @@ from app.core.logging import get_logger
 from app.db.repositories import LookupRepository
 from app.employer import (
     APPLY_MODES,
-    CANDIDATE_DISTANCES,
     COMPANY_SIZES,
-    ENGLISH_LEVELS,
     EXPERIENCE_TYPES,
-    GENDER_PREFS,
-    JOB_LANGUAGES,
     JOB_LOCATION_TYPES,
     INTERN_PAYMENT_TYPES,
     JOB_TYPES,
-    JOB_WORK_MODES,
     KYC_DOC_TYPES,
-    MARITAL_PREFS,
-    QUALIFICATION_LEVELS,
-    REQUIRED_ASSETS,
     SALARY_PERIODS,
     apply_kyc,
     build_employer_record,
@@ -123,6 +115,18 @@ async def register_submit(request: Request) -> HTMLResponse:
         "pincode": one("pincode"),
         "description": one("description"),
     }
+    # District is REQUIRED — it becomes the job's location fallback (private_jobs
+    # .districtId is NOT NULL), so an employer must have one. Re-show the form on a
+    # bypass of the client-side check.
+    if not form["company_name"] or not form["district_id"]:
+        opts = await _reg_options()
+        return HTMLResponse(
+            _register_html(
+                token, identity.get("customer_id") or "", opts,
+                error="Please fill the required fields — company name, state and district.",
+            ),
+            status_code=400,
+        )
     record = build_employer_record(identity=identity, form=form)
     record.setdefault("paid", False)
     record.setdefault("jobs", [])
@@ -224,11 +228,25 @@ async def kyc_submit(request: Request) -> HTMLResponse:
 
 @router.get("/post-job", response_class=HTMLResponse)
 async def post_job_form(request: Request, token: str = Query(default="")) -> HTMLResponse:
-    identity = await get_memory(request).get_employer_identity(token) if token else None
+    memory = get_memory(request)
+    identity = await memory.get_employer_identity(token) if token else None
     if not identity:
         return HTMLResponse(_expired_html(), status_code=404)
     opts = await _job_options()
-    return HTMLResponse(_post_job_html(token, opts))
+    employer = await memory.get_employer(identity.get("customer_id") or "", tenant_id=identity["tenant_id"])
+    pe = (employer or {}).get("private_employers") or {}
+    return HTMLResponse(_post_job_html(
+        token, opts, company_address=_company_address(employer),
+        company_district_id=pe.get("districtId") or "",
+    ))
+
+
+def _company_address(employer: dict[str, Any] | None) -> str:
+    """A one-line display of the employer's registered address (for the
+    'Company Address' job-location option)."""
+    pe = (employer or {}).get("private_employers") or {}
+    parts = [pe.get("address"), pe.get("city"), pe.get("pincode")]
+    return ", ".join(str(p).strip() for p in parts if p and str(p).strip())
 
 
 @router.post("/post-job/submit", response_class=HTMLResponse)
@@ -273,45 +291,32 @@ async def post_job_submit(request: Request) -> HTMLResponse:
         "salary_period": one("salary_period"),
         "salary_min": one("salary_min"),
         "salary_max": one("salary_max"),
-        "salary_negotiable": one("salary_negotiable"),
         "vacancies": one("vacancies"),
-        # Job Location
+        # Job Location (work mode is derived from the location type)
         "job_location_type": one("job_location_type"),
-        "work_mode": one("work_mode"),
         "state_id": one("state_id"),
         "district_id": one("district_id"),
         "city": one("city"),
-        "work_from_home": one("work_from_home"),
-        # Candidate Requirements
-        "qualification_level": one("qualification_level"),
-        "gender_preference": one("gender_preference"),
-        "marital_status_preference": one("marital_status_preference"),
-        "english_level": one("english_level"),
-        "age_min": one("age_min"),
-        "age_max": one("age_max"),
-        # Location Preferences
-        "candidate_distance": one("candidate_distance"),
-        "candidate_distance_custom": one("candidate_distance_custom"),
-        "willing_to_relocate": one("willing_to_relocate"),
-        # Security Deposit
-        "has_security_deposit": one("has_security_deposit"),
-        "security_deposit_amt": one("security_deposit_amt"),
-        "security_deposit_reason": one("security_deposit_reason"),
-        # Work Timings + Interview
-        "work_start_time": one("work_start_time"),
-        "work_end_time": one("work_end_time"),
-        "interview_date": one("interview_date"),
-        "interview_time": one("interview_time"),
-        # Skills & Languages
-        "category_id": one("category_id"),
-        "skills": one("skills"),
-        "preferred_languages": many("preferred_languages"),
-        "required_assets": many("required_assets"),
+        # Candidate Location Preference (where candidates should be from)
+        "preferred_state_id": one("preferred_state_id"),
+        "preferred_district_ids": many("preferred_district_ids"),
         # Apply Methods
         "apply_modes": many("apply_modes"),
         "contact_phone": one("contact_phone"),
         "contact_whatsapp": one("contact_whatsapp"),
     }
+    # "Company Address" → the job's location IS the employer's registered
+    # location, so fill it from the company profile (the form hides those inputs).
+    pe = employer.get("private_employers") or {}
+    if form["job_location_type"] == "COMPANY_ADDRESS":
+        form["district_id"] = pe.get("districtId") or ""
+        form["city"] = pe.get("city") or ""
+    # private_jobs.districtId is NOT NULL, but a Remote job (or any unset pick)
+    # has no district — fall back to the employer's registered district so the
+    # row is always storable. The job stays flagged Remote via jobLocationType.
+    if not form.get("district_id"):
+        form["district_id"] = pe.get("districtId") or ""
+
     # Build the DB-ready private_jobs record (status PENDING — awaiting approval)
     # and stage it on the employer's Redis record. No live private_jobs write yet.
     job = build_job_record(employer_id=employer_id, form=form, status="PENDING")
@@ -373,6 +378,18 @@ _STYLE = """
   .opts label.opt:has(input:checked) span{color:#00d3a7;font-weight:600}
   .subblock{background:#0e2a25;border:1px solid #1f4d44;border-radius:12px;padding:4px 14px 14px;margin:10px 0}
   .subblock > label:first-child{color:#9ad9cb}
+  .addrbox{border:1px solid #2a3942;border-radius:10px;padding:13px 14px;margin:8px 0;
+        background:#202c33;color:#cfd8dc;font-size:14px;line-height:1.4}
+  .qs{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0}
+  .qspill{border:1px solid #2a3942;background:#202c33;color:#e9edef;border-radius:20px;
+        padding:9px 14px;font-size:14px;cursor:pointer}
+  .qspill.on{border-color:#00a884;background:rgba(0,168,132,.16);color:#00d3a7;font-weight:600}
+  .chips2{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
+  .chip2{background:rgba(0,168,132,.16);border:1px solid #00a884;color:#9ce6d4;border-radius:16px;
+        padding:6px 11px;font-size:13px}
+  .chip2 b{cursor:pointer;color:#00d3a7;margin-left:5px;font-weight:700}
+  .info{background:rgba(0,168,132,.10);border:1px solid #1f4d44;border-radius:10px;
+        padding:11px 13px;margin-top:12px;color:#9ad9cb;font-size:13px}
   [hidden]{display:none !important}
   .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
   .chips label.chip{border:1px solid #2a3942;border-radius:20px;padding:7px 13px;cursor:pointer;font-size:14px}
@@ -419,6 +436,17 @@ def _radios(name: str, options: "tuple | list", *, default: str | None = None) -
     return f'<div class="opts">{"".join(out)}</div>'
 
 
+def _pill_radios(name: str, options: "tuple | list") -> str:
+    """Pill-style single-choice radio group (horizontal chips)."""
+    out = []
+    for val, lab in options:
+        out.append(
+            f'<label class="chip"><input type="radio" name="{name}" value="{_esc(val)}">'
+            f"<span>{_esc(lab)}</span></label>"
+        )
+    return f'<div class="chips">{"".join(out)}</div>'
+
+
 def _chips(name: str, options: "tuple | list") -> str:
     """Pill-style checkbox group (multi-select). Options may be (val,label) or str."""
     out = []
@@ -455,10 +483,14 @@ def _js_rows(items: list[dict[str, Any]]) -> str:
     return f"[{cells}]"
 
 
-def _register_html(token: str, phone: str, o: dict[str, list[dict[str, Any]]]) -> str:
+def _register_html(
+    token: str, phone: str, o: dict[str, list[dict[str, Any]]], *, error: str = "",
+) -> str:
+    err = f'<div class="addrbox" style="border-color:#a33;color:#ffb3b3">{_esc(error)}</div>' if error else ""
     inner = f"""
 <h1>Register your company</h1>
 <p class="sub">A few details about your business so candidates know who's hiring.</p>
+{err}
 <form method="post" action="/employer/register/submit" autocomplete="off">
   <input type="hidden" name="token" value="{_esc(token)}">
   <label>Company name <span class="req">*</span></label>
@@ -483,10 +515,10 @@ def _register_html(token: str, phone: str, o: dict[str, list[dict[str, Any]]]) -
   <label>Address</label>
   <input name="address" placeholder="Office address">
   <div class="row">
-    <div><label>State</label>
-      <select name="state_id" id="state_id" autocomplete="off">{_options_html(o['states'], placeholder='Select state…')}</select></div>
-    <div><label>District</label>
-      <select name="district_id" id="district_id" autocomplete="off"><option value="">Select a state first…</option></select></div>
+    <div><label>State <span class="req">*</span></label>
+      <select name="state_id" id="state_id" autocomplete="off" required>{_options_html(o['states'], placeholder='Select state…')}</select></div>
+    <div><label>District <span class="req">*</span></label>
+      <select name="district_id" id="district_id" autocomplete="off" required><option value="">Select a state first…</option></select></div>
   </div>
   <div class="row">
     <div><label>City</label><input name="city" placeholder="City"></div>
@@ -536,13 +568,22 @@ documents are used only for verification.</p>
 
 
 _JOB_STEPS = (
-    "Job Details", "Experience & Salary", "Job Location", "Candidate Requirements",
-    "Preferences", "Timings & Interview", "Skills & Languages", "Apply Methods",
+    "Job Details", "Experience & Salary", "Job Location",
+    "Candidate Location", "Apply Methods",
+)
+# A few major Tamil Nadu districts used by the "Top Cities" quick-select.
+_TOP_DISTRICT_NAMES = (
+    "Chennai", "Coimbatore", "Madurai", "Salem", "Tiruchirappalli",
+    "Tirunelveli", "Erode", "Tiruppur",
 )
 
 
-def _post_job_html(token: str, o: dict[str, list[dict[str, Any]]]) -> str:
+def _post_job_html(
+    token: str, o: dict[str, list[dict[str, Any]]], *,
+    company_address: str = "", company_district_id: str = "",
+) -> str:
     n = len(_JOB_STEPS)
+    addr_display = _esc(company_address) or "Your registered company address will be used."
     steps = "\n".join([
         # 1 — Job Details
         f"""<section class="step"><h1>Job Details</h1>
@@ -588,89 +629,70 @@ def _post_job_html(token: str, o: dict[str, list[dict[str, Any]]]) -> str:
       <div><label>Min (₹)</label><input name="salary_min" inputmode="numeric" placeholder="Min"></div>
       <div><label>Max (₹)</label><input name="salary_max" inputmode="numeric" placeholder="Max"></div>
     </div>
-    {_toggle("salary_negotiable", "Salary negotiable", "Open to discussion")}
   </div>
 
   <label>Number of Vacancies</label>
   <input name="vacancies" inputmode="numeric" placeholder="e.g. 5">
 </section>""",
-        # 3 — Job Location
+        # 3 — Job Location (conditional: Specific → state+district, Company → address)
         f"""<section class="step"><h1>Job Location</h1>
   <label>Job Location <span class="req">*</span></label>
-  {_radios("job_location_type", JOB_LOCATION_TYPES)}
-  <label>Work mode</label>
-  {_radios("work_mode", JOB_WORK_MODES)}
-  <div class="row">
-    <div><label>State</label>
-      <select name="state_id" autocomplete="off">{_options_html(o['states'], placeholder='Select…')}</select></div>
-    <div><label>District</label>
-      <select name="district_id" autocomplete="off">{_options_html(o['districts'], placeholder='Select…')}</select></div>
+  {_pill_radios("job_location_type", JOB_LOCATION_TYPES)}
+
+  <div class="subblock" id="locSpecific" hidden>
+    <label>State</label>
+    <select name="state_id" id="job_state_id" autocomplete="off">{_options_html(o['states'], placeholder='Select a state…')}</select>
+    <label>District</label>
+    <select name="district_id" id="job_district_id" autocomplete="off"><option value="">Select a state first…</option></select>
+    <label>City / area</label>
+    <input name="city" placeholder="Street, area, landmark">
   </div>
-  <label>City / area</label>
-  <input name="city" placeholder="Street, area, landmark">
-</section>""",
-        # 4 — Candidate Requirements
-        f"""<section class="step"><h1>Candidate Requirements</h1>
-  <label>Qualification Level</label>
-  {_radios("qualification_level", QUALIFICATION_LEVELS)}
-  <label>Gender Preference</label>
-  {_radios("gender_preference", GENDER_PREFS)}
-  <label>Marital Status</label>
-  {_radios("marital_status_preference", MARITAL_PREFS)}
-  <label>English Level</label>
-  {_radios("english_level", ENGLISH_LEVELS)}
-  <label>Age Range <span class="hint">(optional)</span></label>
-  <div class="row">
-    <div><input name="age_min" inputmode="numeric" placeholder="Min age"></div>
-    <div><input name="age_max" inputmode="numeric" placeholder="Max age"></div>
+
+  <div class="subblock" id="locCompany" hidden>
+    <label>Company address</label>
+    <div class="addrbox">🏢 {addr_display}</div>
+  </div>
+
+  <div class="subblock" id="locRemote" hidden>
+    <div class="addrbox">🌐 This is a remote job — candidates can work from anywhere.</div>
   </div>
 </section>""",
-        # 5 — Preferences
-        f"""<section class="step"><h1>Preferences</h1>
-  <label>Preferred Candidate Distance</label>
-  {_radios("candidate_distance", CANDIDATE_DISTANCES)}
-  <label>Custom distance (km) <span class="hint">— if Custom selected</span></label>
-  <input name="candidate_distance_custom" inputmode="numeric" placeholder="e.g. 50">
-  {_toggle("willing_to_relocate", "Willing to Relocate", "Accept candidates willing to relocate")}
-  {_toggle("work_from_home", "Work from Home", "This job can be done from home")}
-  {_toggle("has_security_deposit", "Security Deposit Required", "Candidate needs to pay a deposit")}
-  <div class="row">
-    <div><label>Deposit amount (₹)</label><input name="security_deposit_amt" inputmode="numeric" placeholder="0"></div>
-    <div><label>Reason</label><input name="security_deposit_reason" placeholder="e.g. Tools"></div>
+        # 4 — Candidate Location Preference (quick-select + district chips + credits)
+        f"""<section class="step"><h1>Candidate Location Preference</h1>
+  <p class="sub">Select where candidates should be from.</p>
+  <label>Quick Select</label>
+  <div class="qs">
+    <button type="button" class="qspill" data-qs="company">🏢 Company District</button>
+    <button type="button" class="qspill" data-qs="nearby">📍 Nearby</button>
+    <button type="button" class="qspill" data-qs="all">▦ All Districts</button>
+    <button type="button" class="qspill" data-qs="top">🏙 Top Cities</button>
+    <button type="button" class="qspill" data-qs="custom">⚙ Custom</button>
   </div>
+  <label>State</label>
+  <select id="pref_state" autocomplete="off">{_options_html(o['states'], placeholder='Select a state…')}</select>
+  <input type="hidden" name="preferred_state_id" id="pref_state_hidden">
+  <label>Districts <span class="req">*</span></label>
+  <select id="pref_add" autocomplete="off"><option value="">+ Add a district…</option></select>
+  <div class="chips2" id="pref_chips"></div>
+  <div id="pref_hidden"></div>
+  <div class="info" id="creditInfo">0 districts selected = 0 credits per 15 days</div>
 </section>""",
-        # 6 — Timings & Interview
-        f"""<section class="step"><h1>Timings &amp; Interview</h1>
-  <label>Work Timings</label>
-  <div class="row">
-    <div><label>Start time</label><input type="time" name="work_start_time"></div>
-    <div><label>End time</label><input type="time" name="work_end_time"></div>
-  </div>
-  <label>Interview Details</label>
-  <div class="row">
-    <div><label>Date</label><input type="date" name="interview_date"></div>
-    <div><label>Time</label><input type="time" name="interview_time"></div>
-  </div>
-</section>""",
-        # 7 — Skills & Languages
-        f"""<section class="step"><h1>Skills &amp; Languages</h1>
-  <label>Job Category <span class="req">*</span></label>
-  <select name="category_id" autocomplete="off">{_options_html(o['categories'], placeholder='Select a job category')}</select>
-  <label>Skills <span class="hint">(comma-separated)</span></label>
-  <input name="skills" placeholder="e.g. Welding, Fitting">
-  <label>Preferred Languages</label>
-  {_chips("preferred_languages", JOB_LANGUAGES)}
-  <label>Required Assets</label>
-  {_chips("required_assets", REQUIRED_ASSETS)}
-</section>""",
-        # 8 — Apply Methods
+        # 5 — Apply Methods (In-App default; Phone/WhatsApp reveal a contact input)
         f"""<section class="step"><h1>Apply Methods</h1>
   <p class="sub">Choose how candidates can reach you for this job.</p>
-  {_chips("apply_modes", APPLY_MODES)}
-  <label>Contact Phone Number <span class="hint">(optional)</span></label>
-  <input name="contact_phone" inputmode="numeric" placeholder="e.g. 9876543210">
-  <label>WhatsApp Number <span class="hint">(optional)</span></label>
-  <input name="contact_whatsapp" inputmode="numeric" placeholder="e.g. 9876543210">
+  <div class="opts">
+    <label class="opt"><input type="checkbox" name="apply_modes" value="APPLY" id="am_apply" checked><span>📲 In-App Apply</span></label>
+    <label class="opt"><input type="checkbox" name="apply_modes" value="CALL" id="am_call"><span>📞 Phone Call</span></label>
+    <label class="opt"><input type="checkbox" name="apply_modes" value="WHATSAPP" id="am_wa"><span>💬 WhatsApp</span></label>
+  </div>
+  <div id="phoneInput" hidden>
+    <label>Contact Phone Number</label>
+    <input name="contact_phone" inputmode="numeric" placeholder="e.g. 9876543210">
+  </div>
+  <div id="waInput" hidden>
+    <label>WhatsApp Number</label>
+    <input name="contact_whatsapp" inputmode="numeric" placeholder="e.g. 9876543210">
+  </div>
 </section>""",
     ])
 
@@ -704,16 +726,10 @@ function render(){{
 }}
 function valid(){{
   if(cur===0){{ var t=document.querySelector('[name=title]'); if(!t.value.trim()){{ t.focus(); alert('Please enter a job title'); return false; }} }}
-  if(NAMES[cur]==='Skills & Languages'){{ var c=document.querySelector('[name=category_id]'); if(!c.value){{ c.focus(); alert('Please select a job category'); return false; }} }}
   return true;
 }}
 next.onclick = function(){{ if(valid()){{ cur=Math.min(cur+1,steps.length-1); render(); }} }};
 back.onclick = function(){{ cur=Math.max(cur-1,0); render(); }};
-document.getElementById('jobForm').addEventListener('submit', function(e){{
-  // ensure required category is set before the final submit
-  var c=document.querySelector('[name=category_id]');
-  if(!c.value){{ e.preventDefault(); cur=NAMES.indexOf('Skills & Languages'); render(); alert('Please select a job category'); }}
-}});
 
 // --- Experience & Salary conditional fields ---
 function picked(name){{ var el=document.querySelector('input[name="'+name+'"]:checked'); return el?el.value:''; }}
@@ -732,6 +748,77 @@ function internChange(){{
 [].forEach.call(document.querySelectorAll('input[name=experience_type]'), function(r){{ r.addEventListener('change', expChange); }});
 [].forEach.call(document.querySelectorAll('input[name=intern_payment_type]'), function(r){{ r.addEventListener('change', internChange); }});
 expChange(); internChange();
+
+// --- Job Location conditional + State→District cascade ---
+var JOB_DISTRICTS = {_js_rows(o['districts'])};
+function fillJobDistricts(){{
+  var st = document.getElementById('job_state_id').value;
+  var c = document.getElementById('job_district_id');
+  var rows = JOB_DISTRICTS.filter(function(r){{ return String(r[2]) === String(st); }});
+  c.innerHTML = '<option value="">Select district…</option>' +
+    rows.map(function(r){{ return '<option value="'+r[0]+'">'+r[1]+'</option>'; }}).join('');
+}}
+function locChange(){{
+  var v = picked('job_location_type');
+  toggleEl('locSpecific', v==='SPECIFIC');     // state then district
+  toggleEl('locCompany', v==='COMPANY_ADDRESS'); // show the company address
+  toggleEl('locRemote', v==='REMOTE');           // remote note
+}}
+document.getElementById('job_state_id').addEventListener('change', fillJobDistricts);
+[].forEach.call(document.querySelectorAll('input[name=job_location_type]'), function(r){{ r.addEventListener('change', locChange); }});
+locChange();
+
+// --- Candidate Location Preference: quick-select + district chips + credits ---
+var COMPANY_DISTRICT = "{_esc(company_district_id)}";
+var TOP_NAMES = {"[" + ", ".join(f'"{_esc(t)}"' for t in _TOP_DISTRICT_NAMES) + "]"};
+var prefState = document.getElementById('pref_state');
+var prefAdd = document.getElementById('pref_add');
+var prefChips = document.getElementById('pref_chips');
+var prefHidden = document.getElementById('pref_hidden');
+var prefStateHidden = document.getElementById('pref_state_hidden');
+var creditInfo = document.getElementById('creditInfo');
+var prefSelected = [];
+function dName(id){{ var d=JOB_DISTRICTS.filter(function(r){{return r[0]===id;}})[0]; return d?d[1]:id; }}
+function dState(id){{ var d=JOB_DISTRICTS.filter(function(r){{return r[0]===id;}})[0]; return d?d[2]:''; }}
+function fillPrefAdd(){{
+  var st=prefState.value;
+  var rows=JOB_DISTRICTS.filter(function(r){{ return String(r[2])===String(st) && prefSelected.indexOf(r[0])<0; }});
+  prefAdd.innerHTML='<option value="">+ Add a district…</option>'+
+    rows.map(function(r){{ return '<option value="'+r[0]+'">'+r[1]+'</option>'; }}).join('');
+}}
+function renderPref(){{
+  prefChips.innerHTML=prefSelected.map(function(id){{ return '<span class="chip2">'+dName(id)+' <b data-id="'+id+'">×</b></span>'; }}).join('');
+  prefHidden.innerHTML=prefSelected.map(function(id){{ return '<input type="hidden" name="preferred_district_ids" value="'+id+'">'; }}).join('');
+  prefStateHidden.value=prefState.value;
+  var nd=prefSelected.length;
+  creditInfo.textContent=nd+' district'+(nd===1?'':'s')+' selected = '+nd+' credit'+(nd===1?'':'s')+' per 15 days';
+  [].forEach.call(prefChips.querySelectorAll('b'), function(b){{ b.onclick=function(){{ var id=b.getAttribute('data-id'); prefSelected=prefSelected.filter(function(x){{return x!==id;}}); fillPrefAdd(); renderPref(); }}; }});
+  fillPrefAdd();
+}}
+prefAdd.addEventListener('change', function(){{ if(prefAdd.value && prefSelected.indexOf(prefAdd.value)<0){{ prefSelected.push(prefAdd.value); renderPref(); }} }});
+prefState.addEventListener('change', function(){{ renderPref(); }});
+function quickSelect(mode){{
+  if(mode==='company'||mode==='nearby'){{ if(COMPANY_DISTRICT){{ prefState.value=dState(COMPANY_DISTRICT)||prefState.value; prefSelected=[COMPANY_DISTRICT]; }} }}
+  else if(mode==='all'){{ prefSelected=JOB_DISTRICTS.filter(function(r){{return String(r[2])===String(prefState.value);}}).map(function(r){{return r[0];}}); }}
+  else if(mode==='top'){{ prefSelected=JOB_DISTRICTS.filter(function(r){{ return String(r[2])===String(prefState.value) && TOP_NAMES.indexOf(r[1])>=0; }}).map(function(r){{return r[0];}}); }}
+  // 'custom' → leave the current selection for manual editing
+  renderPref();
+}}
+[].forEach.call(document.querySelectorAll('.qspill'), function(b){{ b.onclick=function(){{
+  [].forEach.call(document.querySelectorAll('.qspill'), function(x){{x.classList.remove('on');}});
+  b.classList.add('on'); quickSelect(b.getAttribute('data-qs'));
+}}; }});
+if(COMPANY_DISTRICT){{ prefState.value=dState(COMPANY_DISTRICT)||prefState.value; }}
+renderPref();
+
+// --- Apply Methods: Phone/WhatsApp reveal a contact input ---
+function applyChange(){{
+  toggleEl('phoneInput', document.getElementById('am_call').checked);
+  toggleEl('waInput', document.getElementById('am_wa').checked);
+}}
+['am_call','am_wa'].forEach(function(id){{ document.getElementById(id).addEventListener('change', applyChange); }});
+applyChange();
+
 render();
 </script>
 """

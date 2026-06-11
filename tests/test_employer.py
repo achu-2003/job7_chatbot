@@ -91,6 +91,14 @@ def test_register_form_renders_company_fields():
     assert "Information Technology" in out and "HR Manager" in out
     assert "STARTUP" in out and "ENTERPRISE" in out          # CompanySize options
     assert "var DISTRICTS =" in out                          # cascade JS
+    # State + District are REQUIRED (district is the job-location fallback)
+    assert 'name="state_id" id="state_id" autocomplete="off" required' in out
+    assert 'name="district_id" id="district_id" autocomplete="off" required' in out
+
+
+def test_register_form_shows_error_banner():
+    out = _register_html("t", "91", _OPTS, error="Please fill the required fields.")
+    assert "Please fill the required fields." in out
 
 
 def test_kyc_form_renders_doc_fields():
@@ -102,33 +110,63 @@ def test_kyc_form_renders_doc_fields():
     assert "GST Certificate" in out
 
 
-def test_post_job_form_is_a_sectioned_wizard():
-    out = _post_job_html("tok123", _JOB_OPTS)
+def test_post_job_form_is_a_five_step_wizard():
+    out = _post_job_html("tok123", _JOB_OPTS, company_district_id="d1")
     assert 'action="/employer/post-job/submit"' in out
-    assert out.count('class="step"') == 8                  # eight wizard sections
+    assert out.count('class="step"') == 5                  # five wizard sections
     assert 'id="jobForm"' in out and 'id="next"' in out and 'id="post"' in out
     assert 'var NAMES = ["Job Details"' in out             # stepper JS
-    # one field from each section
+    # one field/marker from each remaining section
     for nm in ("title", "job_type", "experience_type", "job_location_type",
-               "qualification_level", "gender_preference", "english_level",
-               "candidate_distance", "has_security_deposit", "work_start_time",
-               "interview_date", "category_id", "preferred_languages",
-               "required_assets", "apply_modes", "contact_whatsapp"):
+               "preferred_district_ids", "apply_modes", "contact_whatsapp"):
         assert f'name="{nm}"' in out, nm
+    # the removed sections are gone
+    for gone in ("qualification_level", "gender_preference", "english_level",
+                 "candidate_distance", "has_security_deposit", "work_start_time",
+                 "interview_date", "category_id", "preferred_languages", "required_assets"):
+        assert f'name="{gone}"' not in out, gone
 
 
-def test_post_job_form_no_default_radio_and_conditional_blocks():
-    """No radio is pre-selected, and the Experience section carries the
-    conditional year / intern-payment blocks + toggle JS."""
-    out = _post_job_html("tok123", _JOB_OPTS)
-    assert " checked" not in out                            # nothing pre-selected
-    for nm in ("intern_payment_type", "intern_stipend", "training_fee",
-               "intern_duration_months"):
-        assert f'name="{nm}"' in out, nm
+def test_post_job_form_candidate_location_and_apply_methods():
+    """Candidate Location Preference carries the quick-select + district chips +
+    credit line; Apply Methods defaults to In-App and reveals contact inputs."""
+    out = _post_job_html("tok123", _JOB_OPTS, company_district_id="d1")
+    for qs in ('data-qs="company"', 'data-qs="nearby"', 'data-qs="all"',
+               'data-qs="top"', 'data-qs="custom"'):
+        assert qs in out, qs
+    assert 'id="pref_add"' in out and 'id="creditInfo"' in out
+    assert 'COMPANY_DISTRICT = "d1"' in out and "function quickSelect(" in out
+    # Apply Methods: In-App checked by default; phone/whatsapp reveal blocks + JS
+    assert 'value="APPLY" id="am_apply" checked' in out
+    assert 'id="phoneInput"' in out and 'id="waInput"' in out
+    assert "function applyChange()" in out
+
+
+def test_post_job_form_conditional_blocks_no_default_radio():
+    """No radio (job type / experience / salary period / location) is pre-selected,
+    and the Experience + Location conditional blocks + JS are present."""
+    out = _post_job_html("tok123", _JOB_OPTS, company_address="1 MG Rd")
+    # radios are unchecked — the only `checked` is the Apply In-App checkbox
+    assert out.count(" checked") == 1
+    assert 'value="APPLY" id="am_apply" checked' in out
     for block in ('id="expYears"', 'id="internBlock"', 'id="salaryBlock"',
-                  'id="stipendInput"', 'id="trainingInput"'):
+                  'id="stipendInput"', 'id="trainingInput"',
+                  'id="locSpecific"', 'id="locCompany"', 'id="locRemote"'):
         assert block in out, block
-    assert "function expChange()" in out and "function internChange()" in out
+    assert "function expChange()" in out and "function locChange()" in out
+    assert "function locChange()" in out
+
+
+def test_post_job_form_salary_and_jobtype_trimmed():
+    """Salary range is only Monthly/Annual (no per-day/hour), no negotiable toggle,
+    and Job Type is only Full Time / Part Time."""
+    out = _post_job_html("tok123", _JOB_OPTS, company_address="1 MG Rd")
+    assert "Monthly" in out and "Annual" in out
+    assert "Per day" not in out and "Per hour" not in out
+    assert 'name="salary_negotiable"' not in out
+    assert "Full Time" in out and "Part Time" in out
+    assert "Internship" not in out and "Freelance" not in out  # job type trimmed
+    assert "1 MG Rd" in out                                     # company address shown
 
 
 def test_build_job_record_intern_payment():
@@ -150,8 +188,8 @@ def test_build_job_record_maps_all_private_jobs_columns():
         "job_type": "contract", "experience_type": "experienced",
         "experience_min": "2", "experience_max": "5",
         "salary_period": "monthly", "salary_min": "20000", "salary_max": "30000",
-        "salary_negotiable": "yes", "vacancies": "3",
-        "job_location_type": "specific", "work_mode": "office",
+        "vacancies": "3",
+        "job_location_type": "specific",
         "state_id": "s1", "district_id": "d1", "city": "Chennai", "work_from_home": "",
         "qualification_level": "12th_pass", "gender_preference": "both",
         "marital_status_preference": "any", "english_level": "intermediate",
@@ -170,9 +208,9 @@ def test_build_job_record_maps_all_private_jobs_columns():
     j = rec["private_jobs"]
     assert j["title"] == "Senior Welder" and j["slug"] == "senior-welder"
     assert j["employerId"] == "emp123" and j["categoryId"] == "cat1" and j["districtId"] == "d1"
-    assert j["jobType"] == "CONTRACT" and j["workMode"] == "OFFICE"
+    assert j["jobType"] == "CONTRACT" and j["workMode"] == "OFFICE"   # OFFICE: not remote
     assert j["experienceType"] == "EXPERIENCED" and j["experienceMin"] == 2 and j["experienceMax"] == 5
-    assert j["salaryMin"] == 20000 and j["salaryMax"] == 30000 and j["salaryNegotiable"] is True
+    assert j["salaryMin"] == 20000 and j["salaryMax"] == 30000 and j["salaryNegotiable"] is False
     assert j["jobLocationType"] == "SPECIFIC" and j["jobStateId"] == "s1"
     assert j["qualificationLevel"] == "12TH_PASS" and j["genderPreference"] == "BOTH"
     assert j["maritalStatusPreference"] == "ANY" and j["englishLevel"] == "INTERMEDIATE"
@@ -185,6 +223,17 @@ def test_build_job_record_maps_all_private_jobs_columns():
     assert j["preferredLanguages"] == ["Tamil", "English"] and j["requiredAssets"] == ["Bike", "Aadhar"]
     assert j["applyModes"] == ["APPLY", "CALL"] and j["contactWhatsapp"] == "9876543210"
     assert j["status"] == "PENDING"
+
+
+def test_build_job_record_remote_sets_workmode():
+    """A Remote job derives workMode=REMOTE and isWorkFromHome=True from the
+    location type (there's no separate work-mode field)."""
+    rec = build_job_record(
+        employer_id="e1",
+        form={"title": "Remote Dev", "job_location_type": "remote"}, status="PENDING")
+    j = rec["private_jobs"]
+    assert j["jobLocationType"] == "REMOTE"
+    assert j["workMode"] == "REMOTE" and j["isWorkFromHome"] is True
 
 
 def test_build_job_record_distance_anywhere_and_defaults():
