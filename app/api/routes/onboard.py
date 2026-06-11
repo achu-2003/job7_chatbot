@@ -458,7 +458,7 @@ function cascade(parentId, childId, rows, ph){
     fillSelect(c, rows.filter(function(r){ return String(r[2]) === String(p.value); }), ph);
   });
 }
-function tokenSelect(host, name, options, ph){
+function tokenSelect(host, name, options, ph, onChange){
   if(!host) return;
   host.classList.add("ts");
   var box = document.createElement("div"); box.className = "ts-box";
@@ -466,8 +466,14 @@ function tokenSelect(host, name, options, ph){
   input.className = "ts-input"; input.type = "text"; input.placeholder = ph; input.autocomplete = "off";
   var menu = document.createElement("div"); menu.className = "ts-menu"; menu.style.display = "none";
   box.appendChild(input); host.appendChild(box); host.appendChild(menu);
-  var chosen = {}, filtered = [], active = -1;
+  var chosen = {}, els = {}, filtered = [], active = -1;
   box.addEventListener("click", function(){ input.focus(); });
+  function notify(){ if(onChange){ onChange(Object.keys(chosen)); } }
+  function remove(id){
+    if(!els[id]) return;
+    box.removeChild(els[id].chip); host.removeChild(els[id].hid);
+    delete els[id]; delete chosen[id];
+  }
   function add(opt){
     if(chosen[opt[0]]) return;
     chosen[opt[0]] = 1;
@@ -475,11 +481,20 @@ function tokenSelect(host, name, options, ph){
     chip.appendChild(document.createTextNode(opt[1]));
     var x = document.createElement("b"); x.textContent = "×"; chip.appendChild(x);
     var hid = document.createElement("input"); hid.type = "hidden"; hid.name = name; hid.value = opt[0];
+    els[opt[0]] = {chip: chip, hid: hid};
     x.addEventListener("click", function(e){
-      e.stopPropagation(); delete chosen[opt[0]]; box.removeChild(chip); host.removeChild(hid);
+      e.stopPropagation(); remove(opt[0]); host.classList.remove("invalid"); render(); notify();
     });
     box.insertBefore(chip, input); host.appendChild(hid);
-    input.value = ""; render(); input.focus();
+    input.value = ""; host.classList.remove("invalid"); render(); input.focus(); notify();
+  }
+  // Replace the available options (used by the state→district cascade); drop any
+  // already-chosen items that are no longer valid for the new option set.
+  function setOptions(newOpts){
+    options = newOpts || [];
+    var valid = {}; options.forEach(function(o){ valid[o[0]] = 1; });
+    Object.keys(chosen).forEach(function(id){ if(!valid[id]){ remove(id); } });
+    render(); notify();
   }
   function render(){
     var q = input.value.trim().toLowerCase();
@@ -509,6 +524,7 @@ function tokenSelect(host, name, options, ph){
     var t = e.target.closest(".ts-opt"); if(t){ add(filtered[+t.getAttribute("data-i")]); e.preventDefault(); }
   });
   document.addEventListener("click", function(e){ if(!host.contains(e.target)) menu.style.display = "none"; });
+  return { setOptions: setOptions };
 }
 
 cascade("state_id", "district_id", DISTRICTS, "Select district...");
@@ -525,13 +541,29 @@ cascade("course_id", "specialization_id", SPECS, "Select specialization...");
 })();
 
 var STATE_NAME = {}; STATES.forEach(function(s){ STATE_NAME[s[0]] = s[1]; });
-var LOC_OPTS = DISTRICTS.map(function(d){ return [d[0], d[1], STATE_NAME[d[2]] || ""]; });
+// district options carry [id, name, stateName, stateId] so they can be filtered
+// by the chosen states.
+var DISTRICT_OPTS = DISTRICTS.map(function(d){ return [d[0], d[1], STATE_NAME[d[2]] || "", d[2]]; });
 
 tokenSelect(document.getElementById("ts_skills"), "skill_ids", SKILLS, "Type a skill...");
-tokenSelect(document.getElementById("ts_locations"), "preferred_location_ids", LOC_OPTS, "Type a district...");
 tokenSelect(document.getElementById("ts_categories"), "preferred_category_ids", CATEGORIES, "Type a category...");
 tokenSelect(document.getElementById("ts_roles"), "preferred_role_ids", ROLES, "Type a job role...");
-tokenSelect(document.getElementById("ts_other_states"), "other_state_ids", OTHER_STATES, "Type a state...");
+
+// Preferred work locations: pick STATE(s) first (multi), then only those states'
+// DISTRICTS are offered (multi). Selecting a state populates the district list;
+// removing a state drops its districts.
+var prefDistricts = tokenSelect(
+  document.getElementById("ts_locations"), "preferred_location_ids", [],
+  "Select a state above first..."
+);
+tokenSelect(
+  document.getElementById("ts_pref_states"), "preferred_state_ids", STATES,
+  "Type a state (e.g. Tamil Nadu)...",
+  function(stateIds){
+    var set = {}; stateIds.forEach(function(id){ set[id] = 1; });
+    prefDistricts.setOptions(DISTRICT_OPTS.filter(function(d){ return set[d[3]]; }));
+  }
+);
 
 // ---- chip groups (single / multi-select → hidden inputs) ----
 function chipGroup(group){
@@ -713,10 +745,10 @@ def _form_html(
   </section>
 
   <section class="step"><h1>Preferred Work Locations</h1>
-    <label>Cities / Districts {_R()}</label>
+    <label>States {_R()} <span class="hint">(pick one or more)</span></label>
+    <div id="ts_pref_states" data-req></div>
+    <label>Districts {_R()} <span class="hint">(districts of the states you picked)</span></label>
     <div id="ts_locations" data-req></div>
-    <label>Other States</label>
-    <div id="ts_other_states"></div>
     <label>Interested in working abroad?</label>
     {_chips("interested_in_abroad", _YESNO)}
   </section>

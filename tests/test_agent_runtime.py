@@ -1081,23 +1081,41 @@ async def test_apply_answer_finalizes_application():
     assert "applied" in out["response"].lower()
 
 
-async def test_apply_skips_questions_when_profile_complete():
-    """If the profile already has a resume, Apply finalizes immediately with no
-    questions (expected salary is no longer asked)."""
+async def test_apply_always_asks_resume_even_with_one_on_file():
+    """Apply ALWAYS asks for the resume (skippable) — even when the profile
+    already has one, the candidate is offered the Upload Resume step."""
     rt = _runtime()
     reg = {"private_job_seekers": {"id": "seeker1"},
            "job_seeker_profiles": {"id": "profile1", "resume": "http://cv"}}
     _stub_memory(rt, registration=reg, job_lookup=_JOB)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "Apply", interactive_id="apply:r1")
-    assert rt._test_applications and rt._test_applications[0]["ref"] == "r1"  # type: ignore[attr-defined]
-    assert "applied" in out["response"].lower()
-    assert rt._test_apply_saves == []                              # no questions asked
+    assert "resume" in out["response"].lower()                     # resume IS asked
+    assert rt._test_applications == []                             # not finalized yet
+    saved = rt._test_apply_saves[0]                                # type: ignore[attr-defined]
+    assert saved["pending"] == ["resume"]
 
 
-async def test_apply_resume_offers_upload_button(monkeypatch):
-    """Tapping Apply (no resume on file) hands over a tappable 'Upload Resume'
-    web button (cta_url) — not the old 'tap the clip icon' prompt."""
+async def test_apply_skip_uses_existing_resume_on_file():
+    """Skipping the resume on apply falls back to the resume already on the
+    profile, so the application still carries the candidate's CV."""
+    rt = _runtime()
+    reg = {"private_job_seekers": {"id": "seeker1"},
+           "job_seeker_profiles": {"id": "profile1", "resume": "http://cv/on-file"}}
+    _stub_memory(
+        rt, registration=reg, job_lookup=_JOB,
+        apply_state={"job_ref": "r1", "job_title": "Backend Developer",
+                     "job": _JOB, "pending": ["resume"], "answers": {}},
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Skip", interactive_id="apply_skip")
+    rec = rt._test_applications[0]["record"]                        # type: ignore[attr-defined]
+    assert rec["resume"] == "http://cv/on-file" and "applied" in out["response"].lower()
+
+
+async def test_apply_resume_offers_upload_and_skip_buttons(monkeypatch):
+    """Tapping Apply sends TWO messages: a tappable 'Upload Resume' web button
+    (cta_url) AND a separate 'Skip' reply button — not the old clip prompt."""
     from app.config import get_settings
 
     monkeypatch.setattr(get_settings(), "public_base_url", "https://abc.ngrok-free.app")
@@ -1105,13 +1123,17 @@ async def test_apply_resume_offers_upload_button(monkeypatch):
     _stub_memory(rt, registration=_REG, job_lookup=_JOB)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "Apply", interactive_id="apply:r1")
-    interactive = out["whatsapp_interactive"]["interactive"]
-    assert interactive["type"] == "cta_url"
-    params = interactive["action"]["parameters"]
-    assert "Upload Resume" in params["display_text"]
-    assert params["url"] == "https://abc.ngrok-free.app/onboard/resume?token=atok123"
+    msgs = out["whatsapp_messages"]
+    assert len(msgs) == 2
+    upload = msgs[0]["interactive"]
+    assert upload["type"] == "cta_url"
+    assert "Upload Resume" in upload["action"]["parameters"]["display_text"]
+    assert upload["action"]["parameters"]["url"] == "https://abc.ngrok-free.app/onboard/resume?token=atok123"
+    skip = msgs[1]["interactive"]
+    assert skip["type"] == "button"
+    assert skip["action"]["buttons"][0]["reply"]["id"] == "apply_skip"
+    assert skip["action"]["buttons"][0]["reply"]["title"] == "Skip"
     assert "resume" in out["response"].lower() and "clip" not in out["response"].lower()
-    # the staged apply keeps the job so the web upload can finalize
     saved = rt._test_apply_saves[0]                                 # type: ignore[attr-defined]
     assert saved["pending"] == ["resume"] and saved.get("job")
 
