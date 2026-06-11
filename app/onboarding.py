@@ -242,12 +242,16 @@ def build_registration_records(
     def _profile_children(fk: str, ids: list[str]) -> list[dict[str, Any]]:
         return [{"id": _cuid(), "profileId": profile_id, fk: i, "createdAt": now} for i in ids]
 
+    # profile_languages.speakLevel/writeLevel are NOT NULL (enum BASIC|GOOD|FLUENT,
+    # no "none"). A language is in the list because the candidate picked it for
+    # speak and/or write; default the unticked dimension to BASIC so the insert
+    # never violates the not-null constraint.
     language_rows = [
         {
             "id": _cuid(), "profileId": profile_id,
             "languageId": lang.get("languageId"),
-            "speakLevel": (lang.get("speak") or None),
-            "writeLevel": (lang.get("write") or None),
+            "speakLevel": (lang.get("speak") or "BASIC"),
+            "writeLevel": (lang.get("write") or "BASIC"),
             "createdAt": now,
         }
         for lang in languages if isinstance(lang, dict) and lang.get("languageId")

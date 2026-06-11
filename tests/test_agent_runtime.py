@@ -463,21 +463,19 @@ async def test_db_known_user_gets_lane_choice():
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
-async def test_registered_seeker_not_in_db_is_not_re_onboarded():
-    """Regression: a seeker who SUBMITTED the onboarding form (Redis gate) but is
-    not yet found in the job-board DB is treated as KNOWN — tapping Job Search
-    shows jobs, never the onboarding form again."""
+async def test_seeker_not_in_db_is_re_onboarded():
+    """DB is the SINGLE source of truth: a seeker with a staged Redis form but NOT
+    found in the job-board DB is onboarded again (handed the form link) — a Redis
+    form alone never counts as registered, so a failed/disabled DB write surfaces
+    instead of being masked."""
     rt = _runtime()
     _stub_memory(
         rt, facts={"full_name": "Asha", "lane": "seeker"}, candidate=None, onboarded=True,
-        overview={"total_open_jobs": 5,
-                  "categories": [{"category": "Information Technology", "count": 5}]},
     )
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "Job Search")
     body = out["response"].lower()
-    assert "setting up your profile" not in body and "/onboard/form" not in body  # NOT re-onboarded
-    assert out["whatsapp_interactive"]["interactive"]["type"] == "list"   # job categories
+    assert "/onboard/form" in body or "setting up your profile" in body   # re-onboarded
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 

@@ -823,19 +823,12 @@ class AgentRuntime:
         if (picked_lane or facts.get("lane")) == "creator":
             return {"is_known": False, "customer_facts": facts}
 
-        # 2b) SEEKER who already SUBMITTED the onboarding form (Redis gate) → treat
-        # as known so we never re-show the form. The live-DB write still runs on
-        # submit (when REGISTER_IN_DB is on), but a seeker must not be re-onboarded
-        # just because that write is disabled or momentarily failed — the submitted
-        # form is itself proof they've registered.
-        submitted = await self._onboarding_gate(state)
-        if submitted:
-            facts["full_name"] = facts.get("full_name") or submitted.get("name") or None
-            facts["email"] = facts.get("email") or submitted.get("email") or None
-            return {"is_known": True, "customer_facts": facts}
-
-        # 2c) NOT in the DB and no submitted form → a new seeker we ONBOARD via
-        # the tokenised web form.
+        # 2b) NOT in the DB → a new seeker we ONBOARD via the tokenised web form.
+        # The job board DB is the SINGLE source of truth: a Redis-staged form does
+        # NOT count as registered. The form is written to the DB on submit
+        # (REGISTER_IN_DB), so once it lands the next turn's phone lookup (step 1)
+        # finds them and they're known. If a write fails, the sender is onboarded
+        # again — surfacing the failure instead of masking it.
         # The lane choice is asked FIRST (route_after_identify → role_select), so
         # by the time we reach the onboarding node the sender has picked Job
         # Seeker. The form itself collects the full name (editable field), so we
