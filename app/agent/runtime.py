@@ -469,11 +469,39 @@ class AgentRuntime:
         ]
         if not pending:
             return await self._apply_finalize(state, ref, job, reg, answers={})
+        # Stage the in-progress apply (keep the job so the web resume upload can
+        # finalize without re-looking it up).
         await self._save_apply(
-            state, {"job_ref": ref, "job_title": title, "pending": pending, "answers": {}}
+            state, {"job_ref": ref, "job_title": title, "job": job,
+                    "pending": pending, "answers": {}}
         )
-        prompt = onboarding.APPLY_FIELD_BY_KEY[pending[0]]["prompt"]
-        return _apply_prompt(f"Let's apply for {title}.\n\n{prompt}")
+        # The only apply-time field is the resume → hand over a tappable upload
+        # button (web file picker) instead of asking for an attachment.
+        return await self._apply_resume_prompt(state, title)
+
+    async def _apply_resume_prompt(self, state: AgentState, title: str) -> dict[str, Any]:
+        """Resume step: a friendly 'Upload Resume' web button (file picker) + inline
+        link, with 'send the file here / reply skip' as fallbacks."""
+        body = (
+            f"Let's apply for {title}.\n\nAlmost done — upload your resume (PDF/DOC) "
+            "to finish. Tap below to choose a file. You can also send it here as a "
+            "document, or reply 'skip'."
+        )
+        out = _apply_reply(body)
+        try:
+            token = await self.gateway.apply_token(
+                tenant_id=state["tenant_id"], conversation_id=state["conversation_id"]
+            )
+            link = f"{get_settings().public_base_url.rstrip('/')}/onboard/resume?token={token}"
+            if link.startswith("https://"):
+                out["whatsapp_interactive"] = wa.cta_url_message(
+                    body=body, display_text="📎 Upload Resume", url=link,
+                )
+            else:
+                out["draft_response"] = f"{body}\n{link}"
+        except Exception as exc:  # noqa: BLE001 — fall back to chat-only resume capture
+            log.warning("apply_resume_token_failed", error=str(exc)[:200])
+        return out
 
     async def _apply_answer(
         self, state: AgentState, apply_state: dict[str, Any], *, skip: bool = False
@@ -547,6 +575,18 @@ class AgentRuntime:
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("registration_load_failed", error=str(exc)[:200])
+            return None
+
+    async def _onboarding_gate(self, state: AgentState) -> dict[str, Any] | None:
+        """The submitted onboarding form (Redis), or None. Used by identify() as a
+        fallback 'this seeker has registered' signal so a completed registration
+        is never re-onboarded even when the live-DB write is off/failed."""
+        try:
+            return await self.gateway.onboarding(
+                tenant_id=state["tenant_id"], conversation_id=state["conversation_id"]
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("onboarding_gate_load_failed", error=str(exc)[:200])
             return None
 
     async def _load_apply(self, state: AgentState) -> dict[str, Any] | None:
@@ -783,7 +823,19 @@ class AgentRuntime:
         if (picked_lane or facts.get("lane")) == "creator":
             return {"is_known": False, "customer_facts": facts}
 
-        # 2b) NOT in the DB → a new seeker we ONBOARD via the tokenised web form.
+        # 2b) SEEKER who already SUBMITTED the onboarding form (Redis gate) → treat
+        # as known so we never re-show the form. The live-DB write still runs on
+        # submit (when REGISTER_IN_DB is on), but a seeker must not be re-onboarded
+        # just because that write is disabled or momentarily failed — the submitted
+        # form is itself proof they've registered.
+        submitted = await self._onboarding_gate(state)
+        if submitted:
+            facts["full_name"] = facts.get("full_name") or submitted.get("name") or None
+            facts["email"] = facts.get("email") or submitted.get("email") or None
+            return {"is_known": True, "customer_facts": facts}
+
+        # 2c) NOT in the DB and no submitted form → a new seeker we ONBOARD via
+        # the tokenised web form.
         # The lane choice is asked FIRST (route_after_identify → role_select), so
         # by the time we reach the onboarding node the sender has picked Job
         # Seeker. The form itself collects the full name (editable field), so we

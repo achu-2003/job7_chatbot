@@ -14,12 +14,13 @@ Form bodies are parsed manually (urlencoded) so we don't depend on
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import json
-from typing import Any
-from urllib.parse import parse_qs
-
 import re
+import uuid
+from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse
@@ -29,7 +30,7 @@ from app.chatbot import wa_format as wa
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.db.repositories import JobSeekerRepository, LookupRepository
-from app.onboarding import prepare_registration
+from app.onboarding import build_application_record, prepare_registration
 from app.whatsapp import delivery as wa_delivery
 
 # The /onboard form is the SEEKER lane (the employer side has its own form), so
@@ -44,6 +45,56 @@ _SEEKER_HUB_BUTTONS = (
 
 router = APIRouter()
 log = get_logger("onboard")
+
+# Uploaded resumes are stored here and served read-only at /uploads (mounted in
+# app.main). Local disk is fine for testing; point this at cloud storage later.
+_RESUME_DIR = Path("uploads/resumes")
+_RESUME_EXTS = {".pdf", ".doc", ".docx", ".rtf", ".odt", ".png", ".jpg", ".jpeg"}
+
+
+async def _register_with_retry(payload: dict[str, Any], *, tries: int = 3) -> dict[str, Any]:
+    """Write the registration, retrying briefly on transient connection saturation
+    ('too many clients already') from the shared cluster. Re-raises other errors."""
+    last: Exception | None = None
+    for attempt in range(tries):
+        try:
+            return await JobSeekerRepository.create(payload, commit=True)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            transient = "too many clients" in str(exc).lower()
+            if transient and attempt < tries - 1:
+                log.warning("registration_db_retry", attempt=attempt + 1, error=str(exc)[:120])
+                await asyncio.sleep(0.6 * (attempt + 1))
+                continue
+            raise
+    assert last is not None
+    raise last
+
+
+async def _save_resume_upload(upload: Any, token: str) -> str:
+    """Save a selected resume file to local storage and return its served URL.
+    Returns "" when no file was attached. Best-effort — a failure never blocks
+    the submission (the candidate can still register without a resume)."""
+    filename = getattr(upload, "filename", None)
+    if not filename:                       # str field / None → no file selected
+        return ""
+    try:
+        data = await upload.read()
+        if not data:
+            return ""
+        clean = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[-50:].lstrip("._") or "resume"
+        ext = Path(clean).suffix.lower()
+        if ext and ext not in _RESUME_EXTS:
+            clean += ".pdf" if not Path(clean).suffix else ""
+        fname = f"{uuid.uuid4().hex[:10]}_{clean}"
+        _RESUME_DIR.mkdir(parents=True, exist_ok=True)
+        (_RESUME_DIR / fname).write_bytes(data)
+        base = get_settings().public_base_url.rstrip("/")
+        log.info("resume_uploaded", file=fname, bytes=len(data))
+        return f"{base}/uploads/resumes/{fname}"
+    except Exception as exc:  # noqa: BLE001 — upload is best-effort
+        log.warning("resume_upload_failed", error=str(exc)[:200])
+        return ""
 
 # Dropdown sources fetched to render the form (id-valued options).
 _OPTION_KINDS = (
@@ -99,18 +150,24 @@ async def onboarding_form(request: Request, token: str = Query(default="")) -> H
 
 @router.post("/submit", response_class=HTMLResponse)
 async def onboarding_submit(request: Request) -> HTMLResponse:
-    raw = parse_qs((await request.body()).decode("utf-8"))
+    # The form now carries a file input (resume), so it's multipart/form-data —
+    # parse via request.form() (handles both text fields and the upload).
+    posted = await request.form()
 
     def one(key: str) -> str:
-        v = raw.get(key) or []
-        return v[0].strip() if v else ""
+        v = posted.get(key)
+        return v.strip() if isinstance(v, str) else ""
 
     def many(key: str) -> list[str]:
-        return [x.strip() for x in (raw.get(key) or []) if x.strip()]
+        return [x.strip() for x in posted.getlist(key) if isinstance(x, str) and x.strip()]
 
     token = one("token")
     if not token:
         return HTMLResponse(_expired_html(), status_code=400)
+
+    # Resume: a selected file is saved to local storage and its served URL stored;
+    # a pasted link (resume_url) is honored as a fallback when no file is attached.
+    resume = await _save_resume_upload(posted.get("resume"), token) or one("resume_url")
 
     name = one("full_name") or one("name")
     # Languages: each can be marked Speak and/or Write (checkboxes by language id).
@@ -146,7 +203,7 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
         "experience_level_id": one("experience_level_id"),
         "current_salary": one("current_salary"),
         "expected_salary": one("expected_salary"),
-        "resume": one("resume"),
+        "resume": resume,
         "work_mode": one("work_mode"),
         "job_types": many("job_types"),
         "interested_in_abroad": one("interested_in_abroad"),
@@ -181,10 +238,11 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
         log.warning("registration_stage_failed", error=str(exc)[:200])
 
     # Write to the LIVE job board only when explicitly enabled (REGISTER_IN_DB).
-    # A DB failure is logged but never fails the form — the Redis copy still holds.
+    # A DB failure is logged but never fails the form — the Redis copy still holds
+    # (and the seeker is treated as registered via the Redis gate either way).
     if payload is not None and get_settings().register_in_db:
         try:
-            res = await JobSeekerRepository.create(payload, commit=True)
+            res = await _register_with_retry(payload)
             log.info("registration_db_written", seeker_id=res["seeker_id"], children=res["children"])
         except Exception as exc:  # noqa: BLE001
             log.error("registration_db_write_failed", error=str(exc)[:300])
@@ -214,6 +272,80 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
 
     number = re.sub(r"\D", "", settings.whatsapp_business_number or "")
     return HTMLResponse(_success_html(identity.get("name") or "", business_number=number))
+
+
+# ---------------------------------------------------------------------------
+# Apply-time resume upload (the friendly "Upload Resume" web button)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/resume", response_class=HTMLResponse)
+async def resume_form(request: Request, token: str = Query(default="")) -> HTMLResponse:
+    identity = await get_memory(request).get_apply_identity(token) if token else None
+    if not identity:
+        return HTMLResponse(_expired_html(), status_code=404)
+    return HTMLResponse(_resume_html(token))
+
+
+@router.post("/resume/submit", response_class=HTMLResponse)
+async def resume_submit(request: Request) -> HTMLResponse:
+    posted = await request.form()
+    tok = posted.get("token")
+    token = tok.strip() if isinstance(tok, str) else ""
+    if not token:
+        return HTMLResponse(_expired_html(), status_code=400)
+    memory = get_memory(request)
+    identity = await memory.get_apply_identity(token)
+    if not identity:
+        return HTMLResponse(_expired_html(), status_code=404)
+    tid, conv = identity["tenant_id"], identity["conversation_id"]
+
+    resume_url = await _save_resume_upload(posted.get("resume"), token)
+    if not resume_url:
+        return HTMLResponse(_resume_html(token, error="Please choose a PDF/DOC file."), status_code=400)
+
+    apply_state = await memory.get_apply_state(conv, tenant_id=tid)
+    reg = await memory.get_registration(conv, tenant_id=tid)
+    settings = get_settings()
+    # Finalize the application if there's an active apply with a staged job; else
+    # just save the resume onto the staged profile.
+    if apply_state and reg and apply_state.get("job"):
+        job = apply_state["job"]
+        ref = apply_state.get("job_ref")
+        title = apply_state.get("job_title") or "the role"
+        try:
+            built = build_application_record(
+                registration=reg, job=job, answers={"resume": resume_url}
+            )
+            await memory.save_application(conv, ref, built["application"], tenant_id=tid)
+            if built["profile_update"]:
+                await memory.update_registration_profile(conv, built["profile_update"], tenant_id=tid)
+            await memory.clear_apply_state(conv, tenant_id=tid)
+        except Exception as exc:  # noqa: BLE001 — staging must not 500 the upload
+            log.warning("apply_resume_finalize_failed", error=str(exc)[:200])
+        push_body = (
+            f"✅ Resume received — you've applied to {title}! Our team will review "
+            "your profile and get back to you."
+        )
+        sub = f"Your resume is attached and you've applied to {title}."
+    else:
+        if reg:
+            try:
+                await memory.update_registration_profile(conv, {"resume": resume_url}, tenant_id=tid)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("apply_resume_profile_save_failed", error=str(exc)[:200])
+        push_body = "📎 Resume uploaded and saved to your profile."
+        sub = "Your resume has been saved to your profile."
+
+    phone = re.sub(r"\D", "", conv)          # conv id is wa_<number>
+    if phone:
+        try:
+            await wa_delivery.send_message(settings, phone, wa.text_message(push_body))
+        except Exception as exc:  # noqa: BLE001 — push is best-effort
+            log.warning("apply_resume_push_failed", error=str(exc)[:200])
+
+    number = re.sub(r"\D", "", settings.whatsapp_business_number or "")
+    return HTMLResponse(_resume_done_html(sub, business_number=number))
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +631,7 @@ def _form_html(
 <h1>Complete Your Profile</h1>
 <div class="prog">{dots}</div>
 {err}
-<form method="post" action="/onboard/submit" id="profForm" autocomplete="off">
+<form method="post" action="/onboard/submit" id="profForm" autocomplete="off" enctype="multipart/form-data">
   <input type="hidden" name="token" value="{_esc(token)}">
   <input type="hidden" name="date_of_birth" id="date_of_birth">
 
@@ -512,8 +644,8 @@ def _form_html(
     <input type="text" class="ro" value="{_esc(phone)}" readonly>
     <label>Email</label>
     <input type="email" name="email" placeholder="you@example.com">
-    <label>Resume link <span class="hint">(Google Drive, Dropbox, etc.)</span></label>
-    <input type="url" name="resume" placeholder="https://…">
+    <label>Resume <span class="hint">(PDF, DOC — tap to select a file)</span></label>
+    <input type="file" name="resume" accept=".pdf,.doc,.docx,.rtf,.odt,.png,.jpg,.jpeg">
     <label>Gender {_R()}</label>
     {_chips("gender", _GENDER, req=True)}
     <label>Marital Status {_R()}</label>
@@ -654,4 +786,39 @@ def _expired_html() -> str:
 <h1>Link expired</h1>
 <p class="sub">This form link is invalid or has expired. Please go back to
 WhatsApp and message us so we can send you a fresh one.</p>"""
+    return _PAGE.format(body=body)
+
+
+def _resume_html(token: str, *, error: str = "") -> str:
+    """One-screen resume picker — tap to select a PDF/DOC, then Submit."""
+    err = f'<div class="err">{_esc(error)}</div>' if error else ""
+    body = f"""\
+<h1>Upload your resume</h1>
+<p class="sub">Choose your resume (PDF or DOC) to finish applying.</p>
+{err}
+<form method="post" action="/onboard/resume/submit" enctype="multipart/form-data">
+  <input type="hidden" name="token" value="{_esc(token)}">
+  <label>Resume <span class="hint">(PDF, DOC — tap to select a file)</span></label>
+  <input type="file" name="resume" accept=".pdf,.doc,.docx,.rtf,.odt,.png,.jpg,.jpeg" required>
+  <button class="btn" type="submit" style="margin-top:18px">Submit resume</button>
+</form>"""
+    return _PAGE.format(body=body)
+
+
+def _resume_done_html(sub: str, *, business_number: str = "") -> str:
+    if business_number:
+        close = f'<a class="btn" href="https://wa.me/{business_number}">Back to chat</a>'
+    else:
+        close = (
+            '<button onclick="window.close()">Close</button>'
+            '<p class="sub" style="margin-top:14px">All done! Return to WhatsApp '
+            "and continue the chat.</p>"
+        )
+    body = f"""\
+<div class="ok">
+  <div class="tick">&#10003;</div>
+  <h1>Resume uploaded!</h1>
+  <p class="sub">{_esc(sub)}</p>
+  {close}
+</div>"""
     return _PAGE.format(body=body)

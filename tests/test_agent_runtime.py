@@ -171,9 +171,13 @@ def _stub_memory(
     async def fake_save_application(**kw):
         app_calls.append(kw)
 
+    async def fake_apply_token(**kw):
+        return "atok123"
+
     rt.gateway.apply_state = fake_apply_state               # type: ignore[assignment]
     rt.gateway.set_apply_state = fake_set_apply_state       # type: ignore[assignment]
     rt.gateway.clear_apply_state = fake_clear_apply_state   # type: ignore[assignment]
+    rt.gateway.apply_token = fake_apply_token               # type: ignore[assignment]
     rt.gateway.registration = fake_registration            # type: ignore[assignment]
     rt.gateway.update_registration_profile = fake_update_reg_profile  # type: ignore[assignment]
     rt.gateway.save_application = fake_save_application     # type: ignore[assignment]
@@ -456,6 +460,24 @@ async def test_db_known_user_gets_lane_choice():
     titles = [b["reply"]["title"]
               for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
     assert titles == ["Job Seeker", "Employer"]   # lane choice, not the name/form ask
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
+
+
+async def test_registered_seeker_not_in_db_is_not_re_onboarded():
+    """Regression: a seeker who SUBMITTED the onboarding form (Redis gate) but is
+    not yet found in the job-board DB is treated as KNOWN — tapping Job Search
+    shows jobs, never the onboarding form again."""
+    rt = _runtime()
+    _stub_memory(
+        rt, facts={"full_name": "Asha", "lane": "seeker"}, candidate=None, onboarded=True,
+        overview={"total_open_jobs": 5,
+                  "categories": [{"category": "Information Technology", "count": 5}]},
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Job Search")
+    body = out["response"].lower()
+    assert "setting up your profile" not in body and "/onboard/form" not in body  # NOT re-onboarded
+    assert out["whatsapp_interactive"]["interactive"]["type"] == "list"   # job categories
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
@@ -1042,16 +1064,16 @@ async def test_apply_asks_for_missing_details_first():
 
 
 async def test_apply_answer_finalizes_application():
-    """Answering the last pending field finalizes: a DB-ready application record
-    is staged (jobId + jobSeekerId resolved) and the candidate is confirmed."""
+    """Answering the resume (a pasted link) finalizes: a DB-ready application
+    record is staged (jobId + jobSeekerId resolved) and the candidate is confirmed."""
     rt = _runtime()
     _stub_memory(
         rt, registration=_REG, job_lookup=_JOB,
         apply_state={"job_ref": "r1", "job_title": "Backend Developer",
-                     "pending": ["expected_salary"], "answers": {"resume": "http://cv/me"}},
+                     "pending": ["resume"], "answers": {}},
     )
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
-    out = await _handle(rt, "25000")                               # typed answer, no button
+    out = await _handle(rt, "http://cv/me")                        # pasted link, no button
     assert rt._test_applications and rt._test_applications[0]["ref"] == "r1"  # type: ignore[attr-defined]
     rec = rt._test_applications[0]["record"]                       # type: ignore[attr-defined]
     assert rec["jobId"] == "job-db-1" and rec["jobSeekerId"] == "seeker1"
@@ -1060,11 +1082,11 @@ async def test_apply_answer_finalizes_application():
 
 
 async def test_apply_skips_questions_when_profile_complete():
-    """If the profile already has resume + expected salary, Apply finalizes
-    immediately with no questions."""
+    """If the profile already has a resume, Apply finalizes immediately with no
+    questions (expected salary is no longer asked)."""
     rt = _runtime()
     reg = {"private_job_seekers": {"id": "seeker1"},
-           "job_seeker_profiles": {"id": "profile1", "resume": "http://cv", "expectedSalary": 30000}}
+           "job_seeker_profiles": {"id": "profile1", "resume": "http://cv"}}
     _stub_memory(rt, registration=reg, job_lookup=_JOB)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "Apply", interactive_id="apply:r1")
@@ -1073,49 +1095,58 @@ async def test_apply_skips_questions_when_profile_complete():
     assert rt._test_apply_saves == []                              # no questions asked
 
 
-async def test_apply_prompt_offers_skip_button():
-    """The apply questions carry a tappable Skip button."""
+async def test_apply_resume_offers_upload_button(monkeypatch):
+    """Tapping Apply (no resume on file) hands over a tappable 'Upload Resume'
+    web button (cta_url) — not the old 'tap the clip icon' prompt."""
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "public_base_url", "https://abc.ngrok-free.app")
     rt = _runtime()
     _stub_memory(rt, registration=_REG, job_lookup=_JOB)
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "Apply", interactive_id="apply:r1")
-    buttons = out["whatsapp_interactive"]["interactive"]["action"]["buttons"]
-    assert buttons[0]["reply"]["id"] == "apply_skip"
-    assert "resume" in out["response"].lower()
+    interactive = out["whatsapp_interactive"]["interactive"]
+    assert interactive["type"] == "cta_url"
+    params = interactive["action"]["parameters"]
+    assert "Upload Resume" in params["display_text"]
+    assert params["url"] == "https://abc.ngrok-free.app/onboard/resume?token=atok123"
+    assert "resume" in out["response"].lower() and "clip" not in out["response"].lower()
+    # the staged apply keeps the job so the web upload can finalize
+    saved = rt._test_apply_saves[0]                                 # type: ignore[attr-defined]
+    assert saved["pending"] == ["resume"] and saved.get("job")
 
 
-async def test_apply_resume_via_document_upload():
-    """Sending a resume DOCUMENT (not a link) is accepted as the resume answer."""
+async def test_apply_resume_via_document_upload_finalizes():
+    """Sending a resume DOCUMENT in chat (the fallback) is accepted and, since
+    resume is the only apply field, finalizes the application."""
     rt = _runtime()
     _stub_memory(
         rt, registration=_REG, job_lookup=_JOB,
         apply_state={"job_ref": "r1", "job_title": "Backend Developer",
-                     "pending": ["resume", "expected_salary"], "answers": {}},
+                     "job": _JOB, "pending": ["resume"], "answers": {}},
     )
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(
         rt, "myresume.pdf",
         attachment={"kind": "document", "media_id": "MID123", "filename": "myresume.pdf"},
     )
-    saved = rt._test_apply_saves[-1]                               # type: ignore[attr-defined]
-    assert saved["answers"]["resume"].startswith("myresume.pdf")
-    assert "MID123" in saved["answers"]["resume"]
-    assert saved["pending"] == ["expected_salary"]                # advanced to next field
+    rec = rt._test_applications[0]["record"]                        # type: ignore[attr-defined]
+    assert rec["resume"].startswith("myresume.pdf") and "MID123" in rec["resume"]
+    assert "applied" in out["response"].lower()
 
 
-async def test_apply_skip_button_skips_current_field():
-    """Tapping Skip stores no value for the field and moves on."""
+async def test_apply_skip_finalizes_without_resume():
+    """Tapping Skip on the resume step finalizes the application with no resume."""
     rt = _runtime()
     _stub_memory(
         rt, registration=_REG, job_lookup=_JOB,
         apply_state={"job_ref": "r1", "job_title": "Backend Developer",
-                     "pending": ["resume", "expected_salary"], "answers": {}},
+                     "job": _JOB, "pending": ["resume"], "answers": {}},
     )
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "Skip", interactive_id="apply_skip")
-    saved = rt._test_apply_saves[-1]                               # type: ignore[attr-defined]
-    assert saved["answers"]["resume"] is None
-    assert saved["pending"] == ["expected_salary"]
+    rec = rt._test_applications[0]["record"]                        # type: ignore[attr-defined]
+    assert rec["resume"] is None and "applied" in out["response"].lower()
 
 
 async def test_document_outside_apply_is_nudged():

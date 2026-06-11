@@ -243,6 +243,10 @@ class MemoryGateway:
     async def clear_apply_state(self, *, tenant_id: str, conversation_id: str) -> None:
         await self.short_term.clear_apply_state(conversation_id, tenant_id=tenant_id)
 
+    async def apply_token(self, *, tenant_id: str, conversation_id: str) -> str:
+        """Mint the token the apply-resume upload page resolves to this chat."""
+        return await self.short_term.ensure_apply_token(conversation_id, tenant_id=tenant_id)
+
     async def save_application(
         self, *, tenant_id: str, conversation_id: str, ref: str, record: dict[str, Any]
     ) -> None:

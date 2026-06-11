@@ -44,7 +44,8 @@ def test_form_renders_nine_step_wizard():
     assert "function valid(" in out and 'id="nextBtn"' in out
     # contact + education + salary inputs
     assert 'name="email"' in out
-    assert 'name="resume"' in out
+    assert 'type="file" name="resume"' in out             # resume is a file picker
+    assert 'enctype="multipart/form-data"' in out         # so the form is multipart
     assert 'name="institution"' in out
     assert 'name="current_salary"' in out
 
@@ -65,6 +66,34 @@ def test_form_escapes_name_to_prevent_injection():
     out = _form_html("t", "<script>alert(1)</script>", "91", _OPTS)
     assert "<script>alert(1)</script>" not in out
     assert "&lt;script&gt;" in out
+
+
+class _FakeUpload:
+    """Minimal stand-in for a Starlette UploadFile (filename + async read)."""
+    def __init__(self, filename, data):
+        self.filename = filename
+        self._data = data
+
+    async def read(self):
+        return self._data
+
+
+async def test_resume_upload_saves_file_and_returns_url(tmp_path, monkeypatch):
+    import app.api.routes.onboard as ob
+    from app.config import get_settings
+
+    monkeypatch.setattr(ob, "_RESUME_DIR", tmp_path)
+    monkeypatch.setattr(get_settings(), "public_base_url", "https://x.test")
+    url = await ob._save_resume_upload(_FakeUpload("My Résumé.pdf", b"%PDF-1.4 data"), "tok")
+    assert url.startswith("https://x.test/uploads/resumes/") and url.endswith(".pdf")
+    files = list(tmp_path.iterdir())
+    assert len(files) == 1 and files[0].read_bytes() == b"%PDF-1.4 data"
+
+
+async def test_resume_upload_ignores_non_file():
+    import app.api.routes.onboard as ob
+    assert await ob._save_resume_upload("https://a-pasted-link", "tok") == ""   # plain str
+    assert await ob._save_resume_upload(None, "tok") == ""                      # nothing
 
 
 def test_success_and_expired_pages_render():

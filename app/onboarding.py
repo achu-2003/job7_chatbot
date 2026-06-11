@@ -35,15 +35,9 @@ APPLY_FIELDS = (
     {
         "key": "resume",
         "numeric": False,
-        "prompt": "Almost done! 📎 Tap the attachment (clip) icon and send your "
-                  "resume as a document — PDF or DOC. You can also paste a link, "
-                  "or tap Skip.",
-    },
-    {
-        "key": "expected_salary",
-        "numeric": True,
-        "prompt": "What monthly salary are you expecting (in ₹)? Reply a number, "
-                  "or 'skip'.",
+        "prompt": "Almost done! Upload your resume to finish applying — tap the "
+                  "button below to choose a PDF/DOC file. You can also send it here "
+                  "as a document, or reply 'skip'.",
     },
 )
 APPLY_FIELD_BY_KEY = {f["key"]: f for f in APPLY_FIELDS}

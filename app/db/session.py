@@ -33,9 +33,21 @@ async def init_engine() -> None:
         pool_size=3,
         max_overflow=2,
         pool_timeout=30,
-        pool_recycle=900,
+        # Recycle pooled connections every 4 min so the pool never holds a stale
+        # idle connection long. pool_pre_ping reopens any the server has closed.
+        pool_recycle=240,
         pool_pre_ping=True,
-        connect_args={"server_settings": {"application_name": "job7_chatbot"}},
+        connect_args={"server_settings": {
+            "application_name": "job7_chatbot",
+            # The shared cluster has a low max_connections, and a server that is
+            # killed (not shut down gracefully) leaves its pooled connections
+            # ORPHANED until Postgres notices — they pile up and exhaust the
+            # cluster ('sorry, too many clients already'). These server-side
+            # timeouts make Postgres reap our own idle sessions automatically, so
+            # leaked connections self-clean within ~5 min instead of accumulating.
+            "idle_session_timeout": "300000",                # 5 min (ms)
+            "idle_in_transaction_session_timeout": "60000",  # 1 min (ms)
+        }},
         future=True,
     )
     _sessionmaker = async_sessionmaker(

@@ -124,6 +124,15 @@ app.include_router(whatsapp.router, prefix="/api/whatsapp", tags=["whatsapp"])
 app.include_router(onboard.router, prefix="/onboard", tags=["onboard"])
 app.include_router(employer.router, prefix="/employer", tags=["employer"])
 
+# Serve uploaded resumes (read-only) from local disk. Created on startup so the
+# mount never fails on a fresh checkout.
+import os  # noqa: E402
+
+from starlette.staticfiles import StaticFiles  # noqa: E402
+
+os.makedirs("uploads/resumes", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
 
 @app.get("/metrics")
 async def metrics() -> Response:

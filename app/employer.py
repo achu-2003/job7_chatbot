@@ -65,6 +65,9 @@ REQUIRED_ASSETS = (
     "Bike", "Licence", "Aadhar", "PAN", "Laptop", "Camera", "Smartphone", "Car", "Passport", "Bank Account",
 )
 APPLY_MODES = (("APPLY", "In-App Apply"), ("CALL", "Phone Call"), ("WHATSAPP", "WhatsApp"))
+INTERN_PAYMENT_TYPES = (
+    ("STIPEND", "Company pays (Stipend)"), ("TRAINING_FEE", "Intern pays (Training Fee)"),
+)
 
 
 def _cuid() -> str:
@@ -201,10 +204,15 @@ def build_job_record(
         "jobType": _enum(form, "job_type", "FULL_TIME"),
         "workMode": _enum(form, "work_mode", "OFFICE"),
         "isWorkFromHome": _truthy(form.get("work_from_home")),
-        # experience
+        # experience (year min/max only meaningful for EXPERIENCED)
         "experienceType": _enum(form, "experience_type"),
         "experienceMin": _to_int(form.get("experience_min")) or 0,
         "experienceMax": _to_int(form.get("experience_max")),
+        # internship payment (only when experienceType == INTERN)
+        "internPaymentType": _enum(form, "intern_payment_type"),
+        "internStipend": _to_num(form.get("intern_stipend")),
+        "trainingFee": _to_num(form.get("training_fee")),
+        "internDurationMonths": _to_int(form.get("intern_duration_months")),
         # salary
         "salaryMin": _to_num(form.get("salary_min")),
         "salaryMax": _to_num(form.get("salary_max")),

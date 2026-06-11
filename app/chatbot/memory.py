@@ -225,6 +225,39 @@ class ConversationMemory:
         assert self._redis is not None
         await self._redis.delete(self._apply_key(conv_id, tenant_id=tenant_id))
 
+    # ---- apply-time resume upload token (web file picker) -------------
+    #   apply:token:{token} → {tenant_id, conversation_id}  (not tenant-prefixed;
+    #   the upload POST only carries the token)
+
+    @staticmethod
+    def _apply_token_key(token: str) -> str:
+        return f"apply:token:{token}"
+
+    async def ensure_apply_token(
+        self, conv_id: str, *, tenant_id: str
+    ) -> str:
+        """Mint (once) a token the apply-resume upload page resolves back to this
+        conversation, so the uploaded file is attached to the right application."""
+        assert self._redis is not None
+        ttl = get_settings().onboarding_ttl_seconds
+        token = uuid.uuid4().hex
+        await self._redis.setex(
+            self._apply_token_key(token),
+            ttl,
+            json.dumps({"tenant_id": tenant_id, "conversation_id": conv_id}),
+        )
+        return token
+
+    async def get_apply_identity(self, token: str) -> dict[str, Any] | None:
+        assert self._redis is not None
+        raw = await self._redis.get(self._apply_token_key(token))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
     # ------------------------------------------------------------------
     # saved jobs / applied-interest (the candidate's durable lists, Redis only)
     # ------------------------------------------------------------------

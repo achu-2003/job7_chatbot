@@ -39,6 +39,7 @@ from app.employer import (
     GENDER_PREFS,
     JOB_LANGUAGES,
     JOB_LOCATION_TYPES,
+    INTERN_PAYMENT_TYPES,
     JOB_TYPES,
     JOB_WORK_MODES,
     KYC_DOC_TYPES,
@@ -265,6 +266,10 @@ async def post_job_submit(request: Request) -> HTMLResponse:
         "experience_type": one("experience_type"),
         "experience_min": one("experience_min"),
         "experience_max": one("experience_max"),
+        "intern_payment_type": one("intern_payment_type"),
+        "intern_stipend": one("intern_stipend"),
+        "training_fee": one("training_fee"),
+        "intern_duration_months": one("intern_duration_months"),
         "salary_period": one("salary_period"),
         "salary_min": one("salary_min"),
         "salary_max": one("salary_max"),
@@ -361,9 +366,14 @@ _STYLE = """
   .stepname{text-align:center;color:#00d3a7;font-size:12px;text-transform:uppercase;
         letter-spacing:.04em;margin:0 0 14px}
   .step{display:none} .step.active{display:block}
-  .opts label.opt{display:flex;align-items:center;gap:10px;border:1px solid #2a3942;border-radius:10px;
-        padding:11px 12px;margin:8px 0;cursor:pointer}
-  .opts label.opt input{width:auto;accent-color:#00a884}
+  .opts label.opt{display:flex;align-items:center;gap:11px;border:1.5px solid #2a3942;border-radius:12px;
+        padding:13px 14px;margin:9px 0;cursor:pointer;transition:all .12s}
+  .opts label.opt input{width:18px;height:18px;accent-color:#00a884;flex:0 0 auto}
+  .opts label.opt:has(input:checked){border-color:#00a884;background:rgba(0,168,132,.14)}
+  .opts label.opt:has(input:checked) span{color:#00d3a7;font-weight:600}
+  .subblock{background:#0e2a25;border:1px solid #1f4d44;border-radius:12px;padding:4px 14px 14px;margin:10px 0}
+  .subblock > label:first-child{color:#9ad9cb}
+  [hidden]{display:none !important}
   .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
   .chips label.chip{border:1px solid #2a3942;border-radius:20px;padding:7px 13px;cursor:pointer;font-size:14px}
   .chips label.chip input{display:none}
@@ -419,6 +429,14 @@ def _chips(name: str, options: "tuple | list") -> str:
             f"<span>{_esc(lab)}</span></label>"
         )
     return f'<div class="chips">{"".join(out)}</div>'
+
+
+def _year_select(name: str) -> str:
+    """A 0-15 'years' dropdown (used for the Experienced min/max year pickers)."""
+    opts = "".join(
+        f'<option value="{i}">{i} year{"" if i == 1 else "s"}</option>' for i in range(0, 16)
+    )
+    return f'<select name="{name}" autocomplete="off"><option value="">Select…</option>{opts}</select>'
 
 
 def _toggle(name: str, label: str, hint: str = "") -> str:
@@ -531,34 +549,57 @@ def _post_job_html(token: str, o: dict[str, list[dict[str, Any]]]) -> str:
   <label>Job Title <span class="req">*</span></label>
   <input name="title" required placeholder="e.g. Software Developer">
   <label>Job Type</label>
-  {_radios("job_type", JOB_TYPES, default="FULL_TIME")}
+  {_radios("job_type", JOB_TYPES)}
   <label>Description</label>
   <textarea name="description" placeholder="Role responsibilities, requirements…"></textarea>
 </section>""",
-        # 2 — Experience & Salary
+        # 2 — Experience & Salary (conditional: years for Experienced, payment for Intern)
         f"""<section class="step"><h1>Experience &amp; Salary</h1>
   <label>Experience Required</label>
-  {_radios("experience_type", EXPERIENCE_TYPES, default="ANY")}
-  <div class="row">
-    <div><label>Min years</label><input name="experience_min" inputmode="numeric" placeholder="0"></div>
-    <div><label>Max years</label><input name="experience_max" inputmode="numeric" placeholder="3"></div>
+  {_radios("experience_type", EXPERIENCE_TYPES)}
+
+  <div class="subblock" id="expYears" hidden>
+    <label>Years of Experience</label>
+    <div class="row">
+      <div><label>Min years</label>{_year_select("experience_min")}</div>
+      <div><label>Max years</label>{_year_select("experience_max")}</div>
+    </div>
   </div>
-  <label>Salary Range</label>
-  {_radios("salary_period", SALARY_PERIODS, default="MONTHLY")}
-  <div class="row">
-    <div><label>Min (₹)</label><input name="salary_min" inputmode="numeric" placeholder="Min"></div>
-    <div><label>Max (₹)</label><input name="salary_max" inputmode="numeric" placeholder="Max"></div>
+
+  <div class="subblock" id="internBlock" hidden>
+    <label>Intern Payment Type</label>
+    {_radios("intern_payment_type", INTERN_PAYMENT_TYPES)}
+    <div id="stipendInput" hidden>
+      <label>Monthly Stipend (₹)</label>
+      <input name="intern_stipend" inputmode="numeric" placeholder="e.g. 10000">
+    </div>
+    <div id="trainingInput" hidden>
+      <label>Training Fee (₹)</label>
+      <input name="training_fee" inputmode="numeric" placeholder="e.g. 25000">
+    </div>
+    <label>Duration (months)</label>
+    <input name="intern_duration_months" inputmode="numeric" placeholder="e.g. 6">
   </div>
-  {_toggle("salary_negotiable", "Salary negotiable", "Open to discussion")}
+
+  <div id="salaryBlock">
+    <label>Salary Range</label>
+    {_radios("salary_period", SALARY_PERIODS)}
+    <div class="row">
+      <div><label>Min (₹)</label><input name="salary_min" inputmode="numeric" placeholder="Min"></div>
+      <div><label>Max (₹)</label><input name="salary_max" inputmode="numeric" placeholder="Max"></div>
+    </div>
+    {_toggle("salary_negotiable", "Salary negotiable", "Open to discussion")}
+  </div>
+
   <label>Number of Vacancies</label>
   <input name="vacancies" inputmode="numeric" placeholder="e.g. 5">
 </section>""",
         # 3 — Job Location
         f"""<section class="step"><h1>Job Location</h1>
   <label>Job Location <span class="req">*</span></label>
-  {_radios("job_location_type", JOB_LOCATION_TYPES, default="COMPANY_ADDRESS")}
+  {_radios("job_location_type", JOB_LOCATION_TYPES)}
   <label>Work mode</label>
-  {_radios("work_mode", JOB_WORK_MODES, default="OFFICE")}
+  {_radios("work_mode", JOB_WORK_MODES)}
   <div class="row">
     <div><label>State</label>
       <select name="state_id" autocomplete="off">{_options_html(o['states'], placeholder='Select…')}</select></div>
@@ -573,11 +614,11 @@ def _post_job_html(token: str, o: dict[str, list[dict[str, Any]]]) -> str:
   <label>Qualification Level</label>
   {_radios("qualification_level", QUALIFICATION_LEVELS)}
   <label>Gender Preference</label>
-  {_radios("gender_preference", GENDER_PREFS, default="BOTH")}
+  {_radios("gender_preference", GENDER_PREFS)}
   <label>Marital Status</label>
-  {_radios("marital_status_preference", MARITAL_PREFS, default="ANY")}
+  {_radios("marital_status_preference", MARITAL_PREFS)}
   <label>English Level</label>
-  {_radios("english_level", ENGLISH_LEVELS, default="NO_NEED")}
+  {_radios("english_level", ENGLISH_LEVELS)}
   <label>Age Range <span class="hint">(optional)</span></label>
   <div class="row">
     <div><input name="age_min" inputmode="numeric" placeholder="Min age"></div>
@@ -673,6 +714,24 @@ document.getElementById('jobForm').addEventListener('submit', function(e){{
   var c=document.querySelector('[name=category_id]');
   if(!c.value){{ e.preventDefault(); cur=NAMES.indexOf('Skills & Languages'); render(); alert('Please select a job category'); }}
 }});
+
+// --- Experience & Salary conditional fields ---
+function picked(name){{ var el=document.querySelector('input[name="'+name+'"]:checked'); return el?el.value:''; }}
+function toggleEl(id,on){{ var e=document.getElementById(id); if(e) e.hidden=!on; }}
+function expChange(){{
+  var v=picked('experience_type');
+  toggleEl('expYears', v==='EXPERIENCED');   // year selectors only for Experienced
+  toggleEl('internBlock', v==='INTERN');     // intern payment only for Intern
+  toggleEl('salaryBlock', v!=='INTERN');     // salary shown by default; hidden for Intern
+}}
+function internChange(){{
+  var p=picked('intern_payment_type');
+  toggleEl('stipendInput', p==='STIPEND');
+  toggleEl('trainingInput', p==='TRAINING_FEE');
+}}
+[].forEach.call(document.querySelectorAll('input[name=experience_type]'), function(r){{ r.addEventListener('change', expChange); }});
+[].forEach.call(document.querySelectorAll('input[name=intern_payment_type]'), function(r){{ r.addEventListener('change', internChange); }});
+expChange(); internChange();
 render();
 </script>
 """

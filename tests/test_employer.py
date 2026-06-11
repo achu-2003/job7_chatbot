@@ -117,6 +117,33 @@ def test_post_job_form_is_a_sectioned_wizard():
         assert f'name="{nm}"' in out, nm
 
 
+def test_post_job_form_no_default_radio_and_conditional_blocks():
+    """No radio is pre-selected, and the Experience section carries the
+    conditional year / intern-payment blocks + toggle JS."""
+    out = _post_job_html("tok123", _JOB_OPTS)
+    assert " checked" not in out                            # nothing pre-selected
+    for nm in ("intern_payment_type", "intern_stipend", "training_fee",
+               "intern_duration_months"):
+        assert f'name="{nm}"' in out, nm
+    for block in ('id="expYears"', 'id="internBlock"', 'id="salaryBlock"',
+                  'id="stipendInput"', 'id="trainingInput"'):
+        assert block in out, block
+    assert "function expChange()" in out and "function internChange()" in out
+
+
+def test_build_job_record_intern_payment():
+    rec = build_job_record(employer_id="e1", form={
+        "title": "Design Intern", "experience_type": "intern",
+        "intern_payment_type": "training_fee", "training_fee": "25000",
+        "intern_duration_months": "6",
+    }, status="PENDING")
+    j = rec["private_jobs"]
+    assert j["experienceType"] == "INTERN"
+    assert j["internPaymentType"] == "TRAINING_FEE"
+    assert j["trainingFee"] == 25000 and j["internDurationMonths"] == 6
+    assert j["salaryMin"] is None                          # interns have no salary range
+
+
 def test_build_job_record_maps_all_private_jobs_columns():
     form = {
         "title": "Senior Welder", "description": "Weld things well.",
