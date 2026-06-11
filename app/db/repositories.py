@@ -202,30 +202,37 @@ class JobRepository:
     async def search_by_title(
         query: str, *, limit: int = 8, tenant_id: str | None = None
     ) -> list[dict[str, Any]]:
-        """Deterministic title match for a typed role ('welder' → Welder jobs).
-        Matches the whole phrase first; if nothing, OR-matches each word so a
-        multi-word query still finds something. Live openings only."""
-        words = [w for w in re.findall(r"[a-z0-9]+", (query or "").lower()) if len(w) >= 3]
+        """Deterministic free-text job search for a typed query. Splits the query
+        into WORDS and matches a live job if ANY word hits its TITLE, a required
+        SKILL, or its CATEGORY — so "welder" → Welder jobs, "python" → jobs needing
+        Python, and "python developer" → both. Ranked: exact-phrase title first,
+        then most skill matches, then a plain title-word hit, then recency."""
+        words = [w for w in re.findall(r"[a-z0-9]+", (query or "").lower()) if len(w) >= 2]
         if not words:
             return []
+        params: dict[str, Any] = {
+            "patterns": [f"%{w}%" for w in words],
+            "phrase": f"%{' '.join(words)}%",
+            "limit": limit,
+        }
+        tenant_sql = _tenant_clause("j", params, tenant_id)
+        skill_overlap = "(SELECT count(*) FROM unnest(j.skills) sk WHERE sk ILIKE ANY(:patterns))"
+        sql = text(
+            JobRepository._SELECT
+            + f"WHERE {JobRepository._LIVE}{tenant_sql} AND ("
+            "  j.title ILIKE ANY(:patterns) "
+            "  OR cat.name ILIKE ANY(:patterns) "
+            f"  OR {skill_overlap} > 0 "
+            ") "
+            "ORDER BY (CASE WHEN j.title ILIKE :phrase THEN 1 ELSE 0 END) DESC, "
+            f"         {skill_overlap} DESC, "
+            "         (CASE WHEN j.title ILIKE ANY(:patterns) THEN 1 ELSE 0 END) DESC, "
+            '         j."createdAt" DESC '
+            "LIMIT :limit"
+        )
         start = time.perf_counter()
         async with session_scope() as session:
-            for clause, params in (
-                ("j.title ILIKE :phrase", {"phrase": f"%{' '.join(words)}%"}),
-                (" OR ".join(f"j.title ILIKE :w{i}" for i in range(len(words))),
-                 {f"w{i}": f"%{w}%" for i, w in enumerate(words)}),
-            ):
-                p = dict(params, limit=limit)
-                tenant_sql = _tenant_clause("j", p, tenant_id)
-                sql = text(
-                    JobRepository._SELECT
-                    + f"WHERE {JobRepository._LIVE}{tenant_sql} AND ({clause}) "
-                    + 'ORDER BY j."createdAt" DESC LIMIT :limit'
-                )
-                res = await session.execute(sql, p)
-                rows = [dict(r._mapping) for r in res]
-                if rows:
-                    break
+            rows = [dict(r._mapping) for r in (await session.execute(sql, params)).fetchall()]
         SQL_LATENCY.labels(op="job_title_search").observe(time.perf_counter() - start)
         return rows
 
