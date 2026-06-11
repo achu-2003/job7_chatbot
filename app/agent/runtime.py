@@ -56,6 +56,7 @@ from app.mcp.tools import (
     get_job_core,
     list_category_jobs_core,
     list_jobs_overview_core,
+    recommend_by_skills_core,
     recommend_jobs_core,
     search_jobs_by_title_core,
 )
@@ -256,9 +257,11 @@ class AgentRuntime:
         self.validator = HallucinationValidator()
         # Injectable so tests can stub the job-board lookups without a DB.
         self._candidate_lookup = CandidateRepository.get
+        self._candidate_skills = CandidateRepository.skill_names
         self._category_browse = list_category_jobs_core
         self._jobs_overview = list_jobs_overview_core
         self._recommend = recommend_jobs_core
+        self._recommend_by_skills = recommend_by_skills_core
         self._job_lookup = get_job_core
         self._title_search = search_jobs_by_title_core
         self._list_candidates = JobSeekerRepository.list_candidates
@@ -707,16 +710,36 @@ class AgentRuntime:
         }
 
     async def _recommend_menu(self, state: AgentState) -> dict[str, Any]:
-        """Profile-based recommendations for the 'Recommended Jobs' button."""
-        role, location = await self._profile_pref(state)
-        try:
-            jobs = await self._recommend(
-                self.vector, tenant_id=state["tenant_id"],
-                role=role, location=location, limit=8,
-            )
-        except Exception as exc:  # noqa: BLE001 — never break the turn on a lookup miss
-            log.warning("menu_recommend_failed", error=str(exc)[:200])
-            jobs = []
+        """Recommendations for the 'Recommended Jobs' button. PRIMARY: jobs whose
+        required skills overlap the candidate's skills (best match first). FALLBACK
+        (no skills on file / nothing matches): their preferred role + location, then
+        the newest open jobs — so the button always shows something."""
+        jobs: list[dict[str, Any]] = []
+        phone = (state.get("customer_id") or "").strip()
+        if phone:
+            try:
+                skills = await self._candidate_skills(phone=phone)
+            except Exception as exc:  # noqa: BLE001 — a lookup miss must not break the turn
+                log.warning("candidate_skills_lookup_failed", error=str(exc)[:200])
+                skills = []
+            if skills:
+                try:
+                    jobs = await self._recommend_by_skills(
+                        tenant_id=state["tenant_id"], skill_names=skills, limit=8,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("skill_recommend_failed", error=str(exc)[:200])
+                    jobs = []
+        if not jobs:
+            role, location = await self._profile_pref(state)
+            try:
+                jobs = await self._recommend(
+                    self.vector, tenant_id=state["tenant_id"],
+                    role=role, location=location, limit=8,
+                )
+            except Exception as exc:  # noqa: BLE001 — never break the turn on a lookup miss
+                log.warning("menu_recommend_failed", error=str(exc)[:200])
+                jobs = []
         first = _first_name((state.get("customer_facts") or {}).get("full_name"))
         if not jobs:
             who = f", {first}" if first else ""

@@ -313,6 +313,30 @@ class JobRepository:
         total = sum(r["n"] for r in rows)
         return {"total": total, "categories": rows}
 
+    @staticmethod
+    async def recommend_by_skills(
+        *, skill_names: list[str], limit: int = 8, tenant_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Open jobs whose required ``skills`` overlap the candidate's skills,
+        ranked by how many skills match (most matches first). Case-insensitive.
+        Returns [] when the candidate has no skills or nothing overlaps."""
+        names = [s.strip().lower() for s in (skill_names or []) if s and s.strip()]
+        if not names:
+            return []
+        params: dict[str, Any] = {"skills": names, "limit": limit}
+        tenant_sql = _tenant_clause("j", params, tenant_id)
+        overlap = "(SELECT count(*) FROM unnest(j.skills) sk WHERE lower(sk) = ANY(:skills))"
+        sql = text(
+            JobRepository._SELECT
+            + f"WHERE {JobRepository._LIVE}{tenant_sql} "
+            + "AND EXISTS (SELECT 1 FROM unnest(j.skills) sk WHERE lower(sk) = ANY(:skills)) "
+            + f'ORDER BY {overlap} DESC, j."createdAt" DESC '
+            + "LIMIT :limit"
+        )
+        async with session_scope() as session:
+            rows = (await session.execute(sql, params)).fetchall()
+        return [dict(r._mapping) for r in rows]
+
 
 # ---------------------------------------------------------------
 # Candidates (read + scoped write) — built up conversationally
@@ -387,6 +411,23 @@ class CandidateRepository:
             )
             row = res.first()
             return dict(row._mapping) if row else None
+
+    @staticmethod
+    async def skill_names(*, phone: str) -> list[str]:
+        """The candidate's skill NAMES (from ``private_job_seeker_skills`` →
+        ``private_skills``), matched by phone. Used to recommend jobs whose
+        required skills overlap. Empty list when the number isn't registered or
+        has no skills on file."""
+        sql = text(
+            'SELECT DISTINCT sk.name FROM private_job_seekers js '
+            'JOIN private_job_seeker_skills jss ON jss."jobSeekerId" = js.id '
+            'JOIN private_skills sk ON sk.id = jss."skillId" '
+            "WHERE right(regexp_replace(js.phone, '\\D', '', 'g'), 10) "
+            "    = right(regexp_replace(:phone, '\\D', '', 'g'), 10)"
+        )
+        async with session_scope() as session:
+            rows = (await session.execute(sql, {"phone": phone})).fetchall()
+        return [r._mapping["name"] for r in rows]
 
 
 # ---------------------------------------------------------------

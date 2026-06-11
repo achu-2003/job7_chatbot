@@ -50,6 +50,8 @@ def _stub_memory(
     browse: dict | None = None,
     overview: dict | None = None,
     recommend: list | None = None,
+    candidate_skills: list | None = None,
+    skill_jobs: list | None = None,
     browse_state: dict | None = None,
     job_lookup: dict | None = None,
     apply_state: dict | None = None,
@@ -120,6 +122,12 @@ def _stub_memory(
 
     async def fake_recommend(*a, **kw):
         return recommend or []
+
+    async def fake_candidate_skills(**kw):
+        return candidate_skills or []
+
+    async def fake_recommend_by_skills(**kw):
+        return skill_jobs or []
 
     saved_calls: list = []
     applied_calls: list = []
@@ -192,6 +200,8 @@ def _stub_memory(
     rt._category_browse = fake_browse      # type: ignore[assignment]
     rt._jobs_overview = fake_overview      # type: ignore[assignment]
     rt._recommend = fake_recommend         # type: ignore[assignment]
+    rt._candidate_skills = fake_candidate_skills        # type: ignore[assignment]
+    rt._recommend_by_skills = fake_recommend_by_skills  # type: ignore[assignment]
     rt._job_lookup = fake_job_lookup       # type: ignore[assignment]
 
     async def fake_title_search(**kw):
@@ -782,6 +792,27 @@ async def test_recommended_jobs_button_lists_profile_matches():
     assert "Achuthan" in out["response"]
     assert "QA Engineer" in out["response"] and "Tester" in out["response"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
+
+
+async def test_recommended_jobs_prefers_skill_match():
+    """'Recommended Jobs' first recommends jobs whose skills overlap the
+    candidate's skills (skill match wins over the role/location fallback)."""
+    rt = _runtime()
+    _stub_memory(
+        rt, facts={"full_name": "Achuthan E"},
+        candidate_skills=["Python", "Django", "MySQL"],
+        skill_jobs=[{"job_ref": "j1", "title": "Software Developer", "location": "Chennai"},
+                    {"job_ref": "j2", "title": "Frontend Developer", "location": "Coimbatore"}],
+        recommend=[{"job_ref": "x9", "title": "SHOULD NOT APPEAR", "location": "Nowhere"}],
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Recommended Jobs")
+    interactive = out["whatsapp_interactive"]["interactive"]
+    ids = [r["id"] for r in interactive["action"]["sections"][0]["rows"]]
+    assert ids == ["view:j1", "view:j2"]                          # skill-matched jobs
+    assert "Software Developer" in out["response"]
+    assert "SHOULD NOT APPEAR" not in out["response"]             # role fallback NOT used
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
 async def test_tap_recommended_job_shows_single_card():

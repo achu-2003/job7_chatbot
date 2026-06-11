@@ -347,6 +347,17 @@ async def recommend_jobs_core(
     return [_compact_job(r) for r in rows]
 
 
+async def recommend_by_skills_core(
+    *, tenant_id: str, skill_names: list[str], limit: int = 8
+) -> list[dict[str, Any]]:
+    """Recommend open jobs whose required skills overlap the candidate's skills,
+    best matches first. Returns the compact job shape (empty when nothing matches)."""
+    rows = await JobRepository.recommend_by_skills(
+        skill_names=skill_names, limit=limit, tenant_id=tenant_id,
+    )
+    return [_compact_job(r) for r in rows]
+
+
 async def list_jobs_overview_core(*, tenant_id: str) -> dict[str, Any]:
     """A count + category menu of open jobs — the answer to "list all jobs" so
     the candidate can pick a category instead of getting a wall of postings."""
