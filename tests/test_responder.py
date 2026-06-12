@@ -57,6 +57,35 @@ async def test_application_status_is_reported_not_asked_for_identity():
     assert "email" not in out["draft_response"].lower()
 
 
+async def test_application_status_shows_job_details():
+    """The status reply is a rich card: title + status badge, company, location,
+    salary, applied date and a status note (not just 'Title — Status')."""
+    state = {
+        "inbound_text": "Application status",
+        "working": {"tool_results": [{
+            "tool": "get_application_status",
+            "result": {"found": True, "applications": [
+                {"job_title": "Staff Nurse", "status": "PENDING", "company": "SMV TECHPARK",
+                 "location": "Tirupattur", "salary_min": 20000, "salary_max": 32000,
+                 "salary_period": "MONTHLY", "created_at": "2026-06-12T11:21:59"},
+            ]},
+        }]},
+        "short_term": [], "cached_product": {},
+    }
+    out = await respond(
+        state, llm=_CannedLLM("(should not be used)"),
+        validator=HallucinationValidator(), memory_context=None,
+    )
+    r = out["draft_response"]
+    assert out.get("single_bubble") is True                   # whole list as one bubble
+    assert "Staff Nurse" in r and "Pending" in r
+    assert "SMV TECHPARK" in r and "Tirupattur" in r          # company + location
+    assert "20,000" in r and "32,000" in r                    # salary range
+    assert "Applied 12 Jun" in r                              # applied date
+    assert "ㅤ" in r                                           # gap line between apps (survives humanizer)
+    assert "   " not in r                                      # no ugly 3-space indent
+
+
 async def test_apply_confirmation_hands_over_jobs7_app_link():
     # When submit_application returns the Jobs7 app link, the responder formats
     # it deterministically (no LLM, never asks for email) and attaches a tappable

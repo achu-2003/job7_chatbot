@@ -55,6 +55,12 @@ class ConversationMemory:
         ok = await self._redis.set(f"seen:{key}", "1", nx=True, ex=ttl)
         return bool(ok)
 
+    async def clear_seen(self, key: str) -> None:
+        """Release a ``mark_seen`` claim (used to undo an idempotency lock when the
+        guarded operation failed, so a genuine retry can proceed)."""
+        assert self._redis is not None
+        await self._redis.delete(f"seen:{key}")
+
     # ------------------------------------------------------------------
     # key builders — always tenant-scoped
     # ------------------------------------------------------------------

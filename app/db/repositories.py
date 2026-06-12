@@ -17,6 +17,7 @@ candidate can only ever read or write their own records.
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 import uuid
@@ -436,6 +437,25 @@ class CandidateRepository:
             rows = (await session.execute(sql, {"phone": phone})).fetchall()
         return [r._mapping["name"] for r in rows]
 
+    @staticmethod
+    async def application_ids(*, phone: str) -> dict[str, str] | None:
+        """The LIVE ``(jobSeekerId, profileId)`` for a phone — needed to write an
+        application with FK-valid ids. The Redis-staged registration may carry
+        placeholder cuids (or ids from a since-superseded registration), so the
+        application must reference the real job-board rows. None if not registered.
+        """
+        sql = text(
+            'SELECT js.id AS "jobSeekerId", p.id AS "profileId" '
+            'FROM private_job_seekers js '
+            'LEFT JOIN job_seeker_profiles p ON p."jobSeekerId" = js.id '
+            "WHERE right(regexp_replace(js.phone, '\\D', '', 'g'), 10) "
+            "    = right(regexp_replace(:phone, '\\D', '', 'g'), 10) "
+            'ORDER BY p."createdAt" NULLS LAST LIMIT 1'
+        )
+        async with session_scope() as session:
+            row = (await session.execute(sql, {"phone": phone})).first()
+        return dict(row._mapping) if row else None
+
 
 # ---------------------------------------------------------------
 # Applications (read + scoped, idempotent write)
@@ -488,6 +508,52 @@ class ApplicationRepository:
         return row, created
 
     @staticmethod
+    async def create(payload: dict[str, Any], *, commit: bool = True) -> dict[str, Any]:
+        """Write the candidate's application to the live job board
+        (``private_job_applications``).
+
+        IDEMPOTENT: the table has a UNIQUE ``(jobId, profileId)``, so re-applying
+        to the same job is a NO-OP (``ON CONFLICT DO NOTHING``) — the first
+        application and any employer status change on it are preserved, and a
+        double-tap never errors or duplicates. ``commit=False`` is a DRY RUN
+        (insert + rollback, exercising every type / enum / FK constraint).
+        ``status`` / ``appliedAt`` have DB defaults; ``updatedAt`` is set to now().
+        """
+        app = payload.get("application", payload)
+        sa = app.get("screeningAnswers")
+        params = {
+            "id": app["id"],
+            "jobId": app.get("jobId"),
+            "jobSeekerId": app.get("jobSeekerId"),
+            "profileId": app.get("profileId"),
+            "resume": app.get("resume"),
+            "coverLetter": app.get("coverLetter"),
+            "screeningAnswers": json.dumps(sa) if isinstance(sa, (dict, list)) else None,
+            "status": (app.get("status") or "PENDING"),
+        }
+        sql = text(
+            'INSERT INTO private_job_applications '
+            '("id","jobId","jobSeekerId","profileId","resume","coverLetter",'
+            '"screeningAnswers","status","appliedAt","updatedAt") '
+            "VALUES (:id,:jobId,:jobSeekerId,:profileId,:resume,:coverLetter,"
+            'CAST(:screeningAnswers AS jsonb),CAST(:status AS "Status"), now(), now()) '
+            'ON CONFLICT ("jobId","profileId") DO NOTHING '
+            "RETURNING id"
+        )
+        start = time.perf_counter()
+        async with get_engine().connect() as conn:
+            trans = await conn.begin()
+            try:
+                res = await conn.execute(sql, params)
+                inserted = res.first() is not None      # None when the conflict skipped it
+                await (trans.commit() if commit else trans.rollback())
+            except Exception:
+                await trans.rollback()
+                raise
+        SQL_LATENCY.labels(op="application_create").observe(time.perf_counter() - start)
+        return {"committed": commit, "application_id": app["id"], "inserted": inserted}
+
+    @staticmethod
     async def get_by_ref(
         app_ref: str,
         *,
@@ -535,10 +601,17 @@ class ApplicationRepository:
             SELECT
                 a.id AS app_ref, a.status::text AS status,
                 a."appliedAt" AS created_at,
+                a."viewedAt" AS viewed_at, a."shortlistedAt" AS shortlisted_at,
                 j.slug AS job_ref, j.title AS job_title,
-                j."locationDetails" AS location
+                COALESCE(d.name, j."locationDetails") AS location,
+                c.name AS company,
+                j."salaryMin" AS salary_min, j."salaryMax" AS salary_max,
+                j."salaryPeriod"::text AS salary_period,
+                j."jobType"::text AS job_type
             FROM private_job_applications a
             JOIN private_jobs j ON j.id = a."jobId"
+            LEFT JOIN private_companies c ON c.id = j."companyId"
+            LEFT JOIN districts d ON d.id = j."districtId"
             WHERE a."jobSeekerId" = :cid
             ORDER BY a."appliedAt" DESC
             LIMIT :limit

@@ -2,6 +2,7 @@
 .env
 .env.local
 .env.*.local
+.env.native
 
 # Python
 __pycache__/
@@ -12,16 +13,15 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# Data dirs (local chroma store etc.)
+# Data dirs (local qdrant/chroma store etc.)
 data/
 *.sqlite3
+
+# Uploaded files (candidate resumes etc.) — never commit user uploads
+uploads/
 
 # Editor
 .vscode/
 .idea/
 *.swp
 .DS_Store
-.env.example
-.env.example
-.env.native
-.env

@@ -29,7 +29,12 @@ from app.api.deps import get_memory
 from app.chatbot import wa_format as wa
 from app.config import get_settings
 from app.core.logging import get_logger
-from app.db.repositories import JobSeekerRepository, LookupRepository
+from app.db.repositories import (
+    ApplicationRepository,
+    CandidateRepository,
+    JobSeekerRepository,
+    LookupRepository,
+)
 from app.onboarding import build_application_record, prepare_registration
 from app.whatsapp import delivery as wa_delivery
 
@@ -69,6 +74,29 @@ async def _register_with_retry(payload: dict[str, Any], *, tries: int = 3) -> di
             raise
     assert last is not None
     raise last
+
+
+async def _write_application_live(
+    tenant_id: str, phone: str, job: dict[str, Any], built: dict[str, Any]
+) -> None:
+    """Persist an application (incl. the uploaded resume) to the live
+    private_job_applications. Resolves the real jobSeekerId/profileId by phone
+    (the staged registration ids may not be the live rows). Idempotent + best-
+    effort — an error never fails the resume upload."""
+    app = built.get("application") or {}
+    try:
+        ids = await CandidateRepository.application_ids(phone=phone)
+        if not (ids or {}).get("jobSeekerId"):
+            log.info("apply_resume_db_skipped_no_live_seeker", phone=phone[-10:])
+            return
+        app["jobId"] = job["id"]
+        app["jobSeekerId"] = ids["jobSeekerId"]
+        app["profileId"] = ids.get("profileId")
+        res = await ApplicationRepository.create(built, commit=True)
+        log.info("apply_resume_db_written", inserted=res["inserted"],
+                 application_id=res["application_id"], has_resume=bool(app.get("resume")))
+    except Exception as exc:  # noqa: BLE001 — never fail the upload on a DB error
+        log.error("apply_resume_db_write_failed", error=str(exc)[:300])
 
 
 async def _save_resume_upload(upload: Any, token: str) -> str:
@@ -240,12 +268,35 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
     # Write to the LIVE job board only when explicitly enabled (REGISTER_IN_DB).
     # A DB failure is logged but never fails the form — the Redis copy still holds
     # (and the seeker is treated as registered via the Redis gate either way).
+    #
+    # IDEMPOTENCY: the form can be slow, so candidates double-tap Submit. Two
+    # guards stop duplicate private_job_seekers rows: (1) an ATOMIC NX lock keyed
+    # by phone so only the FIRST of N concurrent/duplicate submits writes, and
+    # (2) a "already on the job board?" check so a re-registration is a no-op.
     if payload is not None and get_settings().register_in_db:
-        try:
-            res = await _register_with_retry(payload)
-            log.info("registration_db_written", seeker_id=res["seeker_id"], children=res["children"])
-        except Exception as exc:  # noqa: BLE001
-            log.error("registration_db_write_failed", error=str(exc)[:300])
+        phone_key = re.sub(r"\D", "", identity.get("customer_id") or "")
+        lock = f"onboard_db:{phone_key or identity['conversation_id']}"
+        if await memory.mark_seen(lock, ttl=120):
+            try:
+                existing = await CandidateRepository.get(
+                    tenant_id=identity["tenant_id"], phone=identity.get("customer_id") or ""
+                )
+            except Exception as exc:  # noqa: BLE001 — a blip must not block the write
+                log.warning("registration_dup_check_failed", error=str(exc)[:200])
+                existing = None
+            if existing:
+                log.info("registration_db_already_exists_skipped", phone=phone_key)
+            else:
+                try:
+                    res = await _register_with_retry(payload)
+                    log.info("registration_db_written",
+                             seeker_id=res["seeker_id"], children=res["children"])
+                except Exception as exc:  # noqa: BLE001
+                    log.error("registration_db_write_failed", error=str(exc)[:300])
+                    # write failed → release the lock so a genuine retry can write
+                    await memory.clear_seen(lock)
+        else:
+            log.info("registration_db_duplicate_submit_skipped", phone=phone_key)
 
     settings = get_settings()
     # PROACTIVELY push the "registration successful" message + the seeker hub to
@@ -323,6 +374,11 @@ async def resume_submit(request: Request) -> HTMLResponse:
             await memory.clear_apply_state(conv, tenant_id=tid)
         except Exception as exc:  # noqa: BLE001 — staging must not 500 the upload
             log.warning("apply_resume_finalize_failed", error=str(exc)[:200])
+            built = None
+        # LIVE write (flag-gated): persist the application + uploaded resume to
+        # private_job_applications, with the real live jobSeekerId/profileId.
+        if built and job.get("id") and get_settings().register_in_db:
+            await _write_application_live(tid, re.sub(r"\D", "", conv), job, built)
         push_body = (
             f"✅ Resume received — you've applied to {title}! Our team will review "
             "your profile and get back to you."
@@ -622,9 +678,18 @@ function valid(step){
   });
   return ok;
 }
-function advance(){ if(cur===steps.length-1) document.getElementById("profForm").submit(); else show(cur+1); }
-document.getElementById("nextBtn").addEventListener("click", function(){ if(valid(steps[cur])) advance(); });
-document.getElementById("skipBtn").addEventListener("click", advance);
+var submitting = false;
+function advance(){
+  if(cur===steps.length-1){
+    if(submitting) return;                       // guard against double-submit
+    submitting = true;
+    var nb=document.getElementById("nextBtn"); nb.disabled=true; nb.textContent="Submitting…";
+    var sb=document.getElementById("skipBtn"); if(sb){ sb.style.pointerEvents="none"; sb.style.opacity=".5"; }
+    document.getElementById("profForm").submit();
+  } else show(cur+1);
+}
+document.getElementById("nextBtn").addEventListener("click", function(){ if(!submitting && valid(steps[cur])) advance(); });
+document.getElementById("skipBtn").addEventListener("click", function(){ if(!submitting) advance(); });
 document.getElementById("backBtn").addEventListener("click", function(){ if(cur>0) show(cur-1); });
 show(0);
 """

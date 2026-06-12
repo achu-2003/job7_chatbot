@@ -60,6 +60,7 @@ def _stub_memory(
     employer: dict | None = None,
     candidates: list | None = None,
     search_results: list | None = None,
+    application_ids: dict | None = None,
 ) -> None:
     # Default to a fully-onboarded sender so the identity gate is a no-op and the
     # reasoning tests below exercise the normal path. Onboarding tests pass
@@ -230,11 +231,24 @@ def _stub_memory(
     async def fake_search_candidates(*, query, **kw):
         return search_results if search_results is not None else (candidates or [])
 
+    # ---- live application write (private_job_applications) ----
+    app_db_calls: list = []
+
+    async def fake_application_ids(**kw):
+        return application_ids
+
+    async def fake_create_application(payload, **kw):
+        app_db_calls.append(payload)
+        return {"committed": True, "application_id": payload["application"]["id"], "inserted": True}
+
     rt.gateway.employer = fake_employer            # type: ignore[assignment]
     rt.gateway.employer_token = fake_employer_token  # type: ignore[assignment]
     rt.gateway.update_employer = fake_update_employer  # type: ignore[assignment]
     rt._list_candidates = fake_list_candidates     # type: ignore[assignment]
     rt._search_candidates = fake_search_candidates  # type: ignore[assignment]
+    rt._application_ids = fake_application_ids      # type: ignore[assignment]
+    rt._create_application = fake_create_application  # type: ignore[assignment]
+    rt._test_app_db = app_db_calls                 # type: ignore[attr-defined]
 
     # expose action-call logs for assertions
     rt._test_saved = saved_calls           # type: ignore[attr-defined]
@@ -1091,6 +1105,66 @@ async def test_tap_save_adds_to_saved_list():
 
 _REG = {"private_job_seekers": {"id": "seeker1"}, "job_seeker_profiles": {"id": "profile1"}}
 _JOB = {"id": "job-db-1", "job_ref": "r1", "title": "Backend Developer"}
+
+
+async def test_apply_writes_application_to_live_db_with_resume(monkeypatch):
+    """When live writes are on, finalizing an apply persists the application —
+    incl. the uploaded resume — to private_job_applications, using the REAL live
+    jobSeekerId/profileId (resolved by phone, not the staged-registration ids)."""
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "register_in_db", True)
+    rt = _runtime()
+    _stub_memory(
+        rt, registration=_REG, job_lookup=_JOB,
+        application_ids={"jobSeekerId": "live-seeker-9", "profileId": "live-profile-9"},
+        apply_state={"job_ref": "r1", "job_title": "Backend Developer", "job": _JOB,
+                     "pending": ["resume"], "answers": {}},
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "https://cv/me.pdf")              # resume link finalizes
+    assert rt._test_app_db, "application not written to live DB"   # type: ignore[attr-defined]
+    app = rt._test_app_db[0]["application"]                        # type: ignore[attr-defined]
+    assert app["jobId"] == "job-db-1"
+    assert app["jobSeekerId"] == "live-seeker-9" and app["profileId"] == "live-profile-9"
+    assert app["resume"] == "https://cv/me.pdf" and app["status"] == "PENDING"
+    assert "applied" in out["response"].lower()
+
+
+async def test_apply_no_live_write_when_flag_off(monkeypatch):
+    """With register_in_db off, the apply stays Redis-only — no
+    private_job_applications write."""
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "register_in_db", False)
+    rt = _runtime()
+    _stub_memory(
+        rt, registration=_REG, job_lookup=_JOB,
+        application_ids={"jobSeekerId": "live-seeker-9", "profileId": "live-profile-9"},
+        apply_state={"job_ref": "r1", "job_title": "Backend Developer", "job": _JOB,
+                     "pending": ["resume"], "answers": {}},
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    await _handle(rt, "https://cv/me.pdf")
+    assert rt._test_app_db == []                              # type: ignore[attr-defined]
+
+
+async def test_apply_skips_live_write_when_no_live_seeker(monkeypatch):
+    """If the phone isn't found in the live job board, the application write is
+    skipped (can't satisfy the FK) — the Redis copy still holds."""
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "register_in_db", True)
+    rt = _runtime()
+    _stub_memory(
+        rt, registration=_REG, job_lookup=_JOB, application_ids=None,   # not in live DB
+        apply_state={"job_ref": "r1", "job_title": "Backend Developer", "job": _JOB,
+                     "pending": ["resume"], "answers": {}},
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "https://cv/me.pdf")
+    assert rt._test_app_db == []                              # type: ignore[attr-defined]
+    assert "applied" in out["response"].lower()              # apply still confirmed
 
 
 async def test_apply_asks_for_missing_details_first():

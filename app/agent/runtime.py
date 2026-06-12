@@ -45,7 +45,7 @@ from app.agent.state import AgentState
 from app.chatbot import wa_format as wa
 from app.chatbot.memory import ConversationMemory
 from app.chatbot.validator import HallucinationValidator
-from app.db.repositories import CandidateRepository, JobSeekerRepository
+from app.db.repositories import ApplicationRepository, CandidateRepository, JobSeekerRepository
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.core.metrics import AGENT_LOOPS
@@ -271,6 +271,8 @@ class AgentRuntime:
         self._job_lookup = get_job_core
         self._title_search = search_jobs_by_title_core
         self._list_candidates = JobSeekerRepository.list_candidates
+        self._application_ids = CandidateRepository.application_ids
+        self._create_application = ApplicationRepository.create
         self._search_candidates = JobSeekerRepository.search_candidates
         self._graph = self._build_graph()
 
@@ -562,7 +564,8 @@ class AgentRuntime:
         self, state: AgentState, ref: str, job: dict[str, Any],
         reg: dict[str, Any], answers: dict[str, Any],
     ) -> dict[str, Any]:
-        """Build + stage the application record (Redis only) and confirm."""
+        """Build + stage the application (Redis) and, when live writes are on,
+        also persist it (incl. the uploaded resume) to private_job_applications."""
         built = onboarding.build_application_record(registration=reg, job=job, answers=answers)
         title = job.get("title") or "the role"
         kw = {"tenant_id": state["tenant_id"], "conversation_id": state["conversation_id"]}
@@ -572,10 +575,37 @@ class AgentRuntime:
                 await self.gateway.update_registration_profile(fields=built["profile_update"], **kw)
         except Exception as exc:  # noqa: BLE001 — staging must not 500 the turn
             log.warning("apply_stage_failed", error=str(exc)[:200])
+        await self._write_application_live(state, built, job)
         return _apply_reply(
             f"✅ Applied to {title}! Our team will review your profile and get back "
             "to you. Anything else I can help with?"
         )
+
+    async def _write_application_live(
+        self, state: AgentState, built: dict[str, Any], job: dict[str, Any]
+    ) -> None:
+        """Write the application to the LIVE private_job_applications (flag-gated).
+        Resolves the real jobSeekerId/profileId by phone (the staged registration
+        ids may not be the live rows). Idempotent (ON CONFLICT) + best-effort."""
+        if not get_settings().register_in_db:
+            return
+        app = built.get("application") or {}
+        if not job.get("id"):
+            return
+        phone = (state.get("customer_id") or "").strip()
+        try:
+            ids = await self._application_ids(phone=phone)
+            if not (ids or {}).get("jobSeekerId"):
+                log.info("application_db_skipped_no_live_seeker", phone=phone[-10:])
+                return
+            app["jobId"] = job["id"]
+            app["jobSeekerId"] = ids["jobSeekerId"]
+            app["profileId"] = ids.get("profileId")
+            res = await self._create_application(built, commit=True)
+            log.info("application_db_written", inserted=res["inserted"],
+                     application_id=res["application_id"], has_resume=bool(app.get("resume")))
+        except Exception as exc:  # noqa: BLE001 — never break the turn on a DB error
+            log.error("application_db_write_failed", error=str(exc)[:300])
 
     async def _registration(self, state: AgentState) -> dict[str, Any] | None:
         try:

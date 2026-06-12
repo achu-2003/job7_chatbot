@@ -73,7 +73,9 @@ async def respond(
     direct = _application_status_reply(results)
     if direct is not None:
         conv.note("respond", f"app-status {len(direct)} chars")
-        return {"draft_response": direct, "used_llm": False}
+        # single_bubble: the whole status list must arrive as ONE bubble — never
+        # chunked at the small per-bubble char cap (which split it mid-card).
+        return {"draft_response": direct, "used_llm": False, "single_bubble": True}
 
     # Apply confirmation: the candidate is identified and confirmed a real role,
     # so submit_application returned the Jobs7 app link. Format it ourselves (the
@@ -199,12 +201,84 @@ def _application_status_reply(results: list[dict[str, Any]]) -> str | None:
     if not apps:
         return "You don't have any applications on record yet. Want me to find you some jobs?"
 
-    lines = []
+    # A blank line ("") becomes a "\n\n" paragraph break that the humanizer strips
+    # + re-merges away, so apps end up packed together. A Hangul-filler line renders
+    # as a blank line WhatsApp keeps — giving a clear gap between applications.
+    # Lines start at the margin (no indent) and are kept short so they don't wrap.
+    gap = "ㅤ"
+    lines = [f"*📋 Your Applications ({len(apps)})*"]
     for a in apps[:5]:
         title = a.get("job_title") or a.get("job_ref") or "a role"
-        status = str(a.get("status") or "submitted").replace("_", " ").title()
-        lines.append(f"• {title} — {status}")
+        status_raw = str(a.get("status") or "PENDING")
+        status = status_raw.replace("_", " ").title()
+        lines.append(gap)                                        # spacer before each app
+        lines.append(f"{_status_badge(status_raw)} *{title}* — {status}")
+        loc = " · ".join(x for x in (a.get("company"), a.get("location")) if x)
+        if loc:
+            lines.append(f"🏢 {loc}")
+        salary = _app_salary(a)
+        if salary:
+            lines.append(f"💰 {salary}")
+        applied = _fmt_app_date(a.get("created_at"))
+        if applied:
+            lines.append(f"📅 Applied {applied}")
+        note = _status_note(status_raw)                          # only for progress statuses
+        if note:
+            lines.append(note)
     return "\n".join(lines)
+
+
+def _status_badge(status: str) -> str:
+    return {
+        "PENDING": "⏳", "VIEWED": "👀", "SHORTLISTED": "⭐",
+        "INTERVIEW_SCHEDULED": "📅", "INTERVIEWED": "🎤",
+        "SELECTED": "✅", "APPROVED": "✅", "REJECTED": "❌",
+        "ACTIVE": "🟢", "INACTIVE": "⚪",
+    }.get((status or "").upper(), "•")
+
+
+def _status_note(status: str) -> str | None:
+    """A short note only for PROGRESS statuses — Pending/Viewed need none (the
+    badge + label already say it), keeping those cards compact."""
+    return {
+        "SHORTLISTED": "⭐ You've been shortlisted!",
+        "INTERVIEW_SCHEDULED": "📅 Interview scheduled",
+        "INTERVIEWED": "🎤 Interview done",
+        "SELECTED": "🎉 You've been selected!",
+        "REJECTED": "Not selected this time",
+    }.get((status or "").upper())
+
+
+def _app_salary(a: dict[str, Any]) -> str | None:
+    lo, hi = a.get("salary_min"), a.get("salary_max")
+    period = (a.get("salary_period") or "MONTHLY").lower()
+    per = {"monthly": "/month", "yearly": "/year", "daily": "/day", "hourly": "/hr"}.get(period, "")
+
+    def _fmt(n: Any) -> str | None:
+        try:
+            return f"₹{float(n):,.0f}"
+        except (TypeError, ValueError):
+            return None
+
+    lo_s, hi_s = _fmt(lo), _fmt(hi)
+    if lo_s and hi_s:
+        return f"{lo_s}–{hi_s}{per}" if lo_s != hi_s else f"{lo_s}{per}"
+    if lo_s:
+        return f"{lo_s}+{per}"
+    return None
+
+
+def _fmt_app_date(value: Any) -> str | None:
+    """'12 Jun' from a datetime / ISO string / date — None if unparseable."""
+    if not value:
+        return None
+    try:
+        from datetime import datetime
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value.replace("Z", "+00:00")[:19])
+        return value.strftime("%d %b")
+    except (ValueError, TypeError):
+        return None
 
 
 def _first_name(name: str | None) -> str:
