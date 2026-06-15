@@ -20,6 +20,10 @@ data/
 # Uploaded files (candidate resumes etc.) — never commit user uploads
 uploads/
 
+# Redis/Memurai artifacts (written to cwd when run from the project folder)
+*.rdb
+memurai-log.txt
+
 # Editor
 .vscode/
 .idea/

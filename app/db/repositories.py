@@ -969,3 +969,33 @@ class JobPostRepository:
                 raise
         SQL_LATENCY.labels(op="job_post").observe(time.perf_counter() - start)
         return {"committed": commit, "job_id": job["id"]}
+
+
+# ---------------------------------------------------------------
+# Employer credit wallet — READ-ONLY (live billing balance)
+# ---------------------------------------------------------------
+
+
+class CreditWalletRepository:
+    """READ-ONLY access to the live ``credit_wallets`` balance.
+
+    The employer flow debits a Redis-mirrored wallet (test harness), but the
+    *starting* balance ('Have' on the Activate screen) is the employer's real
+    job-credit balance from the live billing table. Read-only: we never write to
+    credit_wallets / credit_ledger here.
+    """
+
+    @staticmethod
+    async def job_credit_balance(employer_id: str | None) -> int | None:
+        """The employer's live ``jobCredits`` balance, or None if they have no
+        wallet (e.g. a Redis-only test employer whose id isn't in the DB)."""
+        if not employer_id:
+            return None
+        sql = text('SELECT "jobCredits" FROM credit_wallets WHERE "employerId" = :eid LIMIT 1')
+        try:
+            async with session_scope() as session:
+                row = (await session.execute(sql, {"eid": employer_id})).first()
+        except Exception as exc:  # noqa: BLE001 — a billing-read miss must not break posting
+            log.warning("job_credit_balance_failed", error=str(exc)[:200])
+            return None
+        return int(row._mapping["jobCredits"]) if row else None

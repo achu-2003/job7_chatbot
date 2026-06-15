@@ -18,6 +18,7 @@ step's prompt/menu back to WhatsApp so the chat continues without typing.
 from __future__ import annotations
 
 import html
+import json
 import re
 from typing import Any
 from urllib.parse import parse_qs
@@ -29,7 +30,14 @@ from app.api.deps import get_memory
 from app.chatbot import wa_format as wa
 from app.config import get_settings
 from app.core.logging import get_logger
-from app.db.repositories import LookupRepository
+from app.credits import (
+    JOB_CREDIT_PRICE,
+    VALIDITY_OPTIONS,
+    WELCOME_JOB_CREDITS,
+    credit_quote,
+    credits_required,
+)
+from app.db.repositories import CreditWalletRepository, LookupRepository
 from app.employer import (
     APPLY_MODES,
     COMPANY_SIZES,
@@ -43,6 +51,7 @@ from app.employer import (
     build_employer_record,
     build_job_record,
 )
+from app.validation import validate_employer, validate_job_post, validate_kyc
 from app.whatsapp import delivery as wa_delivery
 
 router = APIRouter()
@@ -67,6 +76,13 @@ async def _reg_options() -> dict[str, list[dict[str, Any]]]:
 async def _job_options() -> dict[str, list[dict[str, Any]]]:
     kinds = ("categories", "districts", "states")
     return {k: await LookupRepository.options(k) for k in kinds}
+
+
+def _district_names(ids: list[str], *, opts: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """Map selected candidate-district ids → their display names (for the Activate
+    screen header). Unknown ids fall back to the id so the count is never wrong."""
+    by_id = {str(d.get("id")): d.get("name") for d in (opts.get("districts") or [])}
+    return [by_id.get(str(i)) or str(i) for i in ids]
 
 
 # ---------------------------------------------------------------------------
@@ -115,16 +131,15 @@ async def register_submit(request: Request) -> HTMLResponse:
         "pincode": one("pincode"),
         "description": one("description"),
     }
-    # District is REQUIRED — it becomes the job's location fallback (private_jobs
-    # .districtId is NOT NULL), so an employer must have one. Re-show the form on a
-    # bypass of the client-side check.
-    if not form["company_name"] or not form["district_id"]:
+    # SERVER-SIDE VALIDATION: company name + district required (district is the
+    # job-location fallback — private_jobs.districtId is NOT NULL), email/website/
+    # PIN validated when filled. Re-show the form with the error on any failure.
+    errors = validate_employer(form)
+    if errors:
         opts = await _reg_options()
         return HTMLResponse(
-            _register_html(
-                token, identity.get("customer_id") or "", opts,
-                error="Please fill the required fields — company name, state and district.",
-            ),
+            _register_html(token, identity.get("customer_id") or "", opts,
+                           error=next(iter(errors.values()))),
             status_code=400,
         )
     record = build_employer_record(identity=identity, form=form)
@@ -185,6 +200,18 @@ async def kyc_submit(request: Request) -> HTMLResponse:
     record = await memory.get_employer(phone, tenant_id=identity["tenant_id"])
     if not record:
         return HTMLResponse(_expired_html(), status_code=404)
+
+    # SERVER-SIDE VALIDATION: a document type + link are required; GST/PAN
+    # validated when filled. Re-show the KYC form with the error.
+    kyc_form_data = {
+        "kyc_document_type": one("kyc_document_type"),
+        "kyc_document_url": one("kyc_document_url"),
+        "gst_number": one("gst_number"),
+        "pan_number": one("pan_number"),
+    }
+    errors = validate_kyc(kyc_form_data)
+    if errors:
+        return HTMLResponse(_kyc_html(token, error=next(iter(errors.values()))), status_code=400)
 
     settings = get_settings()
     apply_kyc(
@@ -314,22 +341,103 @@ async def post_job_submit(request: Request) -> HTMLResponse:
     # private_jobs.districtId is NOT NULL, but a Remote job (or any unset pick)
     # has no district — fall back to the employer's registered district so the
     # row is always storable. The job stays flagged Remote via jobLocationType.
-    if not form.get("district_id"):
+    # NB: never backfill for a Specific Location — there the district is the
+    # employer's explicit choice and a blank one must fail validation, not be
+    # silently replaced by the company district.
+    if form["job_location_type"] != "SPECIFIC" and not form.get("district_id"):
         form["district_id"] = pe.get("districtId") or ""
 
-    # Build the DB-ready private_jobs record (status PENDING — awaiting approval)
-    # and stage it on the employer's Redis record. No live private_jobs write yet.
-    job = build_job_record(employer_id=employer_id, form=form, status="PENDING")
-    record = await memory.add_employer_job(phone, job, tenant_id=identity["tenant_id"])
-    if record is None:
+    # SERVER-SIDE VALIDATION: title required; salaries / vacancies / contacts /
+    # intern amounts validated (and salary max ≥ min). Re-show the wizard on error.
+    errors = validate_job_post(form)
+    if errors:
+        opts = await _job_options()
+        return HTMLResponse(
+            _post_job_html(token, opts, company_address=_company_address(employer),
+                           company_district_id=pe.get("districtId") or "",
+                           error=next(iter(errors.values()))),
+            status_code=400,
+        )
+
+    # Build the DB-ready private_jobs record (status DRAFT — not posted until the
+    # employer activates it with credits) and stage it as a draft keyed by token.
+    # No live private_jobs write. The job is finalized on /post-job/activate.
+    job = build_job_record(employer_id=employer_id, form=form, status="DRAFT")
+    await memory.stage_job_draft(token, job)
+
+    # 'Have' = the employer's REAL live job-credit balance, mirrored into Redis on
+    # first read (then debited there). New/test employers with no live wallet get
+    # the welcome grant. Reading live billing is safe (read-only).
+    live = await CreditWalletRepository.job_credit_balance(employer_id)
+    seed = live if live is not None else WELCOME_JOB_CREDITS
+    have = await memory.ensure_job_credits(phone, tenant_id=identity["tenant_id"], seed=seed)
+
+    district_names = _district_names(form.get("preferred_district_ids") or [], opts=await _job_options())
+    return HTMLResponse(_activate_job_html(
+        token, title=title, district_names=district_names, have=have,
+    ))
+
+
+@router.post("/post-job/activate", response_class=HTMLResponse)
+async def post_job_activate(request: Request) -> HTMLResponse:
+    """Finalize a staged job draft: charge job credits (Redis-mirrored wallet) for
+    (#districts × validity multiplier), then 'post' it (stage on the employer
+    record) and push the menu back to WhatsApp. If the wallet is short, the
+    Activate page only reaches here via 'Pay & Activate', which simulates buying
+    the shortfall (no real payment / no live billing write)."""
+    raw = parse_qs((await request.body()).decode("utf-8"))
+
+    def one(key: str) -> str:
+        v = raw.get(key) or []
+        return v[0].strip() if v else ""
+
+    token = one("token")
+    if not token:
+        return HTMLResponse(_expired_html(), status_code=400)
+    memory = get_memory(request)
+    identity = await memory.get_employer_identity(token)
+    if not identity:
+        return HTMLResponse(_expired_html(), status_code=404)
+    phone = identity.get("customer_id") or ""
+    tenant_id = identity["tenant_id"]
+
+    job = await memory.get_job_draft(token)
+    if job is None:
         return HTMLResponse(_expired_html(), status_code=404)
 
+    # Validity (15/30/45) → multiplier; credits = #districts × multiplier.
+    valid_days = {str(d) for d, _ in VALIDITY_OPTIONS}
+    validity = one("validity_days")
+    if validity not in valid_days:
+        validity = str(VALIDITY_OPTIONS[0][0])
+    districts = (job.get("private_jobs") or {}).get("preferredDistrictIds") or []
+    need = credits_required(len(districts), validity)
+
+    have = int((await memory.get_employer(phone, tenant_id=tenant_id) or {}).get("walletJobCredits") or 0)
+    quote = credit_quote(have, need)
+    # 'Pay & Activate' path: simulate buying the shortfall into the Redis wallet.
+    if not quote["sufficient"]:
+        await memory.adjust_job_credits(phone, quote["buy"], tenant_id=tenant_id)
+    # Debit the credits the post costs.
+    await memory.adjust_job_credits(phone, -need, tenant_id=tenant_id)
+
+    # Finalize: stamp validity + the credits charged, flip to PENDING (posted,
+    # awaiting board approval), and append to the employer's jobs.
+    job["private_jobs"]["status"] = "PENDING"
+    job["private_jobs"]["validityDays"] = int(validity)
+    job["creditsCharged"] = need
+    job["validityDays"] = int(validity)
+    await memory.add_employer_job(phone, job, tenant_id=tenant_id)
+    await memory.clear_job_draft(token)
+
+    title = (job.get("private_jobs") or {}).get("title") or "your job"
     settings = get_settings()
     digits = re.sub(r"\D", "", phone)
     if digits:
         body = (
-            f"✅ Job posted: *{title}* ({job['ref']}).\n\nCandidates can be matched to "
-            "it now. What next?"
+            f"✅ Job activated: *{title}* ({job['ref']}) for {validity} days.\n\n"
+            f"💳 {need} job credit{'s' if need != 1 else ''} used — balance "
+            f"{await memory.ensure_job_credits(phone, tenant_id=tenant_id, seed=0)}. What next?"
         )
         try:
             await wa_delivery.send_message(settings, digits, wa.buttons_message(body, _EMP_MENU))
@@ -338,8 +446,9 @@ async def post_job_submit(request: Request) -> HTMLResponse:
 
     number = re.sub(r"\D", "", settings.whatsapp_business_number or "")
     return HTMLResponse(_success_html(
-        "Job posted!", f"“{title}” is live ({job['ref']}). Head back to WhatsApp to "
-        "view candidates.", business_number=number,
+        "Job activated!", f"“{title}” is live for {validity} days ({job['ref']}). "
+        f"{need} credit{'s' if need != 1 else ''} used. Head back to WhatsApp to view candidates.",
+        business_number=number,
     ))
 
 
@@ -402,6 +511,36 @@ _STYLE = """
   .nav{display:flex;gap:10px;margin-top:18px}
   .nav button{flex:1;padding:13px;border:0;border-radius:9px;font-size:15px;font-weight:600;cursor:pointer}
   .ghost{background:#202c33;color:#e9edef;border:1px solid #2a3942 !important}
+  /* Activate Job screen */
+  .jobhdr{background:linear-gradient(135deg,#5b3df5,#7b5cff);border-radius:14px;padding:16px 16px 14px;margin-bottom:14px}
+  .jobttl{font-size:18px;font-weight:700;color:#fff}
+  .jobsub{color:#dcd6ff;font-size:13px;margin-top:6px}
+  .achips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .achip{background:rgba(255,255,255,.18);color:#fff;border-radius:20px;padding:4px 11px;font-size:12px}
+  .acard{background:#111b21;border:1px solid #2a3942;border-radius:12px;padding:14px;margin-bottom:12px}
+  .acard>label{margin:0 0 10px;color:#e9edef;font-size:14px;font-weight:600}
+  .vpills{display:flex;gap:8px}
+  .vpill{flex:1;padding:12px 0;border:1.5px solid #2a3942;border-radius:10px;background:#202c33;
+         color:#e9edef;font-size:14px;font-weight:600;cursor:pointer;display:flex;flex-direction:column;align-items:center}
+  .vpill small{color:#8696a0;font-weight:400;font-size:11px;margin-top:2px}
+  .vpill.on{background:#5b3df5;border-color:#5b3df5;color:#fff}
+  .vpill.on small{color:#dcd6ff}
+  .vnote{color:#8696a0;font-size:12px;margin:10px 0 0;text-align:center}
+  .calc{display:flex;align-items:center;justify-content:space-around;background:#202c33;border-radius:10px;padding:12px 8px}
+  .calc>div{display:flex;flex-direction:column;align-items:center}
+  .calc b{font-size:22px} .calc small{color:#8696a0;font-size:11px;margin-top:2px}
+  .calc .op{color:#6b7d88;font-size:16px;font-weight:400} .calc .accent{color:#a78bfa}
+  .boxes{display:flex;gap:8px;margin-top:12px}
+  .box{flex:1;border-radius:10px;padding:10px 0;text-align:center;border:1px solid #2a3942}
+  .box small{display:block;color:#8696a0;font-size:11px} .box b{font-size:18px}
+  .box.have{background:rgba(0,168,132,.12)} .box.have b{color:#00d3a7}
+  .box.need{background:rgba(167,139,250,.12)} .box.need b{color:#a78bfa}
+  .box.buy{background:rgba(255,107,107,.12)} .box.buy b{color:#ff6b6b}
+  .box.buy.zero{background:rgba(0,168,132,.12)} .box.buy.zero b{color:#00d3a7}
+  .bar{height:7px;background:#2a3942;border-radius:6px;overflow:hidden;margin-top:12px}
+  .bar span{display:block;height:100%;background:#5b3df5;width:0;transition:width .2s}
+  .tc{display:flex;align-items:center;gap:9px;color:#aebac1;font-size:12px;margin-top:14px}
+  .tc input{width:auto;transform:scale(1.3);accent-color:#5b3df5}
 """
 
 
@@ -522,7 +661,7 @@ def _register_html(
   </div>
   <div class="row">
     <div><label>City</label><input name="city" placeholder="City"></div>
-    <div><label>Pincode</label><input name="pincode" inputmode="numeric" placeholder="600001"></div>
+    <div><label>Pincode</label><input name="pincode" inputmode="numeric" pattern="[1-9][0-9]{{5}}" title="6-digit PIN code" placeholder="600001"></div>
   </div>
   <label>About the company</label>
   <textarea name="description" placeholder="What your company does (optional)"></textarea>
@@ -546,18 +685,24 @@ document.getElementById('state_id').addEventListener('change', fillDistricts);
     return _page("Register your company", inner)
 
 
-def _kyc_html(token: str) -> str:
+def _kyc_html(token: str, *, error: str = "") -> str:
+    err = f'<div class="addrbox" style="border-color:#a33;color:#ffb3b3">{_esc(error)}</div>' if error else ""
     inner = f"""
 <h1>Verify your business</h1>
 <p class="sub">Submit a business proof to unlock full candidate details. Your
 documents are used only for verification.</p>
+{err}
 <form method="post" action="/employer/kyc/submit" autocomplete="off">
   <input type="hidden" name="token" value="{_esc(token)}">
   <label>Document type <span class="req">*</span></label>
   <select name="kyc_document_type" required>{_options_html(KYC_DOC_TYPES, placeholder='Select…')}</select>
   <div class="row">
-    <div><label>GST number</label><input name="gst_number" placeholder="22AAAAA0000A1Z5"></div>
-    <div><label>PAN number</label><input name="pan_number" placeholder="AAAAA0000A"></div>
+    <div><label>GST number</label>
+      <input name="gst_number" pattern="[0-9]{{2}}[A-Za-z]{{5}}[0-9]{{4}}[A-Za-z][0-9A-Za-z]Z[0-9A-Za-z]"
+        title="15-character GST, e.g. 22AAAAA0000A1Z5" placeholder="22AAAAA0000A1Z5"></div>
+    <div><label>PAN number</label>
+      <input name="pan_number" pattern="[A-Za-z]{{5}}[0-9]{{4}}[A-Za-z]"
+        title="10-character PAN, e.g. AAAAA0000A" placeholder="AAAAA0000A"></div>
   </div>
   <label>Document link <span class="req">*</span></label>
   <input type="url" name="kyc_document_url" required placeholder="https://… (Drive/Dropbox link to the proof)">
@@ -580,10 +725,11 @@ _TOP_DISTRICT_NAMES = (
 
 def _post_job_html(
     token: str, o: dict[str, list[dict[str, Any]]], *,
-    company_address: str = "", company_district_id: str = "",
+    company_address: str = "", company_district_id: str = "", error: str = "",
 ) -> str:
     n = len(_JOB_STEPS)
     addr_display = _esc(company_address) or "Your registered company address will be used."
+    err = f'<div class="addrbox" style="border-color:#a33;color:#ffb3b3">{_esc(error)}</div>' if error else ""
     steps = "\n".join([
         # 1 — Job Details
         f"""<section class="step"><h1>Job Details</h1>
@@ -602,8 +748,8 @@ def _post_job_html(
   <div class="subblock" id="expYears" hidden>
     <label>Years of Experience</label>
     <div class="row">
-      <div><label>Min years</label>{_year_select("experience_min")}</div>
-      <div><label>Max years</label>{_year_select("experience_max")}</div>
+      <div><label>Min years <span class="req">*</span></label>{_year_select("experience_min")}</div>
+      <div><label>Max years <span class="req">*</span></label>{_year_select("experience_max")}</div>
     </div>
   </div>
 
@@ -626,13 +772,13 @@ def _post_job_html(
     <label>Salary Range</label>
     {_radios("salary_period", SALARY_PERIODS)}
     <div class="row">
-      <div><label>Min (₹)</label><input name="salary_min" inputmode="numeric" placeholder="Min"></div>
-      <div><label>Max (₹)</label><input name="salary_max" inputmode="numeric" placeholder="Max"></div>
+      <div><label>Min (₹)</label><input name="salary_min" data-fmt="num" inputmode="numeric" placeholder="Min"></div>
+      <div><label>Max (₹)</label><input name="salary_max" data-fmt="num" inputmode="numeric" placeholder="Max"></div>
     </div>
   </div>
 
   <label>Number of Vacancies</label>
-  <input name="vacancies" inputmode="numeric" placeholder="e.g. 5">
+  <input name="vacancies" data-fmt="int" inputmode="numeric" placeholder="e.g. 5">
 </section>""",
         # 3 — Job Location (conditional: Specific → state+district, Company → address)
         f"""<section class="step"><h1>Job Location</h1>
@@ -687,17 +833,22 @@ def _post_job_html(
   </div>
   <div id="phoneInput" hidden>
     <label>Contact Phone Number</label>
-    <input name="contact_phone" inputmode="numeric" placeholder="e.g. 9876543210">
+    <input name="contact_phone" data-fmt="phone" inputmode="numeric" placeholder="e.g. 9876543210">
   </div>
   <div id="waInput" hidden>
     <label>WhatsApp Number</label>
-    <input name="contact_whatsapp" inputmode="numeric" placeholder="e.g. 9876543210">
+    <input name="contact_whatsapp" data-fmt="phone" inputmode="numeric" placeholder="e.g. 9876543210">
   </div>
 </section>""",
     ])
 
-    names_js = "[" + ", ".join(f'"{_esc(s)}"' for s in _JOB_STEPS) + "]"
+    # JSON-encode (NOT html-escape) — these are JS string literals inside a
+    # <script>; HTML-escaping the "&" in "Experience & Salary" would make the
+    # runtime value "Experience &amp; Salary" and silently break the NAMES[cur]
+    # comparison in valid() (and garble the step header).
+    names_js = json.dumps(list(_JOB_STEPS))
     inner = f"""
+{err}
 <div class="dots" id="dots"></div>
 <div class="stepname" id="stepname"></div>
 <form method="post" action="/employer/post-job/submit" autocomplete="off" id="jobForm">
@@ -726,6 +877,62 @@ function render(){{
 }}
 function valid(){{
   if(cur===0){{ var t=document.querySelector('[name=title]'); if(!t.value.trim()){{ t.focus(); alert('Please enter a job title'); return false; }} }}
+  // Experience & Salary: conditionally-required fields by experience type.
+  // Detect the step by the field's presence (robust to the step's display name).
+  if(steps[cur].querySelector('[name=experience_type]')){{
+    var exp=picked('experience_type');
+    if(exp==='EXPERIENCED'){{
+      var mn=document.querySelector('[name=experience_min]'), mx=document.querySelector('[name=experience_max]');
+      if(!mn.value || !mx.value){{ alert('Please select the min and max years of experience.'); return false; }}
+      if(+mx.value < +mn.value){{ alert("Max years can't be less than min years."); return false; }}
+    }} else if(exp==='INTERN'){{
+      var pay=picked('intern_payment_type');
+      if(!pay){{ alert('Please choose an intern payment type.'); return false; }}
+      if(pay==='STIPEND'){{ var sp=document.querySelector('[name=intern_stipend]'); if(!sp.value.trim()){{ sp.focus(); alert('Please enter the monthly stipend.'); return false; }} }}
+      if(pay==='TRAINING_FEE'){{ var tf=document.querySelector('[name=training_fee]'); if(!tf.value.trim()){{ tf.focus(); alert('Please enter the training fee.'); return false; }} }}
+    }}
+  }}
+  // Job Location: a location type must be chosen; Specific needs state + district.
+  if(steps[cur].querySelector('[name=job_location_type]')){{
+    var lt=picked('job_location_type');
+    if(!lt){{ alert('Please choose a job location.'); return false; }}
+    if(lt==='SPECIFIC'){{
+      var st=document.getElementById('job_state_id'), di=document.getElementById('job_district_id');
+      if(!st.value){{ st.focus(); alert('Please select the job state.'); return false; }}
+      if(!di.value){{ di.focus(); alert('Please select the job district.'); return false; }}
+    }}
+  }}
+  // Candidate Location Preference: at least one district must be selected.
+  if(steps[cur].querySelector('#pref_add')){{
+    if(steps[cur].querySelectorAll('[name=preferred_district_ids]').length===0){{
+      alert('Please select at least one candidate district.'); return false;
+    }}
+  }}
+  // Apply Methods: a chosen Phone Call / WhatsApp needs its number.
+  if(steps[cur].querySelector('[name=apply_modes]')){{
+    if(document.getElementById('am_call').checked){{
+      var p=document.querySelector('[name=contact_phone]');
+      if(!p.value.trim()){{ p.focus(); alert('Please enter the contact phone number.'); return false; }}
+    }}
+    if(document.getElementById('am_wa').checked){{
+      var w=document.querySelector('[name=contact_whatsapp]');
+      if(!w.value.trim()){{ w.focus(); alert('Please enter the WhatsApp number.'); return false; }}
+    }}
+  }}
+  // format checks for the current step's numeric/phone fields (only when filled)
+  var step = steps[cur], bad = null, msg = "";
+  [].forEach.call(step.querySelectorAll('[data-fmt]'), function(el){{
+    if(bad) return;
+    var v=(el.value||'').trim(); if(!v) return;
+    var f=el.getAttribute('data-fmt');
+    if(f==='num' && !/^\\d+(\\.\\d+)?$/.test(v)){{ bad=el; msg="Please enter a valid number."; }}
+    else if(f==='int' && !/^\\d+$/.test(v)){{ bad=el; msg="Please enter a whole number."; }}
+    else if(f==='phone'){{ var d=v.replace(/\\D/g,''); if(d.length>10) d=d.slice(-10); if(!(d.length===10 && /[6-9]/.test(d[0]))){{ bad=el; msg="Enter a valid 10-digit mobile number."; }} }}
+  }});
+  // salary max >= min (when both given)
+  var mn=step.querySelector('[name=salary_min]'), mx=step.querySelector('[name=salary_max]');
+  if(!bad && mn && mx && mn.value.trim() && mx.value.trim() && +mx.value < +mn.value){{ bad=mx; msg="Max salary can't be less than the minimum."; }}
+  if(bad){{ bad.focus(); alert(msg); return false; }}
   return true;
 }}
 next.onclick = function(){{ if(valid()){{ cur=Math.min(cur+1,steps.length-1); render(); }} }};
@@ -819,10 +1026,109 @@ function applyChange(){{
 ['am_call','am_wa'].forEach(function(id){{ document.getElementById(id).addEventListener('change', applyChange); }});
 applyChange();
 
+// The "Post Job" button is type=submit (last step) — guard it through valid().
+document.getElementById('jobForm').addEventListener('submit', function(e){{ if(!valid()){{ e.preventDefault(); }} }});
+
 render();
 </script>
 """
     return _page("Post a job", inner)
+
+
+def _activate_job_html(token: str, *, title: str, district_names: list[str], have: int) -> str:
+    """The 'Activate Job' screen: pick a validity (15/30/45 days → 1×/2×/3×),
+    see credits required (#districts × multiplier) vs the wallet balance, and
+    activate (or 'Pay ₹X & Activate' to cover a shortfall — simulated purchase)."""
+    chips = "".join(f'<span class="achip">{_esc(n)}</span>' for n in district_names) or \
+        '<span class="achip">—</span>'
+    pills = "".join(
+        f'<button type="button" class="vpill{" on" if days == VALIDITY_OPTIONS[0][0] else ""}" '
+        f'data-days="{days}" data-mult="{mult}">{days} Days<small>{mult}x</small></button>'
+        for days, mult in VALIDITY_OPTIONS
+    )
+    mult_js = "{" + ", ".join(f"{d}: {m}" for d, m in VALIDITY_OPTIONS) + "}"
+    names_js = json.dumps(district_names)
+    default_days = VALIDITY_OPTIONS[0][0]
+    inner = f"""
+<div class="jobhdr">
+  <div class="jobttl">💼 {_esc(title)}</div>
+  <div class="jobsub">Districts ({len(district_names)})</div>
+  <div class="achips">{chips}</div>
+</div>
+
+<form method="post" action="/employer/post-job/activate" id="actForm">
+  <input type="hidden" name="token" value="{_esc(token)}">
+  <input type="hidden" name="validity_days" id="validity_days" value="{default_days}">
+
+  <div class="acard">
+    <label>🕒 Job Validity</label>
+    <div class="vpills">{pills}</div>
+    <p class="vnote" id="vnote">{default_days} Days · 1 credit/district</p>
+  </div>
+
+  <div class="acard">
+    <label>🧮 Credits Required</label>
+    <div class="calc">
+      <div><b id="cDistricts">{len(district_names)}</b><small>districts</small></div>
+      <div class="op">×</div>
+      <div><b id="cMult">1</b><small>multiplier</small></div>
+      <div class="op">=</div>
+      <div><b id="cNeed" class="accent">0</b><small>credits</small></div>
+    </div>
+    <div class="boxes">
+      <div class="box have"><small>Have</small><b id="bHave">{int(have)}</b></div>
+      <div class="box need"><small>Need</small><b id="bNeed">0</b></div>
+      <div class="box buy" id="buyBox"><small>Buy</small><b id="bBuy">0</b></div>
+    </div>
+    <div class="bar"><span id="barFill"></span></div>
+    <p class="vnote" id="statusNote"></p>
+  </div>
+
+  <label class="tc"><input type="checkbox" id="tc" checked> I accept the Terms, Privacy &amp; Refund policy</label>
+  <button type="submit" class="btn" id="actBtn">Activate Now</button>
+</form>
+<script>
+var PRICE = {JOB_CREDIT_PRICE};
+var HAVE = {int(have)};
+var MULT = {mult_js};
+var NAMES = {names_js};
+var days = {default_days};
+function recompute(){{
+  var districts = NAMES.length, m = MULT[days] || 1;
+  var need = Math.max(1, districts) * m;
+  var buy = Math.max(0, need - HAVE), pay = buy * PRICE;
+  document.getElementById('cDistricts').textContent = districts;
+  document.getElementById('cMult').textContent = m;
+  document.getElementById('cNeed').textContent = need;
+  document.getElementById('bHave').textContent = HAVE;
+  document.getElementById('bNeed').textContent = need;
+  document.getElementById('bBuy').textContent = buy;
+  document.getElementById('validity_days').value = days;
+  document.getElementById('vnote').textContent = days + ' Days · ' + m + ' credit/district';
+  var pct = need > 0 ? Math.min(100, Math.round(HAVE / need * 100)) : 100;
+  document.getElementById('barFill').style.width = pct + '%';
+  var ok = buy === 0;
+  document.getElementById('buyBox').classList.toggle('zero', ok);
+  document.getElementById('statusNote').textContent = ok
+    ? '✅ Sufficient credits available' : ('Need ' + buy + ' more credit' + (buy===1?'':'s'));
+  var btn = document.getElementById('actBtn');
+  btn.textContent = ok ? 'Activate Now' : ('Pay ₹' + pay + ' & Activate');
+}}
+[].forEach.call(document.querySelectorAll('.vpill'), function(p){{
+  p.addEventListener('click', function(){{
+    [].forEach.call(document.querySelectorAll('.vpill'), function(x){{ x.classList.remove('on'); }});
+    p.classList.add('on');
+    days = parseInt(p.getAttribute('data-days'), 10);
+    recompute();
+  }});
+}});
+document.getElementById('actForm').addEventListener('submit', function(e){{
+  if(!document.getElementById('tc').checked){{ e.preventDefault(); alert('Please accept the Terms to continue.'); }}
+}});
+recompute();
+</script>
+"""
+    return _page("Activate job", inner)
 
 
 def _success_html(title: str, sub: str, *, business_number: str = "") -> str:

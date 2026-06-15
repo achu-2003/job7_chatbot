@@ -572,6 +572,64 @@ class ConversationMemory:
         await self.save_employer(phone, rec, tenant_id=tenant_id)
         return rec
 
+    # --- job-posting credit wallet (Redis-mirrored test harness) -------------
+    # The 'Have' balance starts from the employer's LIVE credit_wallets.jobCredits
+    # (read by the route), but the debit happens here in Redis — the live billing
+    # tables are never written. The balance lives on the employer record so it
+    # survives across posts within the 30-day test window.
+
+    async def ensure_job_credits(
+        self, phone: str, *, tenant_id: str | None, seed: int
+    ) -> int:
+        """Current job-credit balance, seeding it from ``seed`` (the live balance,
+        or the welcome grant) only the first time. Returns the balance."""
+        rec = await self.get_employer(phone, tenant_id=tenant_id)
+        if rec is None:
+            return 0
+        if rec.get("walletJobCredits") is None:
+            rec["walletJobCredits"] = int(seed)
+            await self.save_employer(phone, rec, tenant_id=tenant_id)
+        return int(rec.get("walletJobCredits") or 0)
+
+    async def adjust_job_credits(
+        self, phone: str, delta: int, *, tenant_id: str | None
+    ) -> int | None:
+        """Add (delta>0, a simulated purchase) or debit (delta<0) job credits.
+        Floors at 0. Returns the new balance, or None if not registered."""
+        rec = await self.get_employer(phone, tenant_id=tenant_id)
+        if rec is None:
+            return None
+        rec["walletJobCredits"] = max(0, int(rec.get("walletJobCredits") or 0) + int(delta))
+        await self.save_employer(phone, rec, tenant_id=tenant_id)
+        return rec["walletJobCredits"]
+
+    # --- staged job draft (between the post-job form and the Activate screen) -
+
+    @staticmethod
+    def _job_draft_key(token: str) -> str:
+        return f"employer:jobdraft:{token}"
+
+    async def stage_job_draft(self, token: str, job: dict[str, Any]) -> None:
+        """Hold a built (but not-yet-activated) job keyed by the form token, so the
+        Activate screen can finalize it after the credit choice."""
+        assert self._redis is not None
+        ttl = get_settings().onboarding_ttl_seconds
+        await self._redis.setex(self._job_draft_key(token), ttl, json.dumps(job, default=str))
+
+    async def get_job_draft(self, token: str) -> dict[str, Any] | None:
+        assert self._redis is not None
+        raw = await self._redis.get(self._job_draft_key(token))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    async def clear_job_draft(self, token: str) -> None:
+        assert self._redis is not None
+        await self._redis.delete(self._job_draft_key(token))
+
     async def ensure_employer_token(
         self, phone: str, *, tenant_id: str, conversation_id: str, name: str | None
     ) -> str:

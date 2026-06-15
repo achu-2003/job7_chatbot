@@ -15,6 +15,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from app.validation import valid_email, valid_year
+
 # ---------------------------------------------------------------------------
 # Progressive-profiling field plan
 # ---------------------------------------------------------------------------
@@ -124,7 +126,11 @@ def build_registration_records(
     seeker_id = _cuid()
     now = _now_iso()
     name = (identity.get("name") or form.get("full_name") or "").strip()
+    # Sanitise (defense in depth): only keep an email that's actually valid, so a
+    # malformed value never reaches the DB even if the form's check is bypassed.
     email = (form.get("email") or "").strip() or None
+    if email and not valid_email(email):
+        email = None
     phone = (identity.get("customer_id") or "").strip() or None
 
     profile_id = _cuid()
@@ -140,7 +146,7 @@ def build_registration_records(
     current_status = _enum(form, "current_status")
     work_mode = _enum(form, "work_mode")
     year_of_study = _to_int(form.get("current_year_of_study"))
-    year_of_passing = _to_int(form.get("year_of_passing"))
+    year_of_passing = _to_int(form.get("year_of_passing")) if valid_year(form.get("year_of_passing")) else None
     current_salary = _to_num(form.get("current_salary"))
     expected_salary = _to_num(form.get("expected_salary"))
     dob = (form.get("date_of_birth") or "").strip() or None

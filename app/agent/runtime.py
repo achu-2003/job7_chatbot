@@ -33,6 +33,7 @@ from app.agent import jobflow
 from app.agent.browse import search_terms
 from app.agent.context import is_followup
 from app.agent.identity import extract_name, is_plausible_name
+from app.validation import valid_url
 from app.agent.nodes.humanizer import build_delivery_plan
 from app.agent.nodes.load_context import load_context
 from app.agent.nodes.persist import persist
@@ -544,6 +545,13 @@ class AgentRuntime:
             if val is None:
                 return _apply_prompt("Please reply with a number (e.g. 25000), or tap Skip.")
             answers[key] = val
+        elif key == "resume" and not valid_url(text):
+            # Typed text on the resume step that isn't a link → re-ask (they can
+            # tap Upload Resume, paste an https link, or skip).
+            return _apply_prompt(
+                "That doesn't look like a resume link. Tap *Upload Resume* to attach "
+                "a file, paste a valid link (https://…), or reply 'skip'."
+            )
         else:
             answers[key] = text
 

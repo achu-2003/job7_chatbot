@@ -115,7 +115,14 @@ def test_post_job_form_is_a_five_step_wizard():
     assert 'action="/employer/post-job/submit"' in out
     assert out.count('class="step"') == 5                  # five wizard sections
     assert 'id="jobForm"' in out and 'id="next"' in out and 'id="post"' in out
-    assert 'var NAMES = ["Job Details"' in out             # stepper JS
+    # stepper JS: the "&" in the step name must NOT be HTML-escaped here — it's a
+    # JS string literal, so &amp; would break the in-script NAMES[cur] comparison.
+    assert 'var NAMES = ["Job Details", "Experience & Salary"' in out
+    # the experience-step guard detects the step by field presence (robust to name)
+    assert "steps[cur].querySelector('[name=experience_type]')" in out
+    # Job Location guard: Specific Location requires state + district before Next
+    assert "steps[cur].querySelector('[name=job_location_type]')" in out
+    assert "Please select the job state." in out and "Please select the job district." in out
     # one field/marker from each remaining section
     for nm in ("title", "job_type", "experience_type", "job_location_type",
                "preferred_district_ids", "apply_modes", "contact_whatsapp"):
@@ -140,6 +147,15 @@ def test_post_job_form_candidate_location_and_apply_methods():
     assert 'value="APPLY" id="am_apply" checked' in out
     assert 'id="phoneInput"' in out and 'id="waInput"' in out
     assert "function applyChange()" in out
+    # the final "Post Job" (type=submit) is guarded through valid()
+    assert "addEventListener('submit', function(e)" in out
+    # a chosen Phone Call / WhatsApp requires its number before posting
+    assert "Please enter the contact phone number." in out
+    assert "Please enter the WhatsApp number." in out
+    # an unchosen job location is blocked too
+    assert "Please choose a job location." in out
+    # candidate location preference requires at least one district
+    assert "Please select at least one candidate district." in out
 
 
 def test_post_job_form_conditional_blocks_no_default_radio():

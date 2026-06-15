@@ -36,6 +36,7 @@ from app.db.repositories import (
     LookupRepository,
 )
 from app.onboarding import build_application_record, prepare_registration
+from app.validation import MAX_RESUME_BYTES, valid_resume_filename, validate_registration
 from app.whatsapp import delivery as wa_delivery
 
 # The /onboard form is the SEEKER lane (the employer side has its own form), so
@@ -106,14 +107,17 @@ async def _save_resume_upload(upload: Any, token: str) -> str:
     filename = getattr(upload, "filename", None)
     if not filename:                       # str field / None → no file selected
         return ""
+    if not valid_resume_filename(filename):   # reject wrong file types (not a CV)
+        log.info("resume_upload_bad_type", file=str(filename)[:60])
+        return ""
     try:
         data = await upload.read()
         if not data:
             return ""
+        if len(data) > MAX_RESUME_BYTES:      # reject oversized uploads (> 5 MB)
+            log.info("resume_upload_too_large", bytes=len(data))
+            return ""
         clean = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[-50:].lstrip("._") or "resume"
-        ext = Path(clean).suffix.lower()
-        if ext and ext not in _RESUME_EXTS:
-            clean += ".pdf" if not Path(clean).suffix else ""
         fname = f"{uuid.uuid4().hex[:10]}_{clean}"
         _RESUME_DIR.mkdir(parents=True, exist_ok=True)
         (_RESUME_DIR / fname).write_bytes(data)
@@ -249,6 +253,24 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
     form["location"] = await LookupRepository.name_for("districts", first_loc) or ""
 
     memory = get_memory(request)
+    identity = await memory.get_onboarding_identity(token)
+    if not identity:
+        return HTMLResponse(_expired_html(), status_code=404)
+
+    # SERVER-SIDE VALIDATION (authoritative backstop): reject bad/incomplete data
+    # so nothing malformed is ever staged or written. The form mirrors these rules
+    # in JS, so this normally only triggers if the client check is bypassed —
+    # re-show the form with the first error.
+    errors = validate_registration(form)
+    if errors:
+        opts = await _load_options()
+        phone = re.sub(r"\D", "", identity.get("customer_id") or "")
+        return HTMLResponse(
+            _form_html(token, name or identity.get("name") or "", phone, opts,
+                       error=next(iter(errors.values()))),
+            status_code=400,
+        )
+
     identity = await memory.save_onboarding(token, form)
     if not identity:
         return HTMLResponse(_expired_html(), status_code=404)
@@ -353,7 +375,10 @@ async def resume_submit(request: Request) -> HTMLResponse:
 
     resume_url = await _save_resume_upload(posted.get("resume"), token)
     if not resume_url:
-        return HTMLResponse(_resume_html(token, error="Please choose a PDF/DOC file."), status_code=400)
+        return HTMLResponse(
+            _resume_html(token, error="Please upload a valid PDF/DOC file (under 5 MB)."),
+            status_code=400,
+        )
 
     apply_state = await memory.get_apply_state(conv, tenant_id=tid)
     reg = await memory.get_registration(conv, tenant_id=tid)
@@ -666,7 +691,7 @@ function show(i){
   document.getElementById("backBtn").style.visibility = i===0 ? "hidden" : "visible";
 }
 function valid(step){
-  var ok = true;
+  var ok = true, msg = "";
   step.querySelectorAll("[data-req]").forEach(function(el){
     var bad = false;
     if(el.classList.contains("chips")) bad = !el.querySelector(".chip.on");
@@ -676,6 +701,23 @@ function valid(step){
     else bad = !((el.value||"").trim());
     el.classList.toggle("invalid", bad); if(bad) ok = false;
   });
+  // Format checks — only when the field has a value (blanks are handled above).
+  step.querySelectorAll("[data-fmt]").forEach(function(el){
+    var v = (el.value||"").trim(); if(!v) return;
+    var f = el.getAttribute("data-fmt"), bad = false, m = "";
+    if(f==="email"){ bad = !/^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/.test(v); m = "Please enter a valid email address."; }
+    else if(f==="year"){ bad = !/^\d{4}$/.test(v) || +v < 1950 || +v > 2035; m = "Enter a valid 4-digit passing year."; }
+    else if(f==="salary"){ bad = !/^\d+(\.\d+)?$/.test(v) || +v < 0; m = "Salary must be a valid number."; }
+    if(bad){ el.classList.add("invalid"); ok = false; if(!msg) msg = m; }
+  });
+  // Date of birth → must be a real date for a plausible working age (14–80).
+  var dob = document.getElementById("date_of_birth");
+  if(dob && dob.value && step.contains(dob)){
+    var d = new Date(dob.value), t = new Date();
+    var age = t.getFullYear()-d.getFullYear()-((t.getMonth()<d.getMonth()||(t.getMonth()===d.getMonth()&&t.getDate()<d.getDate()))?1:0);
+    if(isNaN(age) || age < 14 || age > 80){ ok = false; if(!msg) msg = "Enter a valid date of birth (age 14–80)."; }
+  }
+  if(!ok && msg) alert(msg);
   return ok;
 }
 var submitting = false;
@@ -740,7 +782,7 @@ def _form_html(
     <label>Mobile Number</label>
     <input type="text" class="ro" value="{_esc(phone)}" readonly>
     <label>Email</label>
-    <input type="email" name="email" placeholder="you@example.com">
+    <input type="email" name="email" data-fmt="email" placeholder="you@example.com">
     <label>Resume <span class="hint">(PDF, DOC — tap to select a file)</span></label>
     <input type="file" name="resume" accept=".pdf,.doc,.docx,.rtf,.odt,.png,.jpg,.jpeg">
     <label>Gender {_R()}</label>
@@ -774,7 +816,7 @@ def _form_html(
     <label>Institution / College</label>
     <input type="text" name="institution" placeholder="e.g. Anna University">
     <label>Year of Passing</label>
-    <input type="number" name="year_of_passing" min="1970" max="2035" placeholder="e.g. 2024">
+    <input type="number" name="year_of_passing" data-fmt="year" min="1970" max="2035" placeholder="e.g. 2024">
   </section>
 
   <section class="step"><h1>Skills</h1>
@@ -796,7 +838,7 @@ def _form_html(
     <label>Expected Monthly Salary {_R()}</label>
     {_chips("expected_salary", _SALARY, req=True)}
     <label>Current Monthly Salary (₹) <span class="hint">(if working)</span></label>
-    <input type="number" name="current_salary" min="0" step="500" placeholder="e.g. 18000">
+    <input type="number" name="current_salary" data-fmt="salary" min="0" step="500" placeholder="e.g. 18000">
     <label>Do you have work experience?</label>
     {_chips("has_experience", _YESNO)}
     <label>Experience level <span class="hint">(if experienced)</span></label>

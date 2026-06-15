@@ -1131,6 +1131,21 @@ async def test_apply_writes_application_to_live_db_with_resume(monkeypatch):
     assert "applied" in out["response"].lower()
 
 
+async def test_apply_resume_rejects_non_url_text():
+    """Typing non-link text on the resume step is re-asked, not accepted as a
+    resume (validation) — the application is not finalized."""
+    rt = _runtime()
+    _stub_memory(
+        rt, registration=_REG, job_lookup=_JOB,
+        apply_state={"job_ref": "r1", "job_title": "Backend Developer", "job": _JOB,
+                     "pending": ["resume"], "answers": {}},
+    )
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "i'll send it later")            # not a URL / doc / skip
+    assert "link" in out["response"].lower()                 # re-asked
+    assert rt._test_applications == []                       # not finalized
+
+
 async def test_apply_no_live_write_when_flag_off(monkeypatch):
     """With register_in_db off, the apply stays Redis-only — no
     private_job_applications write."""

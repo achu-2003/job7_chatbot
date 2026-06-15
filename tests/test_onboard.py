@@ -46,6 +46,9 @@ def test_form_renders_nine_step_wizard():
     assert 'name="email"' in out
     assert 'type="file" name="resume"' in out             # resume is a file picker
     assert 'enctype="multipart/form-data"' in out         # so the form is multipart
+    # client-side format validation hooks
+    assert 'data-fmt="email"' in out and 'data-fmt="year"' in out and 'data-fmt="salary"' in out
+    assert 'data-fmt' in out and "Please enter a valid email address" in out
     assert 'name="institution"' in out
     assert 'name="current_salary"' in out
 
@@ -94,6 +97,20 @@ async def test_resume_upload_ignores_non_file():
     import app.api.routes.onboard as ob
     assert await ob._save_resume_upload("https://a-pasted-link", "tok") == ""   # plain str
     assert await ob._save_resume_upload(None, "tok") == ""                      # nothing
+
+
+def test_registration_drops_invalid_email_and_year():
+    from app.onboarding import build_registration_records
+    rec = build_registration_records(
+        identity={"customer_id": "919876543210", "name": "Asha"},
+        form={"full_name": "Asha", "email": "not-an-email", "year_of_passing": "99"},
+    )
+    assert rec["private_job_seekers"]["email"] is None       # malformed email dropped
+    assert rec["private_job_seekers"]["yearOfPassing"] is None  # bad year dropped
+    ok = build_registration_records(
+        identity={"customer_id": "91"}, form={"full_name": "Asha", "email": "a@b.com"},
+    )
+    assert ok["private_job_seekers"]["email"] == "a@b.com"   # valid email kept
 
 
 def test_success_and_expired_pages_render():
