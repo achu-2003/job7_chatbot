@@ -91,7 +91,8 @@ async def test_job_draft_stage_get_clear():
 
 def test_activate_page_renders_validity_and_credits():
     out = _activate_job_html("tok123", title="Fullstack Developer",
-                             district_names=["Chennai", "Vellore", "Tirupattur"], have=1)
+                             district_names=["Chennai", "Vellore", "Tirupattur"], have=1,
+                             key_id="rzp_test_x", test_mode=True)
     assert 'action="/employer/post-job/activate"' in out
     assert 'name="token" value="tok123"' in out
     assert 'name="validity_days"' in out
@@ -103,3 +104,36 @@ def test_activate_page_renders_validity_and_credits():
     assert "var HAVE = 1;" in out and f"var PRICE = {c.JOB_CREDIT_PRICE};" in out
     # the activate button + the recompute logic that flips it to "Pay … & Activate"
     assert ">Activate Now<" in out and "& Activate" in out
+
+
+def test_activate_page_wires_razorpay_for_shortfall():
+    out = _activate_job_html("tok", title="Job", district_names=["Chennai"], have=0,
+                             key_id="rzp_test_x", test_mode=True)
+    assert "checkout.razorpay.com/v1/checkout.js" in out
+    assert "/employer/post-job/credits/order" in out
+    assert "/employer/post-job/credits/verify" in out
+    assert "new Razorpay(" in out
+    # only a shortfall opens checkout; covered credits use the normal POST
+    assert "if(need - HAVE <= 0) return;" in out
+
+
+async def test_finalize_job_debits_and_posts(monkeypatch):
+    import app.api.routes.employer as emp
+
+    async def _noop(*a, **k):
+        return None
+    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop)
+
+    mem = await _mem_with_employer()
+    await mem.ensure_job_credits("919042177457", tenant_id="t1", seed=2)
+    await mem.stage_job_draft("tokF", {"ref": "JOB-XYZ",
+        "private_jobs": {"title": "Dev", "preferredDistrictIds": ["d1", "d2"]}})
+    # 2 districts × 15-day (1x) = 2 credits → wallet 2 → 0; job posted
+    summary = await emp._finalize_job(mem, "919042177457", "t1", "tokF", "15")
+    assert summary["need"] == 2 and summary["ref"] == "JOB-XYZ"
+    rec = await mem.get_employer("919042177457", tenant_id="t1")
+    assert rec["walletJobCredits"] == 0
+    assert rec["jobs"][-1]["private_jobs"]["status"] == "PENDING"
+    assert rec["jobs"][-1]["private_jobs"]["validityDays"] == 15
+    assert rec["lastActivated"]["ref"] == "JOB-XYZ"
+    assert await mem.get_job_draft("tokF") is None        # draft consumed

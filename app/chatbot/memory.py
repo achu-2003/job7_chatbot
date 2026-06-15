@@ -630,6 +630,51 @@ class ConversationMemory:
         assert self._redis is not None
         await self._redis.delete(self._job_draft_key(token))
 
+    # --- Razorpay subscription payment (pending order → activation) ----------
+
+    @staticmethod
+    def _pay_order_key(order_id: str) -> str:
+        return f"employer:payorder:{order_id}"
+
+    async def stage_payment_order(self, order_id: str, data: dict[str, Any]) -> None:
+        """Remember a created Razorpay order's context (token, plan, amount, phone)
+        so the verify callback can trust the server-side plan/price, not the client."""
+        assert self._redis is not None
+        ttl = get_settings().onboarding_ttl_seconds
+        await self._redis.setex(self._pay_order_key(order_id), ttl, json.dumps(data, default=str))
+
+    async def get_payment_order(self, order_id: str) -> dict[str, Any] | None:
+        assert self._redis is not None
+        raw = await self._redis.get(self._pay_order_key(order_id))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    async def clear_payment_order(self, order_id: str) -> None:
+        assert self._redis is not None
+        await self._redis.delete(self._pay_order_key(order_id))
+
+    async def activate_subscription(
+        self, phone: str, subscription: dict[str, Any], *,
+        grant_unlock: int = 0, grant_boost: int = 0, tenant_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Record an active subscription on the employer record (Redis test
+        harness — never the live ``subscriptions`` table) and grant its monthly
+        unlock/boost credits to the Redis-mirrored wallet. Returns the record."""
+        rec = await self.get_employer(phone, tenant_id=tenant_id)
+        if rec is None:
+            return None
+        rec["subscription"] = subscription
+        if grant_unlock:
+            rec["walletUnlockCredits"] = int(rec.get("walletUnlockCredits") or 0) + int(grant_unlock)
+        if grant_boost:
+            rec["walletBoostCredits"] = int(rec.get("walletBoostCredits") or 0) + int(grant_boost)
+        await self.save_employer(phone, rec, tenant_id=tenant_id)
+        return rec
+
     async def ensure_employer_token(
         self, phone: str, *, tenant_id: str, conversation_id: str, name: str | None
     ) -> str:

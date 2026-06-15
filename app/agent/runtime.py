@@ -147,6 +147,9 @@ _EMP_VIEW_RX = re.compile(
 )
 _EMP_POST_RX = re.compile(r"^\s*(post\s*(a\s*)?job|create\s*(a\s*)?job)\s*$", re.IGNORECASE)
 _EMP_JOBS_RX = re.compile(r"^\s*(my\s*jobs?|posted\s*jobs?)\s*$", re.IGNORECASE)
+_EMP_PLANS_RX = re.compile(
+    r"^\s*(upgrade(\s*plan)?|plans?|subscri\w*|pricing|buy\s*(credits?|plan))\s*$", re.IGNORECASE,
+)
 
 
 def _role_choice_message(body: str) -> dict[str, Any]:
@@ -1076,6 +1079,8 @@ class AgentRuntime:
             )
         if _EMP_JOBS_RX.match(q):
             return self._employer_my_jobs(state, emp)
+        if _EMP_PLANS_RX.match(q):
+            return await self._employer_plans_prompt(state)
         return await self._employer_search_candidates(state, emp, q)
 
     async def _employer_action(
@@ -1100,8 +1105,19 @@ class AgentRuntime:
             return await self._employer_pay(state, emp)
         if action == "myjobs":
             return self._employer_my_jobs(state, emp)
+        if action == "plans":
+            return await self._employer_plans_prompt(state)
         # menu / unknown → the hub
         return self._employer_menu_reply(state, emp)
+
+    async def _employer_plans_prompt(self, state: AgentState) -> dict[str, Any]:
+        """Hand over the Razorpay-backed subscription page."""
+        return await self._employer_form_prompt(
+            state, path="subscribe",
+            body="💎 Upgrade your plan for more job posts, unlocks and boosts. "
+                 "Tap below to view plans and pay securely.",
+            cta="Upgrade Plan",
+        )
 
     async def _employer_kyc_gate(
         self, state: AgentState, emp: dict[str, Any], kyc: str
@@ -1260,7 +1276,11 @@ class AgentRuntime:
             if vac:
                 line += f" · {vac} vacanc" + ("y" if int(vac) == 1 else "ies")
             lines.append(line)
-        return self._creator_reply("\n".join(lines))
+        body = "\n".join(lines)
+        return self._creator_reply(
+            body, interactive=wa.buttons_message(
+                body, [("emp:post", "Post a Job"), ("emp:plans", "💎 Upgrade Plan")]),
+        )
 
     async def _planner(self, state: AgentState) -> dict[str, Any]:
         return await plan(

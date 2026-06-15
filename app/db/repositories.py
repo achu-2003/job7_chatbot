@@ -999,3 +999,46 @@ class CreditWalletRepository:
             log.warning("job_credit_balance_failed", error=str(exc)[:200])
             return None
         return int(row._mapping["jobCredits"]) if row else None
+
+
+# ---------------------------------------------------------------
+# Subscription plans — READ-ONLY (the employer plan catalog)
+# ---------------------------------------------------------------
+
+
+class SubscriptionPlanRepository:
+    """READ-ONLY access to the live ``subscription_plans`` catalog (Free/Starter/
+    Growth/Pro/Business). Drives the employer 'Upgrade Plan' page; the price here
+    is authoritative for the Razorpay order amount (never trust a client price)."""
+
+    @staticmethod
+    async def list_active() -> list[dict[str, Any]]:
+        sql = text(
+            'SELECT id, type, name, "nameTamil", slug, price, "billingCycle", '
+            '       "maxActiveJobs", "maxLocationsPerJob", "dailyApplyCap", '
+            '       "monthlyCredits", "monthlyBoosts", features '
+            'FROM subscription_plans WHERE "isActive" = TRUE '
+            'ORDER BY "displayOrder" NULLS LAST, price'
+        )
+        try:
+            async with session_scope() as session:
+                rows = (await session.execute(sql)).fetchall()
+        except Exception as exc:  # noqa: BLE001 — catalog read must not break the flow
+            log.warning("subscription_plans_failed", error=str(exc)[:200])
+            return []
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r._mapping)
+            if isinstance(d.get("price"), Decimal):
+                d["price"] = float(d["price"])
+            out.append(d)
+        return out
+
+    @staticmethod
+    async def get(plan_id: str) -> dict[str, Any] | None:
+        if not plan_id:
+            return None
+        for p in await SubscriptionPlanRepository.list_active():
+            if str(p.get("id")) == str(plan_id):
+                return p
+        return None

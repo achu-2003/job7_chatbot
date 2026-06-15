@@ -24,7 +24,7 @@ from typing import Any
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.api.deps import get_memory
 from app.chatbot import wa_format as wa
@@ -37,7 +37,12 @@ from app.credits import (
     credit_quote,
     credits_required,
 )
-from app.db.repositories import CreditWalletRepository, LookupRepository
+from app.db.repositories import (
+    CreditWalletRepository,
+    LookupRepository,
+    SubscriptionPlanRepository,
+)
+from app.payments import razorpay as rzp
 from app.employer import (
     APPLY_MODES,
     COMPANY_SIZES,
@@ -373,25 +378,83 @@ async def post_job_submit(request: Request) -> HTMLResponse:
     have = await memory.ensure_job_credits(phone, tenant_id=identity["tenant_id"], seed=seed)
 
     district_names = _district_names(form.get("preferred_district_ids") or [], opts=await _job_options())
+    settings = get_settings()
     return HTMLResponse(_activate_job_html(
         token, title=title, district_names=district_names, have=have,
+        key_id=settings.razorpay_key_id, test_mode=settings.razorpay_test_mode,
+        prefill_name=identity.get("name") or "", prefill_phone=re.sub(r"\D", "", phone)[-10:],
+    ))
+
+
+def _clean_validity(value: str) -> str:
+    """Coerce a posted validity to a known option (15/30/45), default the first."""
+    return value if value in {str(d) for d, _ in VALIDITY_OPTIONS} else str(VALIDITY_OPTIONS[0][0])
+
+
+async def _job_credit_quote(memory, phone: str, tenant_id: str, job: dict[str, Any], validity: str):
+    """(need, quote) for a staged job at a chosen validity, vs the live balance."""
+    districts = (job.get("private_jobs") or {}).get("preferredDistrictIds") or []
+    need = credits_required(len(districts), validity)
+    have = int((await memory.get_employer(phone, tenant_id=tenant_id) or {}).get("walletJobCredits") or 0)
+    return need, credit_quote(have, need)
+
+
+async def _finalize_job(memory, phone: str, tenant_id: str, token: str, validity: str) -> dict | None:
+    """Debit ``need`` job credits, flip the staged draft to PENDING (posted),
+    append it to the employer, push the WhatsApp confirmation, and return a
+    summary. Wallet top-up (the purchased credits) must already be applied."""
+    job = await memory.get_job_draft(token)
+    if job is None:
+        return None
+    districts = (job.get("private_jobs") or {}).get("preferredDistrictIds") or []
+    need = credits_required(len(districts), validity)
+    await memory.adjust_job_credits(phone, -need, tenant_id=tenant_id)
+    job["private_jobs"]["status"] = "PENDING"
+    job["private_jobs"]["validityDays"] = int(validity)
+    job["creditsCharged"] = need
+    job["validityDays"] = int(validity)
+    await memory.add_employer_job(phone, job, tenant_id=tenant_id)
+    title = (job.get("private_jobs") or {}).get("title") or "your job"
+    summary = {"title": title, "ref": job.get("ref"), "validity": int(validity), "need": need}
+    await memory.update_employer(phone, {"lastActivated": summary}, tenant_id=tenant_id)
+    await memory.clear_job_draft(token)
+
+    settings = get_settings()
+    digits = re.sub(r"\D", "", phone)
+    if digits:
+        bal = await memory.ensure_job_credits(phone, tenant_id=tenant_id, seed=0)
+        body = (
+            f"✅ Job activated: *{title}* ({job['ref']}) for {validity} days.\n\n"
+            f"💳 {need} job credit{'s' if need != 1 else ''} used — balance {bal}. What next?"
+        )
+        try:
+            await wa_delivery.send_message(settings, digits, wa.buttons_message(body, _EMP_MENU))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("employer_postjob_push_failed", error=str(exc)[:200])
+    return summary
+
+
+def _job_activated_html(summary: dict | None) -> HTMLResponse:
+    s = summary or {}
+    title = s.get("title") or "Your job"
+    ref = s.get("ref") or ""
+    days = s.get("validity") or ""
+    need = s.get("need") or 0
+    number = re.sub(r"\D", "", get_settings().whatsapp_business_number or "")
+    return HTMLResponse(_success_html(
+        "Job activated!", f"“{title}” is live for {days} days ({ref}). "
+        f"{need} credit{'s' if need != 1 else ''} used. Head back to WhatsApp to view candidates.",
+        business_number=number,
     ))
 
 
 @router.post("/post-job/activate", response_class=HTMLResponse)
 async def post_job_activate(request: Request) -> HTMLResponse:
-    """Finalize a staged job draft: charge job credits (Redis-mirrored wallet) for
-    (#districts × validity multiplier), then 'post' it (stage on the employer
-    record) and push the menu back to WhatsApp. If the wallet is short, the
-    Activate page only reaches here via 'Pay & Activate', which simulates buying
-    the shortfall (no real payment / no live billing write)."""
+    """The 'Activate Now' path — used ONLY when the wallet already covers the cost
+    (no payment). A shortfall goes through Razorpay (/post-job/credits/*)."""
     raw = parse_qs((await request.body()).decode("utf-8"))
-
-    def one(key: str) -> str:
-        v = raw.get(key) or []
-        return v[0].strip() if v else ""
-
-    token = one("token")
+    token = (raw.get("token") or [""])[0].strip()
+    validity = _clean_validity((raw.get("validity_days") or [""])[0].strip())
     if not token:
         return HTMLResponse(_expired_html(), status_code=400)
     memory = get_memory(request)
@@ -400,56 +463,241 @@ async def post_job_activate(request: Request) -> HTMLResponse:
         return HTMLResponse(_expired_html(), status_code=404)
     phone = identity.get("customer_id") or ""
     tenant_id = identity["tenant_id"]
-
     job = await memory.get_job_draft(token)
     if job is None:
         return HTMLResponse(_expired_html(), status_code=404)
-
-    # Validity (15/30/45) → multiplier; credits = #districts × multiplier.
-    valid_days = {str(d) for d, _ in VALIDITY_OPTIONS}
-    validity = one("validity_days")
-    if validity not in valid_days:
-        validity = str(VALIDITY_OPTIONS[0][0])
-    districts = (job.get("private_jobs") or {}).get("preferredDistrictIds") or []
-    need = credits_required(len(districts), validity)
-
-    have = int((await memory.get_employer(phone, tenant_id=tenant_id) or {}).get("walletJobCredits") or 0)
-    quote = credit_quote(have, need)
-    # 'Pay & Activate' path: simulate buying the shortfall into the Redis wallet.
+    _, quote = await _job_credit_quote(memory, phone, tenant_id, job, validity)
     if not quote["sufficient"]:
-        await memory.adjust_job_credits(phone, quote["buy"], tenant_id=tenant_id)
-    # Debit the credits the post costs.
-    await memory.adjust_job_credits(phone, -need, tenant_id=tenant_id)
+        # Shouldn't happen (the button routes to Razorpay) — re-show the screen.
+        return HTMLResponse(_page("Insufficient credits",
+            '<div class="ok"><h1>Not enough credits</h1><p class="sub">Please go back '
+            'and pay for the required credits.</p></div>'), status_code=402)
+    summary = await _finalize_job(memory, phone, tenant_id, token, validity)
+    return _job_activated_html(summary)
 
-    # Finalize: stamp validity + the credits charged, flip to PENDING (posted,
-    # awaiting board approval), and append to the employer's jobs.
-    job["private_jobs"]["status"] = "PENDING"
-    job["private_jobs"]["validityDays"] = int(validity)
-    job["creditsCharged"] = need
-    job["validityDays"] = int(validity)
-    await memory.add_employer_job(phone, job, tenant_id=tenant_id)
-    await memory.clear_job_draft(token)
 
-    title = (job.get("private_jobs") or {}).get("title") or "your job"
+@router.post("/post-job/credits/order")
+async def post_job_credits_order(request: Request) -> JSONResponse:
+    """Create a Razorpay order for the JOB-CREDIT shortfall (buy × ₹649)."""
+    raw = parse_qs((await request.body()).decode("utf-8"))
+    token = (raw.get("token") or [""])[0].strip()
+    validity = _clean_validity((raw.get("validity_days") or [""])[0].strip())
+    memory = get_memory(request)
+    identity = await memory.get_employer_identity(token) if token else None
+    if not identity:
+        return JSONResponse({"error": "expired"}, status_code=404)
+    if not get_settings().razorpay_enabled:
+        return JSONResponse({"error": "payments_unavailable"}, status_code=503)
+    phone = identity.get("customer_id") or ""
+    tenant_id = identity["tenant_id"]
+    job = await memory.get_job_draft(token)
+    if job is None:
+        return JSONResponse({"error": "expired"}, status_code=404)
+    _, quote = await _job_credit_quote(memory, phone, tenant_id, job, validity)
+    if quote["sufficient"]:
+        return JSONResponse({"sufficient": True})   # no payment needed
+    try:
+        order = await rzp.create_order(
+            amount_paise=int(quote["pay"]) * 100,
+            receipt=f"jobcr_{re.sub(r'[^0-9]', '', phone)[-10:]}",
+            notes={"kind": "job_credits", "buy": quote["buy"], "phone": phone},
+        )
+    except rzp.RazorpayError as exc:
+        log.warning("jobcredits_order_failed", error=str(exc)[:200])
+        return JSONResponse({"error": "order_failed"}, status_code=502)
+    await memory.stage_payment_order(order["id"], {
+        "kind": "job_credits", "token": token, "validity": validity,
+        "buy": quote["buy"], "phone": phone, "tenant_id": tenant_id,
+    })
+    return JSONResponse({
+        "order_id": order["id"], "amount": order["amount"], "currency": order["currency"],
+        "key_id": get_settings().razorpay_key_id, "buy": quote["buy"],
+        "prefill_name": identity.get("name") or "", "prefill_phone": re.sub(r"\D", "", phone)[-10:],
+    })
+
+
+@router.post("/post-job/credits/verify")
+async def post_job_credits_verify(request: Request) -> JSONResponse:
+    """Verify the Razorpay payment, credit the purchased job credits, then
+    activate the job (Redis test harness)."""
+    raw = parse_qs((await request.body()).decode("utf-8"))
+
+    def one(k: str) -> str:
+        return (raw.get(k) or [""])[0].strip()
+
+    order_id, payment_id, signature = one("razorpay_order_id"), one("razorpay_payment_id"), one("razorpay_signature")
+    if not rzp.verify_payment_signature(order_id=order_id, payment_id=payment_id, signature=signature):
+        return JSONResponse({"error": "bad_signature"}, status_code=400)
+    memory = get_memory(request)
+    pending = await memory.get_payment_order(order_id)
+    if not pending or pending.get("kind") != "job_credits":
+        return JSONResponse({"error": "unknown_order"}, status_code=404)
+    phone, tenant_id = pending["phone"], pending["tenant_id"]
+    # Credit the purchased shortfall, then activate (which debits the cost).
+    await memory.adjust_job_credits(phone, int(pending["buy"]), tenant_id=tenant_id)
+    summary = await _finalize_job(memory, phone, tenant_id, pending["token"], pending["validity"])
+    await memory.clear_payment_order(order_id)
+    if summary is None:
+        return JSONResponse({"error": "expired"}, status_code=404)
+    return JSONResponse({"ok": True, "redirect": f"/employer/post-job/done?token={pending['token']}"})
+
+
+@router.get("/post-job/done", response_class=HTMLResponse)
+async def post_job_done(request: Request, token: str = Query(default="")) -> HTMLResponse:
+    memory = get_memory(request)
+    identity = await memory.get_employer_identity(token) if token else None
+    employer = await memory.get_employer(identity.get("customer_id") or "", tenant_id=identity["tenant_id"]) if identity else None
+    return _job_activated_html((employer or {}).get("lastActivated"))
+
+
+# ---------------------------------------------------------------------------
+# Subscription plans + Razorpay checkout
+# ---------------------------------------------------------------------------
+
+# billingCycle enum → (human label, validity days) for the plan card + expiry.
+_BILLING = {
+    "DAYS_15": ("15 days", 15), "DAYS_30": ("30 days", 30),
+    "DAYS_90": ("90 days", 90), "YEARLY": ("1 year", 365),
+}
+
+
+@router.get("/subscribe", response_class=HTMLResponse)
+async def subscribe_page(request: Request, token: str = Query(default="")) -> HTMLResponse:
+    """Stage: the employer 'Upgrade Plan' page — the live subscription_plans with
+    a Razorpay checkout (test mode)."""
+    memory = get_memory(request)
+    identity = await memory.get_employer_identity(token) if token else None
+    if not identity:
+        return HTMLResponse(_expired_html(), status_code=404)
+    settings = get_settings()
+    if not settings.razorpay_enabled:
+        return HTMLResponse(_page("Payments unavailable",
+            '<div class="ok"><h1>Payments not set up</h1><p class="sub">Razorpay '
+            'keys are not configured. Please try again later.</p></div>'), status_code=503)
+    plans = await SubscriptionPlanRepository.list_active()
+    employer = await memory.get_employer(identity.get("customer_id") or "", tenant_id=identity["tenant_id"])
+    current = (employer or {}).get("subscription") or {}
+    return HTMLResponse(_subscribe_html(
+        token, plans, key_id=settings.razorpay_key_id, test_mode=settings.razorpay_test_mode,
+        prefill_name=identity.get("name") or "", prefill_phone=identity.get("customer_id") or "",
+        current_type=current.get("planType") or "",
+    ))
+
+
+@router.post("/subscribe/order")
+async def subscribe_order(request: Request) -> JSONResponse:
+    """Create a Razorpay order for the chosen plan (price read SERVER-SIDE from
+    the catalog — never trust a client amount). Free plan → activate immediately."""
+    raw = parse_qs((await request.body()).decode("utf-8"))
+    token = (raw.get("token") or [""])[0].strip()
+    plan_id = (raw.get("plan_id") or [""])[0].strip()
+    memory = get_memory(request)
+    identity = await memory.get_employer_identity(token) if token else None
+    if not identity:
+        return JSONResponse({"error": "expired"}, status_code=404)
+    plan = await SubscriptionPlanRepository.get(plan_id)
+    if not plan:
+        return JSONResponse({"error": "unknown_plan"}, status_code=400)
+    phone = identity.get("customer_id") or ""
+    tenant_id = identity["tenant_id"]
+    price = float(plan.get("price") or 0)
+
+    # Free plan: no payment — activate now and tell the client to redirect.
+    if price <= 0:
+        await _activate_subscription(memory, phone, tenant_id, plan)
+        return JSONResponse({"free": True, "redirect": f"/employer/subscribe/done?token={token}"})
+
+    try:
+        order = await rzp.create_order(
+            amount_paise=int(round(price * 100)),
+            receipt=f"sub_{plan.get('type','')}_{re.sub(r'[^0-9]', '', phone)[-10:]}",
+            notes={"plan_id": plan_id, "plan_type": plan.get("type", ""), "phone": phone},
+        )
+    except rzp.RazorpayError as exc:
+        log.warning("subscribe_order_failed", error=str(exc)[:200])
+        return JSONResponse({"error": "order_failed"}, status_code=502)
+
+    await memory.stage_payment_order(order["id"], {
+        "token": token, "plan_id": plan_id, "phone": phone, "tenant_id": tenant_id,
+        "amount": order["amount"],
+    })
+    return JSONResponse({
+        "order_id": order["id"], "amount": order["amount"], "currency": order["currency"],
+        "key_id": get_settings().razorpay_key_id, "plan_name": plan.get("name", "Plan"),
+        "prefill_name": identity.get("name") or "", "prefill_phone": re.sub(r"\D", "", phone)[-10:],
+    })
+
+
+@router.post("/subscribe/verify")
+async def subscribe_verify(request: Request) -> JSONResponse:
+    """Verify the Razorpay payment signature, then activate the subscription
+    (Redis test harness) + grant the plan's monthly credits."""
+    raw = parse_qs((await request.body()).decode("utf-8"))
+
+    def one(k: str) -> str:
+        return (raw.get(k) or [""])[0].strip()
+
+    order_id, payment_id, signature = one("razorpay_order_id"), one("razorpay_payment_id"), one("razorpay_signature")
+    if not rzp.verify_payment_signature(order_id=order_id, payment_id=payment_id, signature=signature):
+        return JSONResponse({"error": "bad_signature"}, status_code=400)
+    memory = get_memory(request)
+    pending = await memory.get_payment_order(order_id)
+    if not pending:
+        return JSONResponse({"error": "unknown_order"}, status_code=404)
+    plan = await SubscriptionPlanRepository.get(pending.get("plan_id"))
+    if not plan:
+        return JSONResponse({"error": "unknown_plan"}, status_code=400)
+    await _activate_subscription(memory, pending["phone"], pending["tenant_id"], plan,
+                                 payment_id=payment_id)
+    await memory.clear_payment_order(order_id)
+    return JSONResponse({"ok": True, "redirect": f"/employer/subscribe/done?token={pending.get('token','')}"})
+
+
+@router.get("/subscribe/done", response_class=HTMLResponse)
+async def subscribe_done(request: Request, token: str = Query(default="")) -> HTMLResponse:
+    memory = get_memory(request)
+    identity = await memory.get_employer_identity(token) if token else None
+    name = re.sub(r"\D", "", get_settings().whatsapp_business_number or "")
+    employer = await memory.get_employer(identity.get("customer_id") or "", tenant_id=identity["tenant_id"]) if identity else None
+    sub = (employer or {}).get("subscription") or {}
+    plan = sub.get("planName") or "your plan"
+    return HTMLResponse(_success_html(
+        "Subscription active!", f"You're now on the {plan} plan. Head back to WhatsApp to continue.",
+        business_number=name,
+    ))
+
+
+async def _activate_subscription(memory, phone: str, tenant_id: str, plan: dict[str, Any],
+                                 *, payment_id: str = "") -> None:
+    """Record the plan on the employer record + grant its monthly credits, then
+    push a WhatsApp confirmation. Redis-only (never the live subscriptions table)."""
+    label, days = _BILLING.get(plan.get("billingCycle"), ("subscription", 30))
+    sub = {
+        "planId": plan.get("id"), "planType": plan.get("type"), "planName": plan.get("name"),
+        "billingCycle": plan.get("billingCycle"), "validityLabel": label, "validityDays": days,
+        "maxActiveJobs": plan.get("maxActiveJobs"), "maxLocationsPerJob": plan.get("maxLocationsPerJob"),
+        "price": plan.get("price"), "paymentId": payment_id, "test": get_settings().razorpay_test_mode,
+    }
+    await memory.activate_subscription(
+        phone, sub, grant_unlock=int(plan.get("monthlyCredits") or 0),
+        grant_boost=int(plan.get("monthlyBoosts") or 0), tenant_id=tenant_id,
+    )
     settings = get_settings()
     digits = re.sub(r"\D", "", phone)
     if digits:
+        grants = []
+        if plan.get("monthlyCredits"):
+            grants.append(f"{plan['monthlyCredits']} unlock credits")
+        if plan.get("monthlyBoosts"):
+            grants.append(f"{plan['monthlyBoosts']} boosts")
+        extra = (" You received " + " and ".join(grants) + ".") if grants else ""
         body = (
-            f"✅ Job activated: *{title}* ({job['ref']}) for {validity} days.\n\n"
-            f"💳 {need} job credit{'s' if need != 1 else ''} used — balance "
-            f"{await memory.ensure_job_credits(phone, tenant_id=tenant_id, seed=0)}. What next?"
+            f"✅ *{plan.get('name')}* plan activated ({label}).{extra}\n\nWhat next?"
         )
         try:
             await wa_delivery.send_message(settings, digits, wa.buttons_message(body, _EMP_MENU))
         except Exception as exc:  # noqa: BLE001
-            log.warning("employer_postjob_push_failed", error=str(exc)[:200])
-
-    number = re.sub(r"\D", "", settings.whatsapp_business_number or "")
-    return HTMLResponse(_success_html(
-        "Job activated!", f"“{title}” is live for {validity} days ({job['ref']}). "
-        f"{need} credit{'s' if need != 1 else ''} used. Head back to WhatsApp to view candidates.",
-        business_number=number,
-    ))
+            log.warning("subscribe_push_failed", error=str(exc)[:200])
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +789,19 @@ _STYLE = """
   .bar span{display:block;height:100%;background:#5b3df5;width:0;transition:width .2s}
   .tc{display:flex;align-items:center;gap:9px;color:#aebac1;font-size:12px;margin-top:14px}
   .tc input{width:auto;transform:scale(1.3);accent-color:#5b3df5}
+  /* Subscription plans */
+  .testbadge{font-size:11px;background:#3a2f00;color:#ffcf33;border:1px solid #6b5a00;
+        border-radius:6px;padding:2px 7px;vertical-align:middle;margin-left:6px}
+  .plan{display:block;border:1.5px solid #2a3942;border-radius:12px;padding:13px 14px;margin:10px 0;cursor:pointer}
+  .plan.on{border-color:#5b3df5;background:rgba(91,61,245,.08)}
+  .prow{display:flex;align-items:center;gap:9px}
+  .prow input{width:auto;accent-color:#5b3df5} .prow b{font-size:15px;flex:0 0 auto}
+  .pprice{margin-left:auto;font-size:17px;font-weight:700;color:#fff;text-align:right}
+  .pprice small{display:block;color:#8696a0;font-size:11px;font-weight:400}
+  .pfeats{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}
+  .pfeat{background:#202c33;color:#aebac1;border-radius:16px;padding:3px 10px;font-size:12px}
+  .curtag{font-size:11px;color:#00d3a7;font-weight:400} .poptag{font-size:11px;color:#ffb020;margin-left:4px}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
 """
 
 
@@ -1035,10 +1296,101 @@ render();
     return _page("Post a job", inner)
 
 
-def _activate_job_html(token: str, *, title: str, district_names: list[str], have: int) -> str:
+def _subscribe_html(token: str, plans: list[dict[str, Any]], *, key_id: str,
+                    test_mode: bool, prefill_name: str, prefill_phone: str,
+                    current_type: str) -> str:
+    """The 'Upgrade Plan' page: subscription_plans as cards + Razorpay Checkout."""
+    cards = []
+    for p in plans:
+        ptype = str(p.get("type") or "")
+        price = float(p.get("price") or 0)
+        label, _ = _BILLING.get(p.get("billingCycle"), ("subscription", 30))
+        feats = []
+        if p.get("maxActiveJobs"):
+            feats.append(f"📋 {p['maxActiveJobs']} active job{'s' if p['maxActiveJobs'] != 1 else ''}")
+        if p.get("monthlyCredits"):
+            feats.append(f"🔓 {p['monthlyCredits']} unlocks")
+        if p.get("monthlyBoosts"):
+            feats.append(f"🚀 {p['monthlyBoosts']} boosts")
+        chips = "".join(f'<span class="pfeat">{_esc(f)}</span>' for f in feats)
+        price_txt = "Free" if price <= 0 else f"₹{int(price) if price == int(price) else price}"
+        cur = ' <span class="curtag">Current</span>' if ptype == current_type else ""
+        popular = '<span class="poptag">★ Popular</span>' if ptype == "GROWTH" else ""
+        cards.append(
+            f'<label class="plan" data-plan="{_esc(p.get("id"))}" data-price="{price}">'
+            f'<div class="prow"><input type="radio" name="plan" value="{_esc(p.get("id"))}">'
+            f'<b>{_esc(p.get("name"))}{cur}</b>{popular}'
+            f'<span class="pprice">{price_txt}<small>/{_esc(label)}</small></span></div>'
+            f'<div class="pfeats">{chips}</div></label>'
+        )
+    badge = '<span class="testbadge">TEST MODE</span>' if test_mode else ""
+    inner = f"""
+<h1>💎 Upgrade Plan {badge}</h1>
+<p class="sub">Pick a plan — billed securely via Razorpay.</p>
+<div id="plans">{''.join(cards)}</div>
+<button type="button" class="btn" id="payBtn" disabled>Select a plan</button>
+<p class="sub" id="payNote" style="margin-top:12px;text-align:center"></p>
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+<script>
+var TOKEN = {json.dumps(token)};
+var PREFILL = {{name: {json.dumps(prefill_name)}, contact: {json.dumps(prefill_phone)}}};
+var sel = null, payBtn = document.getElementById('payBtn'), note = document.getElementById('payNote');
+[].forEach.call(document.querySelectorAll('.plan'), function(el){{
+  el.addEventListener('click', function(){{
+    [].forEach.call(document.querySelectorAll('.plan'), function(x){{ x.classList.remove('on'); }});
+    el.classList.add('on'); el.querySelector('input').checked = true;
+    sel = el.getAttribute('data-plan');
+    var price = parseFloat(el.getAttribute('data-price'));
+    payBtn.disabled = false;
+    payBtn.textContent = price > 0 ? ('Pay ₹' + (price % 1 ? price : price.toFixed(0)) + ' & Subscribe') : 'Activate Free Plan';
+  }});
+}});
+function post(url, data){{
+  var body = Object.keys(data).map(function(k){{ return encodeURIComponent(k)+'='+encodeURIComponent(data[k]); }}).join('&');
+  return fetch(url, {{method:'POST', headers:{{'Content-Type':'application/x-www-form-urlencoded'}}, body:body}});
+}}
+payBtn.addEventListener('click', function(){{
+  if(!sel) return;
+  payBtn.disabled = true; note.textContent = 'Starting secure checkout…';
+  post('/employer/subscribe/order', {{token: TOKEN, plan_id: sel}})
+    .then(function(r){{ return r.json(); }})
+    .then(function(o){{
+      if(o.free){{ window.location = o.redirect; return; }}
+      if(o.error){{ note.textContent = 'Could not start checkout. Please try again.'; payBtn.disabled = false; return; }}
+      var rzp = new Razorpay({{
+        key: o.key_id, order_id: o.order_id, amount: o.amount, currency: o.currency,
+        name: 'Jobs7', description: o.plan_name + ' plan',
+        prefill: {{name: o.prefill_name || PREFILL.name, contact: o.prefill_phone || PREFILL.contact}},
+        theme: {{color: '#5b3df5'}},
+        handler: function(resp){{
+          note.textContent = 'Confirming payment…';
+          post('/employer/subscribe/verify', {{
+            razorpay_order_id: resp.razorpay_order_id,
+            razorpay_payment_id: resp.razorpay_payment_id,
+            razorpay_signature: resp.razorpay_signature
+          }}).then(function(r){{ return r.json(); }}).then(function(v){{
+            if(v.ok){{ window.location = v.redirect; }}
+            else {{ note.textContent = 'Payment verification failed. If you were charged, contact support.'; payBtn.disabled = false; }}
+          }});
+        }},
+        modal: {{ondismiss: function(){{ note.textContent = 'Payment cancelled.'; payBtn.disabled = false; }}}}
+      }});
+      rzp.on('payment.failed', function(){{ note.textContent = 'Payment failed. Please try again.'; payBtn.disabled = false; }});
+      rzp.open();
+    }})
+    .catch(function(){{ note.textContent = 'Network error. Please try again.'; payBtn.disabled = false; }});
+}});
+</script>
+"""
+    return _page("Upgrade plan", inner)
+
+
+def _activate_job_html(token: str, *, title: str, district_names: list[str], have: int,
+                       key_id: str = "", test_mode: bool = False,
+                       prefill_name: str = "", prefill_phone: str = "") -> str:
     """The 'Activate Job' screen: pick a validity (15/30/45 days → 1×/2×/3×),
     see credits required (#districts × multiplier) vs the wallet balance, and
-    activate (or 'Pay ₹X & Activate' to cover a shortfall — simulated purchase)."""
+    activate. A shortfall opens **Razorpay checkout** for buy × ₹649 (test mode)."""
     chips = "".join(f'<span class="achip">{_esc(n)}</span>' for n in district_names) or \
         '<span class="achip">—</span>'
     pills = "".join(
@@ -1086,12 +1438,16 @@ def _activate_job_html(token: str, *, title: str, district_names: list[str], hav
 
   <label class="tc"><input type="checkbox" id="tc" checked> I accept the Terms, Privacy &amp; Refund policy</label>
   <button type="submit" class="btn" id="actBtn">Activate Now</button>
+  <p class="vnote" id="payNote"></p>
 </form>
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
 <script>
 var PRICE = {JOB_CREDIT_PRICE};
 var HAVE = {int(have)};
 var MULT = {mult_js};
 var NAMES = {names_js};
+var TOKEN = {json.dumps(token)};
+var PREFILL = {{name: {json.dumps(prefill_name)}, contact: {json.dumps(prefill_phone)}}};
 var days = {default_days};
 function recompute(){{
   var districts = NAMES.length, m = MULT[days] || 1;
@@ -1122,8 +1478,46 @@ function recompute(){{
     recompute();
   }});
 }});
+function post(url, data){{
+  var body = Object.keys(data).map(function(k){{ return encodeURIComponent(k)+'='+encodeURIComponent(data[k]); }}).join('&');
+  return fetch(url, {{method:'POST', headers:{{'Content-Type':'application/x-www-form-urlencoded'}}, body:body}});
+}}
+var note = document.getElementById('payNote'), actBtn = document.getElementById('actBtn');
 document.getElementById('actForm').addEventListener('submit', function(e){{
-  if(!document.getElementById('tc').checked){{ e.preventDefault(); alert('Please accept the Terms to continue.'); }}
+  if(!document.getElementById('tc').checked){{ e.preventDefault(); alert('Please accept the Terms to continue.'); return; }}
+  // Enough credits → let the normal POST to /post-job/activate go through.
+  var need = Math.max(1, NAMES.length) * (MULT[days] || 1);
+  if(need - HAVE <= 0) return;
+  // Shortfall → pay the difference via Razorpay, then activate.
+  e.preventDefault();
+  actBtn.disabled = true; note.textContent = 'Starting secure checkout…';
+  post('/employer/post-job/credits/order', {{token: TOKEN, validity_days: days}})
+    .then(function(r){{ return r.json(); }})
+    .then(function(o){{
+      if(o.sufficient){{ document.getElementById('actForm').submit(); return; }}
+      if(o.error){{ note.textContent = 'Could not start checkout. Please try again.'; actBtn.disabled = false; return; }}
+      var rzp = new Razorpay({{
+        key: o.key_id, order_id: o.order_id, amount: o.amount, currency: o.currency,
+        name: 'Jobs7', description: o.buy + ' job credit' + (o.buy===1?'':'s'),
+        prefill: {{name: o.prefill_name || PREFILL.name, contact: o.prefill_phone || PREFILL.contact}},
+        theme: {{color: '#5b3df5'}},
+        handler: function(resp){{
+          note.textContent = 'Confirming payment…';
+          post('/employer/post-job/credits/verify', {{
+            razorpay_order_id: resp.razorpay_order_id,
+            razorpay_payment_id: resp.razorpay_payment_id,
+            razorpay_signature: resp.razorpay_signature
+          }}).then(function(r){{ return r.json(); }}).then(function(v){{
+            if(v.ok){{ window.location = v.redirect; }}
+            else {{ note.textContent = 'Payment verification failed. If charged, contact support.'; actBtn.disabled = false; }}
+          }});
+        }},
+        modal: {{ondismiss: function(){{ note.textContent = 'Payment cancelled.'; actBtn.disabled = false; }}}}
+      }});
+      rzp.on('payment.failed', function(){{ note.textContent = 'Payment failed. Please try again.'; actBtn.disabled = false; }});
+      rzp.open();
+    }})
+    .catch(function(){{ note.textContent = 'Network error. Please try again.'; actBtn.disabled = false; }});
 }});
 recompute();
 </script>

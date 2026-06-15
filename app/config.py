@@ -226,6 +226,21 @@ class Settings(BaseSettings):
     # required for the button (Meta rejects http/localhost), else it's inline text.
     jobs7_app_url: str = "https://play.google.com/store/apps/details?id=com.jobs7"
 
+    # ---- razorpay (employer subscription / credit payments) ----
+    # TEST keys start with "rzp_test_" (no real money — pay with Razorpay test
+    # cards); LIVE keys start with "rzp_live_". The secret signs/creates orders
+    # and verifies the payment callback signature; never expose it to the browser.
+    razorpay_key_id: str = Field(default="")
+    razorpay_key_secret: str = Field(default="")
+
+    @property
+    def razorpay_enabled(self) -> bool:
+        return bool(self.razorpay_key_id and self.razorpay_key_secret)
+
+    @property
+    def razorpay_test_mode(self) -> bool:
+        return self.razorpay_key_id.startswith("rzp_test_")
+
     # ---- whatsapp / meta cloud api ----
     meta_access_token: str = Field(default="")
     meta_phone_number_id: str = Field(default="")
