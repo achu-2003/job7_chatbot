@@ -28,7 +28,7 @@ _DOMAIN_RX = re.compile(r"^([a-z0-9-]+\.)+[a-z]{2,}(/\S*)?$", re.IGNORECASE)
 
 _MIN_AGE, _MAX_AGE = 14, 80
 _MIN_YEAR, _MAX_YEAR = 1950, date.today().year + 1
-_RESUME_EXTS = {".pdf", ".doc", ".docx", ".rtf", ".odt", ".png", ".jpg", ".jpeg"}
+_RESUME_EXTS = {".pdf", ".doc", ".docx"}   # resumes only — no images/other formats
 MAX_RESUME_BYTES = 5 * 1024 * 1024               # 5 MB
 
 

@@ -989,16 +989,65 @@ class CreditWalletRepository:
     async def job_credit_balance(employer_id: str | None) -> int | None:
         """The employer's live ``jobCredits`` balance, or None if they have no
         wallet (e.g. a Redis-only test employer whose id isn't in the DB)."""
+        bals = await CreditWalletRepository.balances(employer_id)
+        return bals["job"] if bals else None
+
+    @staticmethod
+    async def balances(employer_id: str | None) -> dict[str, int] | None:
+        """All three live balances {job, unlock, boost}, or None if no wallet."""
         if not employer_id:
             return None
-        sql = text('SELECT "jobCredits" FROM credit_wallets WHERE "employerId" = :eid LIMIT 1')
+        sql = text('SELECT "jobCredits", "unlockCredits", "boostCredits" '
+                   'FROM credit_wallets WHERE "employerId" = :eid LIMIT 1')
         try:
             async with session_scope() as session:
                 row = (await session.execute(sql, {"eid": employer_id})).first()
-        except Exception as exc:  # noqa: BLE001 — a billing-read miss must not break posting
-            log.warning("job_credit_balance_failed", error=str(exc)[:200])
+        except Exception as exc:  # noqa: BLE001 — a billing-read miss must not break the flow
+            log.warning("wallet_balances_failed", error=str(exc)[:200])
             return None
-        return int(row._mapping["jobCredits"]) if row else None
+        if not row:
+            return None
+        m = row._mapping
+        return {"job": int(m["jobCredits"]), "unlock": int(m["unlockCredits"]),
+                "boost": int(m["boostCredits"])}
+
+
+class CreditBundleRepository:
+    """READ-ONLY access to the live ``credit_bundles`` catalog (Starter/Growth/
+    Pro/Business) — the 'Bundles' tab of Buy Credits. One-time credit grants
+    (job + unlock + boost); the price here is authoritative for the order."""
+
+    @staticmethod
+    async def list_active() -> list[dict[str, Any]]:
+        sql = text(
+            'SELECT id, "bundleType", name, slug, price, "originalPrice", '
+            '       "jobCredits", "unlockCredits", "boostCredits", "validityDays" '
+            'FROM credit_bundles WHERE "isActive" = TRUE '
+            'ORDER BY "displayOrder" NULLS LAST, price'
+        )
+        try:
+            async with session_scope() as session:
+                rows = (await session.execute(sql)).fetchall()
+        except Exception as exc:  # noqa: BLE001 — catalog read must not break the flow
+            log.warning("credit_bundles_failed", error=str(exc)[:200])
+            return []
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r._mapping)
+            for k in ("price", "originalPrice"):
+                if isinstance(d.get(k), Decimal):
+                    d[k] = float(d[k])
+            out.append(d)
+        return out
+
+    @staticmethod
+    async def get(bundle_id: str) -> dict[str, Any] | None:
+        if not bundle_id:
+            return None
+        for b in await CreditBundleRepository.list_active():
+            if str(b.get("id")) == str(bundle_id):
+                return b
+        return None
 
 
 # ---------------------------------------------------------------

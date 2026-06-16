@@ -64,3 +64,44 @@ def _int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Buy Credits catalog — the "Individual Credits" tab (à-la-carte per type)
+# ---------------------------------------------------------------------------
+
+# credit type → ordered list of (credits, total_price_₹). Mirrors the app's
+# Individual Credits pricing (bulk tiers carry a "SAVE MORE" discount).
+INDIVIDUAL_PACKS: dict[str, list[tuple[int, int]]] = {
+    "JOB":    [(1, 649), (10, 5192)],
+    "UNLOCK": [(1, 49), (10, 392), (100, 3920)],
+    "BOOST":  [(1, 999), (10, 792)],
+}
+CREDIT_TYPE_LABELS = {
+    "JOB": "Job Credits", "UNLOCK": "Unlock Candidates Credits", "BOOST": "Boost Job Credits",
+}
+CREDIT_TYPE_ICONS = {"JOB": "💼", "UNLOCK": "🔓", "BOOST": "🚀"}
+
+
+def find_pack(ctype: Any, qty: Any) -> dict[str, int | str] | None:
+    """Resolve an individual-credit pack by (type, quantity) → its price + grant.
+    Returns None for an unknown combo (so a tampered request is rejected)."""
+    ctype = _s(ctype).upper()
+    try:
+        qty = int(qty)
+    except (TypeError, ValueError):
+        return None
+    for credits, price in INDIVIDUAL_PACKS.get(ctype, []):
+        if credits == qty:
+            return {"type": ctype, "credits": credits, "price": price}
+    return None
+
+
+def unit_price(ctype: str) -> int:
+    """Per-credit price (the 1-unit tier) for display ('₹X / credit')."""
+    packs = INDIVIDUAL_PACKS.get(_s(ctype).upper()) or [(1, 0)]
+    return packs[0][1]
+
+
+def _s(v: Any) -> str:
+    return (v if isinstance(v, str) else "" if v is None else str(v)).strip()

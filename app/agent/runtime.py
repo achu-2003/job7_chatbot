@@ -137,6 +137,22 @@ _EMP_MENU_BUTTONS = (
     ("emp:candidates", "View Candidates"),
     ("emp:myjobs", "My Jobs"),
 )
+# The FULL hub as list rows (WhatsApp reply buttons cap at 3) — used everywhere
+# we show "what next?" so every option, incl. Credits & Wallet / Buy Credits, is
+# always reachable. Keep in sync with employer.py's _EMP_MENU_ROWS.
+_EMP_MENU_ROWS = (
+    {"id": "emp:post", "title": "Post a Job", "description": "Create a new job listing"},
+    {"id": "emp:candidates", "title": "View Candidates", "description": "Browse matching candidates"},
+    {"id": "emp:myjobs", "title": "My Jobs", "description": "Your posted jobs"},
+    {"id": "emp:wallet", "title": "🪪 Credits & Wallet", "description": "Manage your credits"},
+    {"id": "emp:buy", "title": "💳 Buy Credits", "description": "View pricing and bundles"},
+)
+
+
+def _emp_menu(body: str) -> dict[str, Any]:
+    """The verified-employer hub as a WhatsApp list (all options reachable)."""
+    return wa.list_message(body=body, button_text="Menu",
+                           rows=list(_EMP_MENU_ROWS), section_title="Employer menu")
 # Typed (not tapped) employer commands → the same actions as the menu buttons.
 # Anything else a VERIFIED employer types is treated as a candidate search query
 # (by skill / role / category).
@@ -148,7 +164,14 @@ _EMP_VIEW_RX = re.compile(
 _EMP_POST_RX = re.compile(r"^\s*(post\s*(a\s*)?job|create\s*(a\s*)?job)\s*$", re.IGNORECASE)
 _EMP_JOBS_RX = re.compile(r"^\s*(my\s*jobs?|posted\s*jobs?)\s*$", re.IGNORECASE)
 _EMP_PLANS_RX = re.compile(
-    r"^\s*(upgrade(\s*plan)?|plans?|subscri\w*|pricing|buy\s*(credits?|plan))\s*$", re.IGNORECASE,
+    r"^\s*(upgrade(\s*plan)?|plans?|subscri\w*)\s*$", re.IGNORECASE,
+)
+_EMP_BUY_RX = re.compile(
+    r"^\s*(buy\s*credits?|buy|pricing|bundles?)\s*$", re.IGNORECASE,
+)
+_EMP_WALLET_RX = re.compile(
+    r"^\s*(credits?\s*(&|and)?\s*wallet|wallet|my\s*credits?|credits?|balance|recharge|top.?up|history)\s*$",
+    re.IGNORECASE,
 )
 
 
@@ -1081,6 +1104,10 @@ class AgentRuntime:
             return self._employer_my_jobs(state, emp)
         if _EMP_PLANS_RX.match(q):
             return await self._employer_plans_prompt(state)
+        if _EMP_BUY_RX.match(q):
+            return await self._employer_buy_prompt(state)
+        if _EMP_WALLET_RX.match(q):
+            return await self._employer_wallet_prompt(state)
         return await self._employer_search_candidates(state, emp, q)
 
     async def _employer_action(
@@ -1107,8 +1134,21 @@ class AgentRuntime:
             return self._employer_my_jobs(state, emp)
         if action == "plans":
             return await self._employer_plans_prompt(state)
+        if action == "buy":
+            return await self._employer_buy_prompt(state)
+        if action == "wallet":
+            return await self._employer_wallet_prompt(state)
         # menu / unknown → the hub
         return self._employer_menu_reply(state, emp)
+
+    async def _employer_wallet_prompt(self, state: AgentState) -> dict[str, Any]:
+        """Hand over the Credits & Wallet (Credit History) page."""
+        return await self._employer_form_prompt(
+            state, path="wallet",
+            body="🪪 Your Credits & Wallet — view your balance and transaction "
+                 "history, or recharge. Tap below to open.",
+            cta="Credits & Wallet",
+        )
 
     async def _employer_plans_prompt(self, state: AgentState) -> dict[str, Any]:
         """Hand over the Razorpay-backed subscription page."""
@@ -1117,6 +1157,15 @@ class AgentRuntime:
             body="💎 Upgrade your plan for more job posts, unlocks and boosts. "
                  "Tap below to view plans and pay securely.",
             cta="Upgrade Plan",
+        )
+
+    async def _employer_buy_prompt(self, state: AgentState) -> dict[str, Any]:
+        """Hand over the Razorpay-backed Buy Credits page (bundles + individual)."""
+        return await self._employer_form_prompt(
+            state, path="buy-credits",
+            body="💳 Buy credits — pick a bundle or individual Job / Unlock / Boost "
+                 "credits. Tap below to view pricing and pay securely.",
+            cta="Buy Credits",
         )
 
     async def _employer_kyc_gate(
@@ -1138,13 +1187,14 @@ class AgentRuntime:
         return await self._employer_form_prompt(state, path="kyc", body=body, cta="Verify Business")
 
     def _employer_menu_reply(self, state: AgentState, emp: dict[str, Any]) -> dict[str, Any]:
-        """Stage 3 — the verified employer hub."""
+        """Stage 3 — the verified employer hub. A list menu (reply buttons cap at
+        3) so all actions, including Buy Credits / Upgrade Plan, are reachable."""
         company = (emp.get("private_employers") or {}).get("companyName") or "your company"
         body = (
             f"You're verified — *{company}* ✅\n\n"
             "What would you like to do today?"
         )
-        return self._creator_reply(body, interactive=wa.buttons_message(body, _EMP_MENU_BUTTONS))
+        return self._creator_reply(body, interactive=_emp_menu(body))
 
     @staticmethod
     def _candidate_experience(c: dict[str, Any]) -> str:
@@ -1219,9 +1269,9 @@ class AgentRuntime:
         if not cands:
             body = (
                 f"No candidates found matching *{query}*. Try another skill or role "
-                "(e.g. “welder”, “sales”, “python”), or tap below."
+                "(e.g. “welder”, “sales”, “python”), or tap Menu."
             )
-            return self._creator_reply(body, interactive=wa.buttons_message(body, _EMP_MENU_BUTTONS))
+            return self._creator_reply(body, interactive=_emp_menu(body))
         return self._render_candidates(
             emp, cands,
             header_masked=f"*Candidates matching “{query}”* 👥",
@@ -1276,11 +1326,9 @@ class AgentRuntime:
             if vac:
                 line += f" · {vac} vacanc" + ("y" if int(vac) == 1 else "ies")
             lines.append(line)
+        lines.append("\nTap *Menu* for more options.")
         body = "\n".join(lines)
-        return self._creator_reply(
-            body, interactive=wa.buttons_message(
-                body, [("emp:post", "Post a Job"), ("emp:plans", "💎 Upgrade Plan")]),
-        )
+        return self._creator_reply(body, interactive=_emp_menu(body))
 
     async def _planner(self, state: AgentState) -> dict[str, Any]:
         return await plan(

@@ -49,8 +49,18 @@ def test_form_renders_nine_step_wizard():
     # client-side format validation hooks
     assert 'data-fmt="email"' in out and 'data-fmt="year"' in out and 'data-fmt="salary"' in out
     assert 'data-fmt' in out and "Please enter a valid email address" in out
+    # errors render inline (red border + message below), not as alert() popups
+    assert "e.className = \"field-err\"" in out or "className = 'field-err'" in out
+    assert "This field is required." in out
+    valid_body = out.split("function valid(step)")[1].split("return true")[0]
+    assert "alert(" not in valid_body
     assert 'name="institution"' in out
     assert 'name="current_salary"' in out
+    # Current Salary + Experience level live in a block shown only for EXPERIENCED
+    assert '<div id="expFields" hidden>' in out
+    assert 'data-name="current_status"' in out and "EXPERIENCED" in out
+    # the preferred-location pickers show all states on focus (not just the first 12)
+    assert ".slice(0, 50)" in out
 
 
 def test_form_marks_required_fields():

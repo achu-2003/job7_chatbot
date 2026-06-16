@@ -173,6 +173,35 @@ def test_post_job_form_conditional_blocks_no_default_radio():
     assert "function locChange()" in out
 
 
+def test_post_job_form_salary_and_vacancies_required_inline():
+    """Min/Max salary + Vacancies are required; errors are shown inline (red
+    border + message), never as alert() popups."""
+    out = _post_job_html("tok123", _JOB_OPTS, company_address="1 MG Rd")
+    assert 'name="salary_min" data-req="1"' in out
+    assert 'name="salary_max" data-req="1"' in out
+    assert 'name="vacancies" data-req="1"' in out
+    # Salary Range (Monthly/Annual) is required whenever the salary block shows
+    assert 'Salary Range <span class="req">*</span>' in out
+    assert "Please choose Monthly or Annual." in out
+    # inline error machinery present; no alert() inside the wizard validator
+    assert "function showErr(" in out and "function clearErrs(" in out
+    assert "e.className='field-err'" in out
+    valid_body = out.split("function valid()")[1].split("next.onclick")[0]
+    assert "alert(" not in valid_body
+
+
+def test_native_forms_use_inline_validator():
+    """Register + KYC disable native popup bubbles (novalidate) and validate
+    inline (red border + message) via the shared attribute-driven script."""
+    from app.api.routes.employer import _register_html, _kyc_html
+    reg = _register_html("t", "919876543210", _JOB_OPTS | {"industries": [], "designations": []})
+    kyc = _kyc_html("t")
+    for html in (reg, kyc):
+        assert "data-validate" in html
+        assert "form[data-validate]" in html and "novalidate" in html
+        assert "d.className='field-err'" in html
+
+
 def test_post_job_form_salary_and_jobtype_trimmed():
     """Salary range is only Monthly/Annual (no per-day/hour), no negotiable toggle,
     and Job Type is only Full Time / Part Time."""

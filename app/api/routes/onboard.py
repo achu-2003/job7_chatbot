@@ -55,7 +55,7 @@ log = get_logger("onboard")
 # Uploaded resumes are stored here and served read-only at /uploads (mounted in
 # app.main). Local disk is fine for testing; point this at cloud storage later.
 _RESUME_DIR = Path("uploads/resumes")
-_RESUME_EXTS = {".pdf", ".doc", ".docx", ".rtf", ".odt", ".png", ".jpg", ".jpeg"}
+_RESUME_EXTS = {".pdf", ".doc", ".docx"}   # resumes only (PDF / Word)
 
 
 async def _register_with_retry(payload: dict[str, Any], *, tries: int = 3) -> dict[str, Any]:
@@ -478,7 +478,9 @@ _PAGE = """\
   .chip{{padding:9px 14px;border:1px solid #2a3942;border-radius:20px;background:#202c33;color:#e9edef;
          font-size:14px;cursor:pointer;user-select:none}}
   .chip.on{{background:#005c4b;border-color:#00a884;color:#fff}}
-  .chips.invalid,.ts.invalid .ts-box,.dob.invalid select,select.invalid,input.invalid{{border-color:#ff6b6b}}
+  .chips.invalid,.ts.invalid .ts-box,.dob.invalid select,select.invalid,input.invalid{{border-color:#ff6b6b;
+        box-shadow:0 0 0 1px rgba(255,107,107,.35)}}
+  .field-err{{color:#ff7a7a;font-size:12.5px;margin:6px 0 2px;line-height:1.3}}
   .nav{{display:flex;gap:10px;align-items:center;margin-top:24px}}
   .nav button{{margin-top:0}}
   .nav .back{{background:#2a3942;color:#e9edef;width:auto;flex:none;padding:12px 16px}}
@@ -582,7 +584,7 @@ function tokenSelect(host, name, options, ph, onChange){
     filtered = options.filter(function(o){
       if(chosen[o[0]]) return false;
       return q === "" ? true : o[1].toLowerCase().indexOf(q) >= 0;
-    }).slice(0, 12);
+    }).slice(0, 50);   // show all states/districts on focus (menu scrolls); search narrows
     if(!filtered.length){ menu.innerHTML = '<div class="ts-empty">No matches</div>'; return; }
     menu.innerHTML = filtered.map(function(o, i){
       var sub = o[2] ? ' <span style="color:#6b7d88">- ' + _esc(o[2]) + '</span>' : '';
@@ -664,6 +666,41 @@ function chipGroup(group){
 }
 document.querySelectorAll(".chips").forEach(chipGroup);
 
+// Current Salary + Experience level are only relevant to an EXPERIENCED seeker —
+// hide them for Student / Fresher (and clear any stale values so nothing wrong
+// is submitted).
+(function(){
+  var grp = document.querySelector('.chips[data-name="current_status"]');
+  var exp = document.getElementById("expFields");
+  if(!grp || !exp) return;
+  function sync(){
+    var on = grp.querySelector(".chip.on");
+    var isExp = !!on && on.getAttribute("data-val") === "EXPERIENCED";
+    exp.hidden = !isExp;
+    if(!isExp){
+      var cs = exp.querySelector('[name=current_salary]'); if(cs){ cs.value = ""; cs.classList.remove("invalid"); }
+      var el = exp.querySelector('[name=experience_level_id]'); if(el){ el.value = ""; }
+      exp.querySelectorAll(".field-err").forEach(function(x){ x.parentNode.removeChild(x); });
+    }
+  }
+  grp.querySelectorAll(".chip").forEach(function(c){ c.addEventListener("click", sync); });
+  sync();
+})();
+
+// Resume: accept only PDF / DOC / DOCX — reject (and clear) anything else.
+[].forEach.call(document.querySelectorAll("[data-resume]"), function(f){
+  f.addEventListener("change", function(){
+    var old = f.parentNode.querySelector(".resume-err"); if(old) old.parentNode.removeChild(old);
+    var ok = !f.files.length || /\.(pdf|docx?)$/i.test(f.files[0].name);
+    f.classList.toggle("invalid", !ok);
+    if(!ok){
+      var e = document.createElement("div"); e.className = "field-err resume-err";
+      e.textContent = "Only PDF or DOC files are allowed.";
+      f.insertAdjacentElement("afterend", e); f.value = "";
+    }
+  });
+});
+
 // ---- date of birth combiner (Day / Month / Year → YYYY-MM-DD) ----
 (function(){
   var d = document.getElementById("dob_d"), m = document.getElementById("dob_m"),
@@ -691,7 +728,16 @@ function show(i){
   document.getElementById("backBtn").style.visibility = i===0 ? "hidden" : "visible";
 }
 function valid(step){
-  var ok = true, msg = "";
+  // Clear prior inline errors on this step.
+  step.querySelectorAll(".field-err").forEach(function(x){ x.parentNode.removeChild(x); });
+  step.querySelectorAll(".invalid").forEach(function(x){ x.classList.remove("invalid"); });
+  var first = null;
+  function err(el, msg){           // red border on the field + red message below it
+    el.classList.add("invalid");
+    var e = document.createElement("div"); e.className = "field-err"; e.textContent = msg;
+    el.insertAdjacentElement("afterend", e);
+    if(!first) first = el;
+  }
   step.querySelectorAll("[data-req]").forEach(function(el){
     var bad = false;
     if(el.classList.contains("chips")) bad = !el.querySelector(".chip.on");
@@ -699,26 +745,27 @@ function valid(step){
     else if(el.classList.contains("dob")) bad = !document.getElementById("date_of_birth").value;
     else if(el.tagName === "SELECT") bad = !el.value;
     else bad = !((el.value||"").trim());
-    el.classList.toggle("invalid", bad); if(bad) ok = false;
+    if(bad) err(el, "This field is required.");
   });
-  // Format checks — only when the field has a value (blanks are handled above).
+  // Format checks — only when the field has a value (blanks handled above).
   step.querySelectorAll("[data-fmt]").forEach(function(el){
+    if(el.classList.contains("invalid")) return;
     var v = (el.value||"").trim(); if(!v) return;
     var f = el.getAttribute("data-fmt"), bad = false, m = "";
     if(f==="email"){ bad = !/^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/.test(v); m = "Please enter a valid email address."; }
     else if(f==="year"){ bad = !/^\d{4}$/.test(v) || +v < 1950 || +v > 2035; m = "Enter a valid 4-digit passing year."; }
     else if(f==="salary"){ bad = !/^\d+(\.\d+)?$/.test(v) || +v < 0; m = "Salary must be a valid number."; }
-    if(bad){ el.classList.add("invalid"); ok = false; if(!msg) msg = m; }
+    if(bad) err(el, m);
   });
   // Date of birth → must be a real date for a plausible working age (14–80).
-  var dob = document.getElementById("date_of_birth");
-  if(dob && dob.value && step.contains(dob)){
+  var dob = document.getElementById("date_of_birth"), dobBox = step.querySelector(".dob");
+  if(dob && dob.value && dobBox && !dobBox.classList.contains("invalid")){
     var d = new Date(dob.value), t = new Date();
     var age = t.getFullYear()-d.getFullYear()-((t.getMonth()<d.getMonth()||(t.getMonth()===d.getMonth()&&t.getDate()<d.getDate()))?1:0);
-    if(isNaN(age) || age < 14 || age > 80){ ok = false; if(!msg) msg = "Enter a valid date of birth (age 14–80)."; }
+    if(isNaN(age) || age < 14 || age > 80) err(dobBox, "Enter a valid date of birth (age 14–80).");
   }
-  if(!ok && msg) alert(msg);
-  return ok;
+  if(first){ if(first.focus) try { first.focus(); } catch(_){} first.scrollIntoView({block:"center"}); return false; }
+  return true;
 }
 var submitting = false;
 function advance(){
@@ -783,8 +830,8 @@ def _form_html(
     <input type="text" class="ro" value="{_esc(phone)}" readonly>
     <label>Email</label>
     <input type="email" name="email" data-fmt="email" placeholder="you@example.com">
-    <label>Resume <span class="hint">(PDF, DOC — tap to select a file)</span></label>
-    <input type="file" name="resume" accept=".pdf,.doc,.docx,.rtf,.odt,.png,.jpg,.jpeg">
+    <label>Resume <span class="hint">(PDF or DOC only — tap to select a file)</span></label>
+    <input type="file" name="resume" accept=".pdf,.doc,.docx" data-resume="1">
     <label>Gender {_R()}</label>
     {_chips("gender", _GENDER, req=True)}
     <label>Marital Status {_R()}</label>
@@ -837,12 +884,13 @@ def _form_html(
   <section class="step"><h1>Salary &amp; Experience</h1>
     <label>Expected Monthly Salary {_R()}</label>
     {_chips("expected_salary", _SALARY, req=True)}
-    <label>Current Monthly Salary (₹) <span class="hint">(if working)</span></label>
-    <input type="number" name="current_salary" data-fmt="salary" min="0" step="500" placeholder="e.g. 18000">
-    <label>Do you have work experience?</label>
-    {_chips("has_experience", _YESNO)}
-    <label>Experience level <span class="hint">(if experienced)</span></label>
-    <select name="experience_level_id">{_options_html(o["experience_levels"], placeholder="Select…")}</select>
+    <!-- Shown only when "I am a" = Experienced (toggled in JS). -->
+    <div id="expFields" hidden>
+      <label>Current Monthly Salary (₹) <span class="hint">(if working)</span></label>
+      <input type="number" name="current_salary" data-fmt="salary" min="0" step="500" placeholder="e.g. 18000">
+      <label>Experience level</label>
+      <select name="experience_level_id">{_options_html(o["experience_levels"], placeholder="Select…")}</select>
+    </div>
   </section>
 
   <section class="step"><h1>Preferred Roles</h1>
@@ -937,10 +985,23 @@ def _resume_html(token: str, *, error: str = "") -> str:
 {err}
 <form method="post" action="/onboard/resume/submit" enctype="multipart/form-data">
   <input type="hidden" name="token" value="{_esc(token)}">
-  <label>Resume <span class="hint">(PDF, DOC — tap to select a file)</span></label>
-  <input type="file" name="resume" accept=".pdf,.doc,.docx,.rtf,.odt,.png,.jpg,.jpeg" required>
+  <label>Resume <span class="hint">(PDF or DOC only — tap to select a file)</span></label>
+  <input type="file" name="resume" accept=".pdf,.doc,.docx" data-resume="1" required>
   <button class="btn" type="submit" style="margin-top:18px">Submit resume</button>
-</form>"""
+  <p class="field-err" id="resumeErr" style="display:none">Only PDF or DOC files are allowed.</p>
+</form>
+<script>
+(function(){{
+  var f = document.querySelector('[data-resume]'), e = document.getElementById('resumeErr');
+  if(!f) return;
+  f.addEventListener('change', function(){{
+    var ok = !f.files.length || /\\.(pdf|docx?)$/i.test(f.files[0].name);
+    f.classList.toggle('invalid', !ok);
+    if(e) e.style.display = ok ? 'none' : 'block';
+    if(!ok) f.value = '';
+  }});
+}})();
+</script>"""
     return _PAGE.format(body=body)
 
 

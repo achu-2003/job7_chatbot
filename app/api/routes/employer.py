@@ -20,6 +20,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from datetime import datetime
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -31,13 +32,18 @@ from app.chatbot import wa_format as wa
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.credits import (
+    CREDIT_TYPE_ICONS,
+    CREDIT_TYPE_LABELS,
+    INDIVIDUAL_PACKS,
     JOB_CREDIT_PRICE,
     VALIDITY_OPTIONS,
     WELCOME_JOB_CREDITS,
     credit_quote,
     credits_required,
+    find_pack,
 )
 from app.db.repositories import (
+    CreditBundleRepository,
     CreditWalletRepository,
     LookupRepository,
     SubscriptionPlanRepository,
@@ -62,9 +68,22 @@ from app.whatsapp import delivery as wa_delivery
 router = APIRouter()
 log = get_logger("employer")
 
-# Employer menu buttons pushed after KYC verification (ids routed in runtime).
+# Employer menu buttons pushed after an action (reply buttons cap at 3).
 _EMP_MENU = (("emp:post", "Post a Job"), ("emp:candidates", "View Candidates"),
              ("emp:myjobs", "My Jobs"))
+# Full hub as a LIST (up to 10 rows) so the wallet / credits options fit too.
+_EMP_MENU_ROWS = (
+    {"id": "emp:post", "title": "Post a Job", "description": "Create a new job listing"},
+    {"id": "emp:candidates", "title": "View Candidates", "description": "Browse matching candidates"},
+    {"id": "emp:myjobs", "title": "My Jobs", "description": "Your posted jobs"},
+    {"id": "emp:wallet", "title": "🪪 Credits & Wallet", "description": "Manage your credits"},
+    {"id": "emp:buy", "title": "💳 Buy Credits", "description": "View pricing and bundles"},
+)
+
+
+def _emp_menu_list(body: str) -> dict[str, Any]:
+    return wa.list_message(body=body, button_text="Menu",
+                           rows=list(_EMP_MENU_ROWS), section_title="Employer menu")
 
 
 def _esc(v: Any) -> str:
@@ -234,10 +253,10 @@ async def kyc_submit(request: Request) -> HTMLResponse:
     if digits:
         if verified:
             body = (
-                "✅ Business verified! You're all set.\n\nWhat would you like to do "
-                "— post a job, or view candidates?"
+                "✅ Business verified! You're all set.\n\nWhat would you like to do? "
+                "Tap *Menu* to post a job, view candidates, or buy credits."
             )
-            payload = wa.buttons_message(body, _EMP_MENU)
+            payload = _emp_menu_list(body)
         else:
             body = (
                 "📋 KYC submitted — it's now under review. We'll notify you here once "
@@ -373,9 +392,11 @@ async def post_job_submit(request: Request) -> HTMLResponse:
     # 'Have' = the employer's REAL live job-credit balance, mirrored into Redis on
     # first read (then debited there). New/test employers with no live wallet get
     # the welcome grant. Reading live billing is safe (read-only).
-    live = await CreditWalletRepository.job_credit_balance(employer_id)
-    seed = live if live is not None else WELCOME_JOB_CREDITS
-    have = await memory.ensure_job_credits(phone, tenant_id=identity["tenant_id"], seed=seed)
+    live = await CreditWalletRepository.balances(employer_id)
+    seed = live if live is not None else {"job": WELCOME_JOB_CREDITS, "unlock": 0, "boost": 0}
+    bal = await memory.ensure_wallet(phone, tenant_id=identity["tenant_id"], seed=seed,
+                                     welcome=(live is None))
+    have = bal["job"]
 
     district_names = _district_names(form.get("preferred_district_ids") or [], opts=await _job_options())
     settings = get_settings()
@@ -408,13 +429,14 @@ async def _finalize_job(memory, phone: str, tenant_id: str, token: str, validity
         return None
     districts = (job.get("private_jobs") or {}).get("preferredDistrictIds") or []
     need = credits_required(len(districts), validity)
-    await memory.adjust_job_credits(phone, -need, tenant_id=tenant_id)
+    title = (job.get("private_jobs") or {}).get("title") or "your job"
+    await memory.adjust_job_credits(phone, -need, tenant_id=tenant_id,
+                                    description=f"Posted “{title}” ({validity} days)")
     job["private_jobs"]["status"] = "PENDING"
     job["private_jobs"]["validityDays"] = int(validity)
     job["creditsCharged"] = need
     job["validityDays"] = int(validity)
     await memory.add_employer_job(phone, job, tenant_id=tenant_id)
-    title = (job.get("private_jobs") or {}).get("title") or "your job"
     summary = {"title": title, "ref": job.get("ref"), "validity": int(validity), "need": need}
     await memory.update_employer(phone, {"lastActivated": summary}, tenant_id=tenant_id)
     await memory.clear_job_draft(token)
@@ -422,13 +444,13 @@ async def _finalize_job(memory, phone: str, tenant_id: str, token: str, validity
     settings = get_settings()
     digits = re.sub(r"\D", "", phone)
     if digits:
-        bal = await memory.ensure_job_credits(phone, tenant_id=tenant_id, seed=0)
+        bal = (await memory.wallet_balances(phone, tenant_id=tenant_id))["job"]
         body = (
             f"✅ Job activated: *{title}* ({job['ref']}) for {validity} days.\n\n"
             f"💳 {need} job credit{'s' if need != 1 else ''} used — balance {bal}. What next?"
         )
         try:
-            await wa_delivery.send_message(settings, digits, wa.buttons_message(body, _EMP_MENU))
+            await wa_delivery.send_message(settings, digits, _emp_menu_list(body))
         except Exception as exc:  # noqa: BLE001
             log.warning("employer_postjob_push_failed", error=str(exc)[:200])
     return summary
@@ -534,7 +556,9 @@ async def post_job_credits_verify(request: Request) -> JSONResponse:
         return JSONResponse({"error": "unknown_order"}, status_code=404)
     phone, tenant_id = pending["phone"], pending["tenant_id"]
     # Credit the purchased shortfall, then activate (which debits the cost).
-    await memory.adjust_job_credits(phone, int(pending["buy"]), tenant_id=tenant_id)
+    await memory.adjust_job_credits(phone, int(pending["buy"]), tenant_id=tenant_id,
+                                    description=f"Purchased {pending['buy']} job credit"
+                                    f"{'s' if int(pending['buy']) != 1 else ''}")
     summary = await _finalize_job(memory, phone, tenant_id, pending["token"], pending["validity"])
     await memory.clear_payment_order(order_id)
     if summary is None:
@@ -695,9 +719,158 @@ async def _activate_subscription(memory, phone: str, tenant_id: str, plan: dict[
             f"✅ *{plan.get('name')}* plan activated ({label}).{extra}\n\nWhat next?"
         )
         try:
-            await wa_delivery.send_message(settings, digits, wa.buttons_message(body, _EMP_MENU))
+            await wa_delivery.send_message(settings, digits, _emp_menu_list(body))
         except Exception as exc:  # noqa: BLE001
             log.warning("subscribe_push_failed", error=str(exc)[:200])
+
+
+# ---------------------------------------------------------------------------
+# Buy Credits — bundles (credit_bundles) + individual credits + Razorpay
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_buy_item(item: str) -> dict[str, Any] | None:
+    """Resolve a Buy-Credits selection → {price, grant{job,unlock,boost}, label}.
+    ``item`` is 'bundle:<id>' or 'pack:<TYPE>:<qty>'. Price comes from the
+    SERVER (catalog), never the client."""
+    if item.startswith("bundle:"):
+        b = await CreditBundleRepository.get(item.split(":", 1)[1])
+        if not b:
+            return None
+        return {
+            "price": float(b.get("price") or 0), "label": f"{b.get('name')} bundle",
+            "grant": {"job": int(b.get("jobCredits") or 0), "unlock": int(b.get("unlockCredits") or 0),
+                      "boost": int(b.get("boostCredits") or 0)},
+        }
+    if item.startswith("pack:"):
+        _, ctype, qty = (item.split(":") + ["", ""])[:3]
+        pack = find_pack(ctype, qty)
+        if not pack:
+            return None
+        bucket = {"JOB": "job", "UNLOCK": "unlock", "BOOST": "boost"}[pack["type"]]
+        return {
+            "price": float(pack["price"]),
+            "label": f"{pack['credits']} {CREDIT_TYPE_LABELS.get(pack['type'], '')}".strip(),
+            "grant": {"job": 0, "unlock": 0, "boost": 0, bucket: int(pack["credits"])},
+        }
+    return None
+
+
+@router.get("/buy-credits", response_class=HTMLResponse)
+async def buy_credits_page(request: Request, token: str = Query(default="")) -> HTMLResponse:
+    """The 'Buy Credits' page: Bundles + Individual Credits tabs, current balance,
+    Razorpay checkout (test mode)."""
+    memory = get_memory(request)
+    identity = await memory.get_employer_identity(token) if token else None
+    if not identity:
+        return HTMLResponse(_expired_html(), status_code=404)
+    settings = get_settings()
+    if not settings.razorpay_enabled:
+        return HTMLResponse(_page("Payments unavailable",
+            '<div class="ok"><h1>Payments not set up</h1><p class="sub">Razorpay keys '
+            'are not configured.</p></div>'), status_code=503)
+    phone = identity.get("customer_id") or ""
+    employer = await memory.get_employer(phone, tenant_id=identity["tenant_id"])
+    employer_id = (employer or {}).get("private_employers", {}).get("id")
+    live = await CreditWalletRepository.balances(employer_id)
+    seed = live if live is not None else {"job": WELCOME_JOB_CREDITS, "unlock": 0, "boost": 0}
+    bal = await memory.ensure_wallet(phone, tenant_id=identity["tenant_id"], seed=seed,
+                                     welcome=(live is None))
+    bundles = await CreditBundleRepository.list_active()
+    return HTMLResponse(_buy_credits_html(
+        token, bundles=bundles, balance=bal, key_id=settings.razorpay_key_id,
+        test_mode=settings.razorpay_test_mode,
+        prefill_name=identity.get("name") or "", prefill_phone=re.sub(r"\D", "", phone)[-10:],
+    ))
+
+
+@router.post("/buy-credits/order")
+async def buy_credits_order(request: Request) -> JSONResponse:
+    """Create a Razorpay order for a bundle or individual-credit pack."""
+    raw = parse_qs((await request.body()).decode("utf-8"))
+    token = (raw.get("token") or [""])[0].strip()
+    item = (raw.get("item") or [""])[0].strip()
+    memory = get_memory(request)
+    identity = await memory.get_employer_identity(token) if token else None
+    if not identity:
+        return JSONResponse({"error": "expired"}, status_code=404)
+    if not get_settings().razorpay_enabled:
+        return JSONResponse({"error": "payments_unavailable"}, status_code=503)
+    resolved = await _resolve_buy_item(item)
+    if not resolved or resolved["price"] <= 0:
+        return JSONResponse({"error": "unknown_item"}, status_code=400)
+    phone, tenant_id = identity.get("customer_id") or "", identity["tenant_id"]
+    try:
+        order = await rzp.create_order(
+            amount_paise=int(round(resolved["price"] * 100)),
+            receipt=f"buy_{re.sub(r'[^0-9]', '', phone)[-10:]}",
+            notes={"item": item, "phone": phone},
+        )
+    except rzp.RazorpayError as exc:
+        log.warning("buy_credits_order_failed", error=str(exc)[:200])
+        return JSONResponse({"error": "order_failed"}, status_code=502)
+    await memory.stage_payment_order(order["id"], {
+        "kind": "buy_credits", "token": token, "phone": phone, "tenant_id": tenant_id,
+        "grant": resolved["grant"], "label": resolved["label"],
+    })
+    return JSONResponse({
+        "order_id": order["id"], "amount": order["amount"], "currency": order["currency"],
+        "key_id": get_settings().razorpay_key_id, "label": resolved["label"],
+        "prefill_name": identity.get("name") or "", "prefill_phone": re.sub(r"\D", "", phone)[-10:],
+    })
+
+
+@router.post("/buy-credits/verify")
+async def buy_credits_verify(request: Request) -> JSONResponse:
+    """Verify the Razorpay payment, then grant the purchased credits (Redis)."""
+    raw = parse_qs((await request.body()).decode("utf-8"))
+
+    def one(k: str) -> str:
+        return (raw.get(k) or [""])[0].strip()
+
+    order_id, payment_id, signature = one("razorpay_order_id"), one("razorpay_payment_id"), one("razorpay_signature")
+    if not rzp.verify_payment_signature(order_id=order_id, payment_id=payment_id, signature=signature):
+        return JSONResponse({"error": "bad_signature"}, status_code=400)
+    memory = get_memory(request)
+    pending = await memory.get_payment_order(order_id)
+    if not pending or pending.get("kind") != "buy_credits":
+        return JSONResponse({"error": "unknown_order"}, status_code=404)
+    g = pending.get("grant") or {}
+    phone, tenant_id = pending["phone"], pending["tenant_id"]
+    bal = await memory.grant_credits(phone, tenant_id=tenant_id,
+                                     job=int(g.get("job", 0)), unlock=int(g.get("unlock", 0)),
+                                     boost=int(g.get("boost", 0)),
+                                     description=f"Purchased {pending.get('label', 'credits')}")
+    await memory.clear_payment_order(order_id)
+    settings = get_settings()
+    digits = re.sub(r"\D", "", phone)
+    if digits and bal is not None:
+        body = (
+            f"✅ Purchase complete: *{pending.get('label')}*.\n\n"
+            f"💳 Balance — 💼 {bal['job']} job · 🔓 {bal['unlock']} unlock · 🚀 {bal['boost']} boost. What next?"
+        )
+        try:
+            await wa_delivery.send_message(settings, digits, _emp_menu_list(body))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("buy_credits_push_failed", error=str(exc)[:200])
+    return JSONResponse({"ok": True, "redirect": f"/employer/buy-credits?token={pending.get('token','')}"})
+
+
+@router.get("/wallet", response_class=HTMLResponse)
+async def wallet_page(request: Request, token: str = Query(default="")) -> HTMLResponse:
+    """Credits & Wallet (Credit History): the balance card + transaction list."""
+    memory = get_memory(request)
+    identity = await memory.get_employer_identity(token) if token else None
+    if not identity:
+        return HTMLResponse(_expired_html(), status_code=404)
+    phone, tenant_id = identity.get("customer_id") or "", identity["tenant_id"]
+    employer = await memory.get_employer(phone, tenant_id=tenant_id)
+    employer_id = (employer or {}).get("private_employers", {}).get("id")
+    live = await CreditWalletRepository.balances(employer_id)
+    seed = live if live is not None else {"job": WELCOME_JOB_CREDITS, "unlock": 0, "boost": 0}
+    bal = await memory.ensure_wallet(phone, tenant_id=tenant_id, seed=seed, welcome=(live is None))
+    ledger = await memory.wallet_ledger(phone, tenant_id=tenant_id)
+    return HTMLResponse(_wallet_html(token, balance=bal, ledger=ledger))
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +888,10 @@ _STYLE = """
   input,select,textarea{width:100%;box-sizing:border-box;padding:11px 12px;border-radius:8px;
         border:1px solid #2a3942;background:#202c33;color:#e9edef;font-size:15px}
   textarea{min-height:74px;resize:vertical}
+  /* inline validation errors (red border + message below the field) */
+  input.invalid,select.invalid,textarea.invalid{border-color:#ff5b5b !important;
+        box-shadow:0 0 0 1px rgba(255,91,91,.35)}
+  .field-err{color:#ff7a7a;font-size:12.5px;margin:6px 0 2px;line-height:1.3}
   .row{display:flex;gap:10px} .row>div{flex:1}
   .btn{margin-top:20px;width:100%;padding:13px;border:0;border-radius:9px;background:#00a884;
        color:#04150f;font-size:16px;font-weight:600;cursor:pointer}
@@ -802,6 +979,38 @@ _STYLE = """
   .pfeat{background:#202c33;color:#aebac1;border-radius:16px;padding:3px 10px;font-size:12px}
   .curtag{font-size:11px;color:#00d3a7;font-weight:400} .poptag{font-size:11px;color:#ffb020;margin-left:4px}
   .btn:disabled{opacity:.5;cursor:not-allowed}
+  /* Buy Credits */
+  .balcard{background:linear-gradient(135deg,#5b3df5,#7b5cff);border-radius:14px;padding:15px 16px;margin-bottom:14px}
+  .ballbl{color:#e3ddff;font-size:13px;margin-bottom:10px}
+  .balrow{display:flex;justify-content:space-around;text-align:center}
+  .balrow b{font-size:20px;color:#fff;display:block} .balrow small{color:#dcd6ff;font-size:12px}
+  .tabs{display:flex;background:#202c33;border-radius:10px;padding:4px;margin-bottom:14px}
+  .tab{flex:1;padding:10px 0;border:0;border-radius:8px;background:transparent;color:#aebac1;
+       font-size:14px;font-weight:600;cursor:pointer}
+  .tab.on{background:#5b3df5;color:#fff}
+  .sechdr{color:#cdb6ff;font-size:13px;font-weight:700;margin:16px 2px 8px}
+  .savetag{font-size:10px;background:#063a2c;color:#39e6a8;border-radius:10px;padding:2px 8px;margin-left:6px}
+  .buyitem.on{border-color:#5b3df5;background:rgba(91,61,245,.08)}
+  /* Credits & Wallet (Credit History) */
+  .wallethdr{background:linear-gradient(135deg,#5b3df5,#7b5cff);border-radius:16px;padding:16px;margin-bottom:14px}
+  .wrow{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+  .wlbl{color:#fff;font-size:15px;font-weight:600}
+  .recharge{background:rgba(255,255,255,.2);color:#fff;border-radius:20px;padding:7px 14px;
+        font-size:13px;text-decoration:none;font-weight:600}
+  .filters{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+  .filt{border:1px solid #2a3942;background:#202c33;color:#aebac1;border-radius:20px;
+        padding:8px 14px;font-size:13px;cursor:pointer}
+  .filt.on{background:#5b3df5;border-color:#5b3df5;color:#fff;font-weight:600}
+  .txrow{display:flex;align-items:flex-start;gap:11px;background:#111b21;border:1px solid #2a3942;
+        border-radius:12px;padding:13px;margin-bottom:10px}
+  .txicon{width:38px;height:38px;border-radius:50%;background:rgba(0,168,132,.14);
+        display:flex;align-items:center;justify-content:center;font-size:18px;flex:0 0 auto}
+  .txmid{flex:1;min-width:0} .txmid b{font-size:14px} .txmid p{margin:3px 0;color:#aebac1;font-size:13px}
+  .txmid small{color:#6b7d88;font-size:12px}
+  .txamt{text-align:right;flex:0 0 auto} .txcredit{color:#00d3a7;font-weight:700;font-size:16px}
+  .txdebit{color:#ff7a7a;font-weight:700;font-size:16px}
+  .txbal{display:block;margin-top:6px;background:#202c33;color:#8696a0;border-radius:8px;
+        padding:2px 8px;font-size:11px}
 """
 
 
@@ -812,6 +1021,38 @@ def _page(title: str, inner: str) -> str:
         f"<title>{_esc(title)}</title><style>{_STYLE}</style></head>"
         f'<body><div class="card">{inner}</div></body></html>'
     )
+
+
+# Drop-in inline validator for the NATIVE single-page forms (register / KYC):
+# disables the browser's popup bubbles (novalidate) and instead shows a red border
+# + a message under each bad field, driven by the existing required/pattern/type
+# attributes. Plain string (not an f-string) so its braces stay literal.
+_FORM_VALIDATE_JS = r"""<script>
+(function(){
+  function wire(form){
+    form.setAttribute('novalidate','novalidate');
+    form.addEventListener('submit', function(e){
+      [].forEach.call(form.querySelectorAll('.field-err'), function(x){ x.parentNode.removeChild(x); });
+      [].forEach.call(form.querySelectorAll('.invalid'), function(x){ x.classList.remove('invalid'); });
+      var first=null;
+      function err(el,msg){ el.classList.add('invalid'); var d=document.createElement('div');
+        d.className='field-err'; d.textContent=msg; el.insertAdjacentElement('afterend', d); if(!first) first=el; }
+      [].forEach.call(form.querySelectorAll('input,select,textarea'), function(el){
+        if(el.type==='hidden'||el.readOnly||el.disabled||el.offsetParent===null) return;
+        var v=(el.value||'').trim();
+        if(el.hasAttribute('required') && !v){ err(el,'This field is required.'); return; }
+        if(!v) return;
+        if(el.type==='email' && !/^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/.test(v)){ err(el,'Please enter a valid email address.'); return; }
+        if(el.type==='url' && !/^(https?:\/\/)?([a-z0-9-]+\.)+[a-z]{2,}(\/\S*)?$/i.test(v)){ err(el,'Please enter a valid link (e.g. https://…).'); return; }
+        var pat=el.getAttribute('pattern');
+        if(pat){ try{ if(!(new RegExp('^(?:'+pat+')$')).test(v)){ err(el, el.getAttribute('title')||'Please match the requested format.'); } }catch(_){ } }
+      });
+      if(first){ e.preventDefault(); if(first.focus){ try{ first.focus(); }catch(_){ } } first.scrollIntoView({block:'center'}); }
+    });
+  }
+  [].forEach.call(document.querySelectorAll('form[data-validate]'), wire);
+})();
+</script>"""
 
 
 def _options_html(items: "list[dict[str, Any]] | tuple", *, placeholder: str | None = None) -> str:
@@ -891,7 +1132,7 @@ def _register_html(
 <h1>Register your company</h1>
 <p class="sub">A few details about your business so candidates know who's hiring.</p>
 {err}
-<form method="post" action="/employer/register/submit" autocomplete="off">
+<form method="post" action="/employer/register/submit" autocomplete="off" data-validate>
   <input type="hidden" name="token" value="{_esc(token)}">
   <label>Company name <span class="req">*</span></label>
   <input name="company_name" required placeholder="e.g. Acme Technologies">
@@ -942,6 +1183,7 @@ document.getElementById('state_id').addEventListener('change', fillDistricts);
 (function(){{ var s=document.getElementById('state_id');
   function reset(){{ if(s.value){{ s.value=''; }} }} reset(); setTimeout(reset,300); }})();
 </script>
+{_FORM_VALIDATE_JS}
 """
     return _page("Register your company", inner)
 
@@ -953,7 +1195,7 @@ def _kyc_html(token: str, *, error: str = "") -> str:
 <p class="sub">Submit a business proof to unlock full candidate details. Your
 documents are used only for verification.</p>
 {err}
-<form method="post" action="/employer/kyc/submit" autocomplete="off">
+<form method="post" action="/employer/kyc/submit" autocomplete="off" data-validate>
   <input type="hidden" name="token" value="{_esc(token)}">
   <label>Document type <span class="req">*</span></label>
   <select name="kyc_document_type" required>{_options_html(KYC_DOC_TYPES, placeholder='Select…')}</select>
@@ -969,6 +1211,7 @@ documents are used only for verification.</p>
   <input type="url" name="kyc_document_url" required placeholder="https://… (Drive/Dropbox link to the proof)">
   <button class="btn" type="submit">Submit for verification</button>
 </form>
+{_FORM_VALIDATE_JS}
 """
     return _page("Verify your business", inner)
 
@@ -1030,16 +1273,16 @@ def _post_job_html(
   </div>
 
   <div id="salaryBlock">
-    <label>Salary Range</label>
+    <label>Salary Range <span class="req">*</span></label>
     {_radios("salary_period", SALARY_PERIODS)}
     <div class="row">
-      <div><label>Min (₹)</label><input name="salary_min" data-fmt="num" inputmode="numeric" placeholder="Min"></div>
-      <div><label>Max (₹)</label><input name="salary_max" data-fmt="num" inputmode="numeric" placeholder="Max"></div>
+      <div><label>Min (₹) <span class="req">*</span></label><input name="salary_min" data-req="1" data-fmt="num" inputmode="numeric" placeholder="Min"></div>
+      <div><label>Max (₹) <span class="req">*</span></label><input name="salary_max" data-req="1" data-fmt="num" inputmode="numeric" placeholder="Max"></div>
     </div>
   </div>
 
-  <label>Number of Vacancies</label>
-  <input name="vacancies" data-fmt="int" inputmode="numeric" placeholder="e.g. 5">
+  <label>Number of Vacancies <span class="req">*</span></label>
+  <input name="vacancies" data-req="1" data-fmt="int" inputmode="numeric" placeholder="e.g. 5">
 </section>""",
         # 3 — Job Location (conditional: Specific → state+district, Company → address)
         f"""<section class="step"><h1>Job Location</h1>
@@ -1136,64 +1379,90 @@ function render(){{
   post.style.display = cur===steps.length-1 ? 'block' : 'none';
   window.scrollTo(0,0);
 }}
+// --- inline validation helpers (red border + message below the field) ---
+function clearErrs(scope){{
+  [].forEach.call(scope.querySelectorAll('.invalid'), function(x){{ x.classList.remove('invalid'); }});
+  [].forEach.call(scope.querySelectorAll('.field-err'), function(x){{ x.parentNode.removeChild(x); }});
+}}
+function showErr(el, msg){{
+  if(!el) return false;
+  var t = el.tagName;
+  if(t==='INPUT'||t==='SELECT'||t==='TEXTAREA') el.classList.add('invalid');
+  var e = document.createElement('div'); e.className='field-err'; e.textContent = msg;
+  el.insertAdjacentElement('afterend', e);
+  if(el.focus) try {{ el.focus(); }} catch(_){{}}
+  el.scrollIntoView({{block:'center'}});
+  return false;
+}}
+function grp(name){{ var r = steps[cur].querySelector('[name='+name+']'); return r ? r.closest('.opts, .chips') : null; }}
 function valid(){{
-  if(cur===0){{ var t=document.querySelector('[name=title]'); if(!t.value.trim()){{ t.focus(); alert('Please enter a job title'); return false; }} }}
+  clearErrs(steps[cur]);
+  if(cur===0){{ var t=document.querySelector('[name=title]'); if(!t.value.trim()) return showErr(t,'Please enter a job title.'); }}
   // Experience & Salary: conditionally-required fields by experience type.
-  // Detect the step by the field's presence (robust to the step's display name).
   if(steps[cur].querySelector('[name=experience_type]')){{
     var exp=picked('experience_type');
     if(exp==='EXPERIENCED'){{
       var mn=document.querySelector('[name=experience_min]'), mx=document.querySelector('[name=experience_max]');
-      if(!mn.value || !mx.value){{ alert('Please select the min and max years of experience.'); return false; }}
-      if(+mx.value < +mn.value){{ alert("Max years can't be less than min years."); return false; }}
+      if(!mn.value) return showErr(mn,'Select the minimum years of experience.');
+      if(!mx.value) return showErr(mx,'Select the maximum years of experience.');
+      if(+mx.value < +mn.value) return showErr(mx,"Max years can't be less than min years.");
     }} else if(exp==='INTERN'){{
       var pay=picked('intern_payment_type');
-      if(!pay){{ alert('Please choose an intern payment type.'); return false; }}
-      if(pay==='STIPEND'){{ var sp=document.querySelector('[name=intern_stipend]'); if(!sp.value.trim()){{ sp.focus(); alert('Please enter the monthly stipend.'); return false; }} }}
-      if(pay==='TRAINING_FEE'){{ var tf=document.querySelector('[name=training_fee]'); if(!tf.value.trim()){{ tf.focus(); alert('Please enter the training fee.'); return false; }} }}
+      if(!pay) return showErr(grp('intern_payment_type'),'Please choose an intern payment type.');
+      if(pay==='STIPEND'){{ var sp=document.querySelector('[name=intern_stipend]'); if(!sp.value.trim()) return showErr(sp,'Please enter the monthly stipend.'); }}
+      if(pay==='TRAINING_FEE'){{ var tf=document.querySelector('[name=training_fee]'); if(!tf.value.trim()) return showErr(tf,'Please enter the training fee.'); }}
     }}
+    // Salary Range (Monthly / Annual) is required whenever the salary block shows.
+    var sb=document.getElementById('salaryBlock');
+    if(sb && !sb.hidden && !picked('salary_period'))
+      return showErr(grp('salary_period'),'Please choose Monthly or Annual.');
   }}
   // Job Location: a location type must be chosen; Specific needs state + district.
   if(steps[cur].querySelector('[name=job_location_type]')){{
     var lt=picked('job_location_type');
-    if(!lt){{ alert('Please choose a job location.'); return false; }}
+    if(!lt) return showErr(grp('job_location_type'),'Please choose a job location.');
     if(lt==='SPECIFIC'){{
       var st=document.getElementById('job_state_id'), di=document.getElementById('job_district_id');
-      if(!st.value){{ st.focus(); alert('Please select the job state.'); return false; }}
-      if(!di.value){{ di.focus(); alert('Please select the job district.'); return false; }}
+      if(!st.value) return showErr(st,'Please select the job state.');
+      if(!di.value) return showErr(di,'Please select the job district.');
     }}
   }}
   // Candidate Location Preference: at least one district must be selected.
   if(steps[cur].querySelector('#pref_add')){{
-    if(steps[cur].querySelectorAll('[name=preferred_district_ids]').length===0){{
-      alert('Please select at least one candidate district.'); return false;
-    }}
+    if(steps[cur].querySelectorAll('[name=preferred_district_ids]').length===0)
+      return showErr(document.getElementById('pref_add'),'Please select at least one candidate district.');
   }}
   // Apply Methods: a chosen Phone Call / WhatsApp needs its number.
   if(steps[cur].querySelector('[name=apply_modes]')){{
     if(document.getElementById('am_call').checked){{
-      var p=document.querySelector('[name=contact_phone]');
-      if(!p.value.trim()){{ p.focus(); alert('Please enter the contact phone number.'); return false; }}
+      var p=document.querySelector('[name=contact_phone]'); if(!p.value.trim()) return showErr(p,'Please enter the contact phone number.');
     }}
     if(document.getElementById('am_wa').checked){{
-      var w=document.querySelector('[name=contact_whatsapp]');
-      if(!w.value.trim()){{ w.focus(); alert('Please enter the WhatsApp number.'); return false; }}
+      var w=document.querySelector('[name=contact_whatsapp]'); if(!w.value.trim()) return showErr(w,'Please enter the WhatsApp number.');
     }}
   }}
-  // format checks for the current step's numeric/phone fields (only when filled)
-  var step = steps[cur], bad = null, msg = "";
-  [].forEach.call(step.querySelectorAll('[data-fmt]'), function(el){{
-    if(bad) return;
+  // Required fields on this step (data-req) — skipping any inside a hidden block.
+  var reqBad=null;
+  [].forEach.call(steps[cur].querySelectorAll('[data-req]'), function(el){{
+    if(reqBad || el.offsetParent===null) return;        // visible-only
+    if(!(el.value||'').trim()) reqBad=el;
+  }});
+  if(reqBad) return showErr(reqBad,'This field is required.');
+  // format checks for the step's numeric/phone fields (only when filled + visible)
+  var bad=null, msg='';
+  [].forEach.call(steps[cur].querySelectorAll('[data-fmt]'), function(el){{
+    if(bad || el.offsetParent===null) return;
     var v=(el.value||'').trim(); if(!v) return;
     var f=el.getAttribute('data-fmt');
     if(f==='num' && !/^\\d+(\\.\\d+)?$/.test(v)){{ bad=el; msg="Please enter a valid number."; }}
     else if(f==='int' && !/^\\d+$/.test(v)){{ bad=el; msg="Please enter a whole number."; }}
     else if(f==='phone'){{ var d=v.replace(/\\D/g,''); if(d.length>10) d=d.slice(-10); if(!(d.length===10 && /[6-9]/.test(d[0]))){{ bad=el; msg="Enter a valid 10-digit mobile number."; }} }}
   }});
+  if(bad) return showErr(bad,msg);
   // salary max >= min (when both given)
-  var mn=step.querySelector('[name=salary_min]'), mx=step.querySelector('[name=salary_max]');
-  if(!bad && mn && mx && mn.value.trim() && mx.value.trim() && +mx.value < +mn.value){{ bad=mx; msg="Max salary can't be less than the minimum."; }}
-  if(bad){{ bad.focus(); alert(msg); return false; }}
+  var mn2=steps[cur].querySelector('[name=salary_min]'), mx2=steps[cur].querySelector('[name=salary_max]');
+  if(mn2 && mx2 && mn2.value.trim() && mx2.value.trim() && +mx2.value < +mn2.value)
+    return showErr(mx2,"Max salary can't be less than the minimum.");
   return true;
 }}
 next.onclick = function(){{ if(valid()){{ cur=Math.min(cur+1,steps.length-1); render(); }} }};
@@ -1294,6 +1563,185 @@ render();
 </script>
 """
     return _page("Post a job", inner)
+
+
+def _fmt_ts(ts: Any) -> str:
+    """Epoch seconds → 'Jun 15, 2026 · 2:39 PM' (falls back gracefully)."""
+    try:
+        return datetime.fromtimestamp(int(ts)).strftime("%b %d, %Y · %-I:%M %p")
+    except (TypeError, ValueError, OSError):
+        try:                       # Windows strftime has no %-I
+            return datetime.fromtimestamp(int(ts)).strftime("%b %d, %Y · %I:%M %p").replace(" 0", " ")
+        except (TypeError, ValueError, OSError):
+            return ""
+
+
+# Credit-type → wallet icon (matches the balance card / Buy Credits).
+_WALLET_ICONS = {"JOB": "💼", "UNLOCK": "🔓", "BOOST": "🚀"}
+
+
+def _wallet_html(token: str, *, balance: dict[str, int], ledger: list[dict[str, Any]]) -> str:
+    """Credits & Wallet — a Credit Wallet balance card + transaction history with
+    All / Unlocks / Boosts filters (the 'Credit History' screen)."""
+    rows = []
+    for tx in ledger:
+        ctype = str(tx.get("creditType", "JOB")).upper()
+        credit = tx.get("action") != "debit"
+        sign = "+" if credit else "−"
+        amt_cls = "txcredit" if credit else "txdebit"
+        rows.append(
+            f'<div class="txrow" data-type="{ctype}">'
+            f'<div class="txicon">{_WALLET_ICONS.get(ctype, "💳")}</div>'
+            f'<div class="txmid"><b>Transaction</b>'
+            f'<p>{_esc(tx.get("description") or "")}</p>'
+            f'<small>{_esc(_fmt_ts(tx.get("createdAt")))}</small></div>'
+            f'<div class="txamt"><span class="{amt_cls}">{sign}{int(tx.get("amount", 0))}</span>'
+            f'<span class="txbal">Bal: {int(tx.get("balance", 0))}</span></div></div>'
+        )
+    empty = '<p class="sub" id="txEmpty" style="text-align:center;margin-top:24px">No transactions yet.</p>'
+    inner = f"""
+<div class="wallethdr">
+  <div class="wrow"><span class="wlbl">🪪 Credit Wallet</span>
+    <a class="recharge" href="/employer/buy-credits?token={_esc(token)}">＋ Recharge</a></div>
+  <div class="balrow">
+    <div><b>💼 {balance.get('job', 0)}</b><small>Job</small></div>
+    <div><b>🔓 {balance.get('unlock', 0)}</b><small>Unlock</small></div>
+    <div><b>🚀 {balance.get('boost', 0)}</b><small>Boost</small></div>
+  </div>
+</div>
+<div class="filters">
+  <button type="button" class="filt on" data-f="ALL">All Transactions</button>
+  <button type="button" class="filt" data-f="UNLOCK">Unlocks</button>
+  <button type="button" class="filt" data-f="BOOST">Boosts</button>
+</div>
+<div id="txlist">{''.join(rows) or empty}</div>
+<a class="btn" href="/employer/buy-credits?token={_esc(token)}" style="display:block;text-align:center;text-decoration:none">Add Credits</a>
+<script>
+[].forEach.call(document.querySelectorAll('.filt'), function(b){{
+  b.addEventListener('click', function(){{
+    [].forEach.call(document.querySelectorAll('.filt'), function(x){{ x.classList.remove('on'); }});
+    b.classList.add('on');
+    var f = b.getAttribute('data-f');
+    [].forEach.call(document.querySelectorAll('.txrow'), function(r){{
+      r.style.display = (f === 'ALL' || r.getAttribute('data-type') === f) ? '' : 'none';
+    }});
+  }});
+}});
+</script>
+"""
+    return _page("Credits & Wallet", inner)
+
+
+def _buy_credits_html(token: str, *, bundles: list[dict[str, Any]], balance: dict[str, int],
+                      key_id: str, test_mode: bool, prefill_name: str, prefill_phone: str) -> str:
+    """Buy Credits: a Current Balance card + Bundles / Individual Credits tabs,
+    each item a selectable card; pay the selected one via Razorpay checkout."""
+    # Bundles tab (credit_bundles).
+    bcards = []
+    for b in bundles:
+        price = float(b.get("price") or 0)
+        feats = (f'<span class="pfeat">💼 {b.get("jobCredits", 0)} Job</span>'
+                 f'<span class="pfeat">🔓 {b.get("unlockCredits", 0)} Unlocks</span>'
+                 f'<span class="pfeat">🚀 {b.get("boostCredits", 0)} Boost</span>')
+        pop = '<span class="poptag">★ Popular</span>' if str(b.get("bundleType")) == "GROWTH" else ""
+        bcards.append(
+            f'<label class="plan buyitem" data-item="bundle:{_esc(b.get("id"))}" data-price="{price}">'
+            f'<div class="prow"><input type="radio" name="buy"><b>{_esc(b.get("name"))}</b>{pop}'
+            f'<span class="pprice">₹{int(price) if price == int(price) else price}</span></div>'
+            f'<div class="pfeats">{feats}</div></label>'
+        )
+    # Individual Credits tab (per-type packs).
+    icards = []
+    for ctype, packs in INDIVIDUAL_PACKS.items():
+        icards.append(f'<div class="sechdr">{CREDIT_TYPE_ICONS.get(ctype, "")} {_esc(CREDIT_TYPE_LABELS.get(ctype, ctype))}</div>')
+        for i, (qty, price) in enumerate(packs):
+            per = round(price / qty, 1) if qty else price
+            save = '<span class="savetag">SAVE MORE</span>' if i > 0 else ""
+            icards.append(
+                f'<label class="plan buyitem" data-item="pack:{ctype}:{qty}" data-price="{price}">'
+                f'<div class="prow"><input type="radio" name="buy">'
+                f'<b>{qty} Credit{"s" if qty != 1 else ""}</b>{save}'
+                f'<span class="pprice">₹{price}<small>₹{per} / credit</small></span></div></label>'
+            )
+    badge = '<span class="testbadge">TEST MODE</span>' if test_mode else ""
+    inner = f"""
+<h1>💳 Buy Credits {badge}</h1>
+<div class="balcard">
+  <div class="ballbl">Current Balance</div>
+  <div class="balrow">
+    <div><b>💼 {balance.get('job', 0)}</b><small>Job</small></div>
+    <div><b>🔓 {balance.get('unlock', 0)}</b><small>Unlock</small></div>
+    <div><b>🚀 {balance.get('boost', 0)}</b><small>Boost</small></div>
+  </div>
+</div>
+<div class="tabs">
+  <button type="button" class="tab on" id="tabBtnB">Bundles</button>
+  <button type="button" class="tab" id="tabBtnI">Individual Credits</button>
+</div>
+<div id="tabBundles">{''.join(bcards)}</div>
+<div id="tabIndividual" hidden>{''.join(icards)}</div>
+<button type="button" class="btn" id="buyBtn" disabled>Select an option</button>
+<p class="vnote" id="buyNote"></p>
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+<script>
+var TOKEN = {json.dumps(token)};
+var PREFILL = {{name: {json.dumps(prefill_name)}, contact: {json.dumps(prefill_phone)}}};
+var sel = null, buyBtn = document.getElementById('buyBtn'), note = document.getElementById('buyNote');
+function selTab(which){{
+  document.getElementById('tabBundles').hidden = which !== 'b';
+  document.getElementById('tabIndividual').hidden = which !== 'i';
+  document.getElementById('tabBtnB').classList.toggle('on', which === 'b');
+  document.getElementById('tabBtnI').classList.toggle('on', which === 'i');
+}}
+document.getElementById('tabBtnB').addEventListener('click', function(){{ selTab('b'); }});
+document.getElementById('tabBtnI').addEventListener('click', function(){{ selTab('i'); }});
+[].forEach.call(document.querySelectorAll('.buyitem'), function(el){{
+  el.addEventListener('click', function(){{
+    [].forEach.call(document.querySelectorAll('.buyitem'), function(x){{ x.classList.remove('on'); var r=x.querySelector('input'); if(r) r.checked=false; }});
+    el.classList.add('on'); var r=el.querySelector('input'); if(r) r.checked=true;
+    sel = el.getAttribute('data-item');
+    var price = parseFloat(el.getAttribute('data-price'));
+    buyBtn.disabled = false;
+    buyBtn.textContent = 'Pay ₹' + (price % 1 ? price : price.toFixed(0));
+  }});
+}});
+function post(url, data){{
+  var body = Object.keys(data).map(function(k){{ return encodeURIComponent(k)+'='+encodeURIComponent(data[k]); }}).join('&');
+  return fetch(url, {{method:'POST', headers:{{'Content-Type':'application/x-www-form-urlencoded'}}, body:body}});
+}}
+buyBtn.addEventListener('click', function(){{
+  if(!sel) return;
+  buyBtn.disabled = true; note.textContent = 'Starting secure checkout…';
+  post('/employer/buy-credits/order', {{token: TOKEN, item: sel}})
+    .then(function(r){{ return r.json(); }})
+    .then(function(o){{
+      if(o.error){{ note.textContent = 'Could not start checkout. Please try again.'; buyBtn.disabled = false; return; }}
+      var rzp = new Razorpay({{
+        key: o.key_id, order_id: o.order_id, amount: o.amount, currency: o.currency,
+        name: 'Jobs7', description: o.label,
+        prefill: {{name: o.prefill_name || PREFILL.name, contact: o.prefill_phone || PREFILL.contact}},
+        theme: {{color: '#5b3df5'}},
+        handler: function(resp){{
+          note.textContent = 'Confirming payment…';
+          post('/employer/buy-credits/verify', {{
+            razorpay_order_id: resp.razorpay_order_id,
+            razorpay_payment_id: resp.razorpay_payment_id,
+            razorpay_signature: resp.razorpay_signature
+          }}).then(function(r){{ return r.json(); }}).then(function(v){{
+            if(v.ok){{ window.location = v.redirect; }}
+            else {{ note.textContent = 'Payment verification failed. If charged, contact support.'; buyBtn.disabled = false; }}
+          }});
+        }},
+        modal: {{ondismiss: function(){{ note.textContent = 'Payment cancelled.'; buyBtn.disabled = false; }}}}
+      }});
+      rzp.on('payment.failed', function(){{ note.textContent = 'Payment failed. Please try again.'; buyBtn.disabled = false; }});
+      rzp.open();
+    }})
+    .catch(function(){{ note.textContent = 'Network error. Please try again.'; buyBtn.disabled = false; }});
+}});
+</script>
+"""
+    return _page("Buy credits", inner)
 
 
 def _subscribe_html(token: str, plans: list[dict[str, Any]], *, key_id: str,
@@ -1484,7 +1932,7 @@ function post(url, data){{
 }}
 var note = document.getElementById('payNote'), actBtn = document.getElementById('actBtn');
 document.getElementById('actForm').addEventListener('submit', function(e){{
-  if(!document.getElementById('tc').checked){{ e.preventDefault(); alert('Please accept the Terms to continue.'); return; }}
+  if(!document.getElementById('tc').checked){{ e.preventDefault(); note.textContent = 'Please accept the Terms to continue.'; note.style.color = '#ff7a7a'; return; }}
   // Enough credits → let the normal POST to /post-job/activate go through.
   var need = Math.max(1, NAMES.length) * (MULT[days] || 1);
   if(need - HAVE <= 0) return;

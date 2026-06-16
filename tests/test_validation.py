@@ -57,8 +57,13 @@ def test_valid_dob_age_window():
 
 
 def test_valid_resume_filename():
+    # only PDF / DOC / DOCX are accepted
     assert v.valid_resume_filename("My_CV.pdf") and v.valid_resume_filename("resume.DOCX")
+    assert v.valid_resume_filename("cv.doc")
+    # everything else (images, archives, executables) is rejected
     assert not v.valid_resume_filename("song.mp3") and not v.valid_resume_filename("x.exe")
+    assert not v.valid_resume_filename("photo.jpg") and not v.valid_resume_filename("scan.png")
+    assert not v.valid_resume_filename("notes.rtf") and not v.valid_resume_filename("doc.odt")
 
 
 def test_validate_registration_requires_name_only():

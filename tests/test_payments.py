@@ -44,6 +44,47 @@ def test_subscribe_page_renders_plans_and_checkout():
     assert "Activate Free Plan" in out or "o.free" in out
 
 
+def test_individual_credit_packs_match_screenshots():
+    from app import credits as c
+    # Job credits: ₹649/credit; 10 for ₹5192
+    assert c.find_pack("JOB", 1) == {"type": "JOB", "credits": 1, "price": 649}
+    assert c.find_pack("JOB", 10)["price"] == 5192
+    # Unlock: ₹49, 10→₹392, 100→₹3920
+    assert c.find_pack("UNLOCK", 1)["price"] == 49
+    assert c.find_pack("UNLOCK", 100)["price"] == 3920
+    # Boost: ₹999, 10→₹792
+    assert c.find_pack("BOOST", 1)["price"] == 999
+    assert c.find_pack("BOOST", 10)["price"] == 792
+    # unknown combos rejected (can't be tampered into a free grant)
+    assert c.find_pack("JOB", 7) is None and c.find_pack("XXX", 1) is None
+
+
+def test_buy_credits_page_renders_bundles_and_individual():
+    from app.api.routes.employer import _buy_credits_html
+    bundles = [{"id": "b1", "bundleType": "STARTER", "name": "Starter", "price": 999.0,
+                "jobCredits": 1, "unlockCredits": 20, "boostCredits": 1}]
+    out = _buy_credits_html("tok", bundles=bundles, balance={"job": 1, "unlock": 0, "boost": 0},
+                            key_id="rzp_test_x", test_mode=True, prefill_name="A", prefill_phone="9000000000")
+    assert "Current Balance" in out and "TEST MODE" in out
+    assert ">Bundles<" in out and ">Individual Credits<" in out
+    assert 'data-item="bundle:b1"' in out and "Starter" in out
+    assert 'data-item="pack:JOB:1"' in out and 'data-item="pack:UNLOCK:100"' in out
+    assert "/employer/buy-credits/order" in out and "/employer/buy-credits/verify" in out
+    assert "new Razorpay(" in out
+
+
+async def test_resolve_buy_item_and_grant():
+    import app.api.routes.employer as emp
+    # an individual pack resolves to its server price + single-bucket grant
+    r = await emp._resolve_buy_item("pack:UNLOCK:10")
+    assert r["price"] == 392.0 and r["grant"] == {"job": 0, "unlock": 10, "boost": 0}
+    r2 = await emp._resolve_buy_item("pack:BOOST:1")
+    assert r2["price"] == 999.0 and r2["grant"]["boost"] == 1
+    # garbage item → None (rejected)
+    assert await emp._resolve_buy_item("pack:JOB:3") is None
+    assert await emp._resolve_buy_item("nonsense") is None
+
+
 class _FakeRedis:
     def __init__(self):
         self.store: dict[str, str] = {}
@@ -74,6 +115,52 @@ async def test_payment_order_stage_get_clear():
     assert got and got["plan_id"] == "p_growth"
     await m.clear_payment_order("order_abc")
     assert await m.get_payment_order("order_abc") is None
+
+
+async def test_wallet_ledger_records_transactions():
+    m = await _mem()
+    # welcome seed → a 'Congratulations …FREE job credit' ledger row
+    await m.ensure_wallet("919876543210", tenant_id="t1", seed={"job": 1, "unlock": 0, "boost": 0}, welcome=True)
+    # a purchase + a debit, each with a description, get logged
+    await m.grant_credits("919876543210", tenant_id="t1", unlock=20, description="Purchased Starter bundle")
+    await m.adjust_job_credits("919876543210", -1, tenant_id="t1", description="Posted a job")
+    led = await m.wallet_ledger("919876543210", tenant_id="t1")
+    assert len(led) == 3
+    assert led[0]["description"] == "Posted a job" and led[0]["action"] == "debit"   # newest first
+    assert led[0]["creditType"] == "JOB" and led[0]["balance"] == 0
+    assert led[1]["creditType"] == "UNLOCK" and led[1]["amount"] == 20
+    assert "Congratulations" in led[2]["description"] and led[2]["balance"] == 1
+
+
+def test_wallet_page_renders_balance_and_history():
+    from app.api.routes.employer import _wallet_html
+    ledger = [
+        {"creditType": "JOB", "action": "credit", "amount": 1, "balance": 1,
+         "description": "Congratulations! You have received 1 FREE job credit.", "createdAt": 1750000000},
+        {"creditType": "UNLOCK", "action": "credit", "amount": 20, "balance": 20,
+         "description": "Purchased Starter bundle", "createdAt": 1750000500},
+    ]
+    out = _wallet_html("tok", balance={"job": 1, "unlock": 20, "boost": 0}, ledger=list(reversed(ledger)))
+    assert "Credit Wallet" in out and "Recharge" in out
+    assert "All Transactions" in out and ">Unlocks<" in out and ">Boosts<" in out
+    assert "Congratulations" in out and "Bal: 20" in out
+    assert 'data-type="UNLOCK"' in out and 'data-type="JOB"' in out
+    assert "/employer/buy-credits?token=tok" in out          # Recharge / Add Credits link
+
+
+async def test_wallet_ensure_and_grant_all_buckets():
+    m = await _mem()
+    # seeds each bucket from the live balance only the first time
+    bal = await m.ensure_wallet("919876543210", tenant_id="t1", seed={"job": 1, "unlock": 5, "boost": 2})
+    assert bal == {"job": 1, "unlock": 5, "boost": 2}
+    bal = await m.ensure_wallet("919876543210", tenant_id="t1", seed={"job": 99, "unlock": 99, "boost": 99})
+    assert bal == {"job": 1, "unlock": 5, "boost": 2}          # seed ignored after first
+    # a purchase grants into the right buckets
+    bal = await m.grant_credits("919876543210", tenant_id="t1", unlock=10)
+    assert bal == {"job": 1, "unlock": 15, "boost": 2}
+    bal = await m.grant_credits("919876543210", tenant_id="t1", job=2, boost=1)
+    assert bal == {"job": 3, "unlock": 15, "boost": 3}
+    assert await m.wallet_balances("919876543210", tenant_id="t1") == {"job": 3, "unlock": 15, "boost": 3}
 
 
 async def test_activate_subscription_grants_credits():

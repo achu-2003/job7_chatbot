@@ -578,30 +578,108 @@ class ConversationMemory:
     # tables are never written. The balance lives on the employer record so it
     # survives across posts within the 30-day test window.
 
+    # The three credit buckets + a running ledger of every credit/debit, so the
+    # Credits & Wallet (Credit History) page can show balances + transactions.
+    _WALLET_FIELDS = {"job": "walletJobCredits", "unlock": "walletUnlockCredits",
+                      "boost": "walletBoostCredits"}
+    _MAX_LEDGER = 100
+
+    def _ledger_add(self, rec: dict[str, Any], bucket: str, delta: int, description: str) -> None:
+        """Append one ledger row (balance = the bucket's value AFTER the change)."""
+        field = self._WALLET_FIELDS[bucket]
+        led = rec.setdefault("walletLedger", [])
+        led.append({
+            "creditType": bucket.upper(),
+            "action": "credit" if delta >= 0 else "debit",
+            "amount": abs(int(delta)),
+            "balance": int(rec.get(field) or 0),
+            "description": description,
+            "createdAt": int(time.time()),
+        })
+        if len(led) > self._MAX_LEDGER:
+            rec["walletLedger"] = led[-self._MAX_LEDGER:]
+
     async def ensure_job_credits(
         self, phone: str, *, tenant_id: str | None, seed: int
     ) -> int:
-        """Current job-credit balance, seeding it from ``seed`` (the live balance,
-        or the welcome grant) only the first time. Returns the balance."""
+        """Job-credit balance, seeding the whole wallet's job bucket from ``seed``
+        the first time. Returns the job balance. (Welcome ledger is written by the
+        route via ``ensure_wallet(welcome=...)``.)"""
+        bal = await self.ensure_wallet(
+            phone, tenant_id=tenant_id, seed={"job": int(seed), "unlock": 0, "boost": 0})
+        return bal["job"]
+
+    async def ensure_wallet(
+        self, phone: str, *, tenant_id: str | None, seed: dict[str, int], welcome: bool = False,
+    ) -> dict[str, int]:
+        """Return {job, unlock, boost}, seeding any unset bucket from ``seed`` the
+        first time. On the very first creation, write opening ledger rows — the
+        'Congratulations! …1 FREE job credit' welcome entry when ``welcome``."""
         rec = await self.get_employer(phone, tenant_id=tenant_id)
         if rec is None:
-            return 0
-        if rec.get("walletJobCredits") is None:
-            rec["walletJobCredits"] = int(seed)
+            return {"job": 0, "unlock": 0, "boost": 0}
+        fresh = all(rec.get(f) is None for f in self._WALLET_FIELDS.values())
+        changed = False
+        for k, field in self._WALLET_FIELDS.items():
+            if rec.get(field) is None:
+                rec[field] = max(0, int(seed.get(k, 0))); changed = True
+        if changed and fresh:
+            jb = int(seed.get("job", 0))
+            if welcome and jb > 0:
+                self._ledger_add(rec, "job", jb,
+                    f"Congratulations! You have received {jb} FREE job credit"
+                    f"{'s' if jb != 1 else ''} to post your first job. Start hiring today!")
+            else:
+                for k in ("job", "unlock", "boost"):
+                    if int(seed.get(k, 0)) > 0:
+                        self._ledger_add(rec, k, int(seed[k]), "Opening balance")
+        if changed:
             await self.save_employer(phone, rec, tenant_id=tenant_id)
-        return int(rec.get("walletJobCredits") or 0)
+        return {k: int(rec.get(f) or 0) for k, f in self._WALLET_FIELDS.items()}
+
+    async def wallet_balances(
+        self, phone: str, *, tenant_id: str | None,
+    ) -> dict[str, int]:
+        rec = await self.get_employer(phone, tenant_id=tenant_id)
+        if rec is None:
+            return {"job": 0, "unlock": 0, "boost": 0}
+        return {k: int(rec.get(f) or 0) for k, f in self._WALLET_FIELDS.items()}
+
+    async def wallet_ledger(
+        self, phone: str, *, tenant_id: str | None,
+    ) -> list[dict[str, Any]]:
+        """The transaction history, newest first."""
+        rec = await self.get_employer(phone, tenant_id=tenant_id)
+        return list(reversed((rec or {}).get("walletLedger") or []))
 
     async def adjust_job_credits(
-        self, phone: str, delta: int, *, tenant_id: str | None
+        self, phone: str, delta: int, *, tenant_id: str | None, description: str = "",
     ) -> int | None:
-        """Add (delta>0, a simulated purchase) or debit (delta<0) job credits.
-        Floors at 0. Returns the new balance, or None if not registered."""
+        """Add (delta>0) or debit (delta<0) job credits; floors at 0; logs the
+        ledger. Returns the new job balance, or None if not registered."""
+        bal = await self.grant_credits(phone, tenant_id=tenant_id, job=int(delta),
+                                       description=description)
+        return bal["job"] if bal else None
+
+    async def grant_credits(
+        self, phone: str, *, tenant_id: str | None, job: int = 0, unlock: int = 0, boost: int = 0,
+        description: str = "",
+    ) -> dict[str, int] | None:
+        """Add (or debit, with negatives) credits across buckets; floors at 0;
+        logs a ledger row per non-zero bucket. Returns the new {job, unlock,
+        boost}, or None if not registered."""
         rec = await self.get_employer(phone, tenant_id=tenant_id)
         if rec is None:
             return None
-        rec["walletJobCredits"] = max(0, int(rec.get("walletJobCredits") or 0) + int(delta))
+        for bucket, delta in (("job", job), ("unlock", unlock), ("boost", boost)):
+            if not delta:
+                continue
+            field = self._WALLET_FIELDS[bucket]
+            rec[field] = max(0, int(rec.get(field) or 0) + int(delta))
+            if description:
+                self._ledger_add(rec, bucket, int(delta), description)
         await self.save_employer(phone, rec, tenant_id=tenant_id)
-        return rec["walletJobCredits"]
+        return {k: int(rec.get(f) or 0) for k, f in self._WALLET_FIELDS.items()}
 
     # --- staged job draft (between the post-job form and the Activate screen) -
 
@@ -668,10 +746,12 @@ class ConversationMemory:
         if rec is None:
             return None
         rec["subscription"] = subscription
-        if grant_unlock:
-            rec["walletUnlockCredits"] = int(rec.get("walletUnlockCredits") or 0) + int(grant_unlock)
-        if grant_boost:
-            rec["walletBoostCredits"] = int(rec.get("walletBoostCredits") or 0) + int(grant_boost)
+        desc = f"{subscription.get('planName', 'Plan')} subscription"
+        for bucket, field, amt in (("unlock", "walletUnlockCredits", grant_unlock),
+                                   ("boost", "walletBoostCredits", grant_boost)):
+            if amt:
+                rec[field] = int(rec.get(field) or 0) + int(amt)
+                self._ledger_add(rec, bucket, int(amt), desc)
         await self.save_employer(phone, rec, tenant_id=tenant_id)
         return rec
 

@@ -629,13 +629,18 @@ async def test_kyc_under_review_message():
 
 
 async def test_verified_employer_sees_menu():
-    """A verified employer greeting gets the employer hub (3 buttons)."""
+    """A verified employer greeting gets the employer hub as a LIST menu (so
+    Buy Credits / Upgrade Plan fit alongside the core three)."""
     rt = _runtime()
     _stub_memory(rt, facts={"lane": "creator"}, employer=_employer())
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "hi")
-    titles = [b["reply"]["title"] for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
-    assert titles == ["Post a Job", "View Candidates", "My Jobs"]
+    interactive = out["whatsapp_interactive"]["interactive"]
+    assert interactive["type"] == "list"
+    rows = interactive["action"]["sections"][0]["rows"]
+    ids = [r["id"] for r in rows]
+    # core three + Credits & Wallet + Buy Credits (no Upgrade Plan)
+    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy"]
     assert "acme" in out["response"].lower()
 
 
@@ -748,8 +753,11 @@ async def test_employer_search_no_match_nudges_to_menu():
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "astronaut")
     assert "no candidates found" in out["response"].lower()
-    titles = [b["reply"]["title"] for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
-    assert titles == ["Post a Job", "View Candidates", "My Jobs"]
+    # nudges back to the FULL list menu (all options reachable)
+    interactive = out["whatsapp_interactive"]["interactive"]
+    assert interactive["type"] == "list"
+    ids = [r["id"] for r in interactive["action"]["sections"][0]["rows"]]
+    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy"]
 
 
 async def test_unverified_employer_cannot_view_candidates():
