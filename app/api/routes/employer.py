@@ -4,12 +4,12 @@ Mirrors the candidate onboarding form, but for the *employer* side and shaped
 to the live ``private_employers`` table. Three tokenised forms, all keyed to one
 per-phone employer token:
 
-    GET  /employer/register?token=...   → company profile form  (Stage 1)
+    GET  /employer/register?token=...   → company profile form
     POST /employer/register/submit      → stage the employer record in Redis
-    GET  /employer/kyc?token=...        → KYC / business-proof form (Stage 2)
-    POST /employer/kyc/submit           → merge KYC, auto-verify (test mode)
-    GET  /employer/post-job?token=...   → post-a-job form (Stage 4)
+    GET  /employer/post-job?token=...   → post-a-job form
     POST /employer/post-job/submit      → append the job to the employer record
+
+A created profile is immediately ready (no business-verification/KYC step).
 
 Everything is stored in **Redis only** (never the business DB) — this is the
 test harness for the employer flow. Each submit proactively pushes the next
@@ -51,18 +51,15 @@ from app.db.repositories import (
 from app.payments import razorpay as rzp
 from app.employer import (
     APPLY_MODES,
-    COMPANY_SIZES,
     EXPERIENCE_TYPES,
     JOB_LOCATION_TYPES,
     INTERN_PAYMENT_TYPES,
     JOB_TYPES,
-    KYC_DOC_TYPES,
     SALARY_PERIODS,
-    apply_kyc,
     build_employer_record,
     build_job_record,
 )
-from app.validation import validate_employer, validate_job_post, validate_kyc
+from app.validation import validate_employer, validate_job_post
 from app.whatsapp import delivery as wa_delivery
 
 router = APIRouter()
@@ -93,7 +90,7 @@ def _esc(v: Any) -> str:
 async def _reg_options() -> dict[str, list[dict[str, Any]]]:
     """Reference data for the registration form (loaded sequentially to avoid
     opening many Postgres connections at once)."""
-    kinds = ("industries", "designations", "states", "districts")
+    kinds = ("states", "districts")
     return {k: await LookupRepository.options(k) for k in kinds}
 
 
@@ -142,10 +139,6 @@ async def register_submit(request: Request) -> HTMLResponse:
 
     form = {
         "company_name": one("company_name"),
-        "industry_id": one("industry_id"),
-        "company_size": one("company_size"),
-        "contact_person": one("contact_person"),
-        "designation_id": one("designation_id"),
         "email": one("email"),
         "primary_phone": identity.get("customer_id") or one("primary_phone"),
         "website": one("website"),
@@ -173,107 +166,25 @@ async def register_submit(request: Request) -> HTMLResponse:
     await memory.save_employer(phone, record, tenant_id=identity["tenant_id"])
 
     company = record["private_employers"].get("companyName") or "your company"
-    # PROACTIVELY push the next step (KYC) so the chat continues without typing.
+    # No KYC step — the profile is ready, so proactively push the menu.
     settings = get_settings()
     digits = re.sub(r"\D", "", phone)
     if digits:
         body = (
-            f"✅ Company profile created for *{company}*!\n\nOne more step — verify "
-            "your business to unlock candidate details. Tap below to submit your KYC."
+            f"✅ Company profile created for *{company}*!\n\nYou're all set. "
+            "What would you like to do today?"
         )
         try:
-            await wa_delivery.send_message(
-                settings, digits, wa.buttons_message(body, [("emp:kyc", "Verify Business")])
-            )
+            await wa_delivery.send_message(settings, digits, _emp_menu_list(body))
         except Exception as exc:  # noqa: BLE001 — proactive push is best-effort
             log.warning("employer_register_push_failed", error=str(exc)[:200])
 
     number = re.sub(r"\D", "", settings.whatsapp_business_number or "")
     return HTMLResponse(_success_html(
         "Company profile created!",
-        "Your details are saved. Head back to WhatsApp to verify your business "
-        "and start posting jobs.",
+        "Your details are saved. Head back to WhatsApp to start posting jobs and "
+        "viewing candidates.",
         business_number=number,
-    ))
-
-
-@router.get("/kyc", response_class=HTMLResponse)
-async def kyc_form(request: Request, token: str = Query(default="")) -> HTMLResponse:
-    identity = await get_memory(request).get_employer_identity(token) if token else None
-    if not identity:
-        return HTMLResponse(_expired_html(), status_code=404)
-    return HTMLResponse(_kyc_html(token))
-
-
-@router.post("/kyc/submit", response_class=HTMLResponse)
-async def kyc_submit(request: Request) -> HTMLResponse:
-    raw = parse_qs((await request.body()).decode("utf-8"))
-
-    def one(key: str) -> str:
-        v = raw.get(key) or []
-        return v[0].strip() if v else ""
-
-    token = one("token")
-    if not token:
-        return HTMLResponse(_expired_html(), status_code=400)
-    memory = get_memory(request)
-    identity = await memory.get_employer_identity(token)
-    if not identity:
-        return HTMLResponse(_expired_html(), status_code=404)
-    phone = identity.get("customer_id") or ""
-    record = await memory.get_employer(phone, tenant_id=identity["tenant_id"])
-    if not record:
-        return HTMLResponse(_expired_html(), status_code=404)
-
-    # SERVER-SIDE VALIDATION: a document type + link are required; GST/PAN
-    # validated when filled. Re-show the KYC form with the error.
-    kyc_form_data = {
-        "kyc_document_type": one("kyc_document_type"),
-        "kyc_document_url": one("kyc_document_url"),
-        "gst_number": one("gst_number"),
-        "pan_number": one("pan_number"),
-    }
-    errors = validate_kyc(kyc_form_data)
-    if errors:
-        return HTMLResponse(_kyc_html(token, error=next(iter(errors.values()))), status_code=400)
-
-    settings = get_settings()
-    apply_kyc(
-        record,
-        doc_type=one("kyc_document_type"),
-        doc_url=one("kyc_document_url"),
-        gst=one("gst_number"),
-        pan=one("pan_number"),
-        auto_verify=settings.employer_kyc_auto_verify,
-    )
-    await memory.save_employer(phone, record, tenant_id=identity["tenant_id"])
-
-    verified = record["private_employers"].get("kycStatus") == "VERIFIED"
-    digits = re.sub(r"\D", "", phone)
-    if digits:
-        if verified:
-            body = (
-                "✅ Business verified! You're all set.\n\nWhat would you like to do? "
-                "Tap *Menu* to post a job, view candidates, or buy credits."
-            )
-            payload = _emp_menu_list(body)
-        else:
-            body = (
-                "📋 KYC submitted — it's now under review. We'll notify you here once "
-                "your business is verified, then you can view full candidate details."
-            )
-            payload = wa.text_message(body)
-        try:
-            await wa_delivery.send_message(settings, digits, payload)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("employer_kyc_push_failed", error=str(exc)[:200])
-
-    number = re.sub(r"\D", "", settings.whatsapp_business_number or "")
-    sub = ("Your business is verified — head back to WhatsApp to post a job or view "
-           "candidates." if verified else
-           "KYC submitted. We'll verify your business and notify you on WhatsApp.")
-    return HTMLResponse(_success_html(
-        "Business verified!" if verified else "KYC submitted!", sub, business_number=number,
     ))
 
 
@@ -446,8 +357,9 @@ async def _finalize_job(memory, phone: str, tenant_id: str, token: str, validity
     if digits:
         bal = (await memory.wallet_balances(phone, tenant_id=tenant_id))["job"]
         body = (
-            f"✅ Job activated: *{title}* ({job['ref']}) for {validity} days.\n\n"
-            f"💳 {need} job credit{'s' if need != 1 else ''} used — balance {bal}. What next?"
+            f"✅ Job submitted: *{title}* ({job['ref']}) for {validity} days.\n\n"
+            f"💳 {need} job credit{'s' if need != 1 else ''} used — balance {bal}.\n\n"
+            "📞 Our team will review it and contact you shortly. What next?"
         )
         try:
             await wa_delivery.send_message(settings, digits, _emp_menu_list(body))
@@ -464,8 +376,9 @@ def _job_activated_html(summary: dict | None) -> HTMLResponse:
     need = s.get("need") or 0
     number = re.sub(r"\D", "", get_settings().whatsapp_business_number or "")
     return HTMLResponse(_success_html(
-        "Job activated!", f"“{title}” is live for {days} days ({ref}). "
-        f"{need} credit{'s' if need != 1 else ''} used. Head back to WhatsApp to view candidates.",
+        "Job submitted!", f"“{title}” has been submitted for {days} days ({ref}). "
+        f"{need} credit{'s' if need != 1 else ''} used. Our team will review it and "
+        "contact you shortly. Head back to WhatsApp to continue.",
         business_number=number,
     ))
 
@@ -837,23 +750,45 @@ async def buy_credits_verify(request: Request) -> JSONResponse:
         return JSONResponse({"error": "unknown_order"}, status_code=404)
     g = pending.get("grant") or {}
     phone, tenant_id = pending["phone"], pending["tenant_id"]
+    label = pending.get("label", "credits")
     bal = await memory.grant_credits(phone, tenant_id=tenant_id,
                                      job=int(g.get("job", 0)), unlock=int(g.get("unlock", 0)),
                                      boost=int(g.get("boost", 0)),
-                                     description=f"Purchased {pending.get('label', 'credits')}")
+                                     description=f"Purchased {label}")
     await memory.clear_payment_order(order_id)
+    await memory.update_employer(phone, {"lastPurchase": {"label": label, "balance": bal}},
+                                 tenant_id=tenant_id)
     settings = get_settings()
     digits = re.sub(r"\D", "", phone)
     if digits and bal is not None:
         body = (
-            f"✅ Purchase complete: *{pending.get('label')}*.\n\n"
+            f"✅ Purchase complete: *{label}*.\n\n"
             f"💳 Balance — 💼 {bal['job']} job · 🔓 {bal['unlock']} unlock · 🚀 {bal['boost']} boost. What next?"
         )
         try:
             await wa_delivery.send_message(settings, digits, _emp_menu_list(body))
         except Exception as exc:  # noqa: BLE001
             log.warning("buy_credits_push_failed", error=str(exc)[:200])
-    return JSONResponse({"ok": True, "redirect": f"/employer/buy-credits?token={pending.get('token','')}"})
+    # Send the buyer back to the chat (success page with a 'Back to chat' button).
+    return JSONResponse({"ok": True, "redirect": f"/employer/buy-credits/done?token={pending.get('token','')}"})
+
+
+@router.get("/buy-credits/done", response_class=HTMLResponse)
+async def buy_credits_done(request: Request, token: str = Query(default="")) -> HTMLResponse:
+    memory = get_memory(request)
+    identity = await memory.get_employer_identity(token) if token else None
+    employer = await memory.get_employer(identity.get("customer_id") or "",
+                                         tenant_id=identity["tenant_id"]) if identity else None
+    last = (employer or {}).get("lastPurchase") or {}
+    bal = last.get("balance") or {}
+    label = last.get("label") or "your credits"
+    bal_line = (f" Balance: 💼 {bal.get('job', 0)} job · 🔓 {bal.get('unlock', 0)} unlock · "
+                f"🚀 {bal.get('boost', 0)} boost." if bal else "")
+    number = re.sub(r"\D", "", get_settings().whatsapp_business_number or "")
+    return HTMLResponse(_success_html(
+        "Purchase complete!", f"{label} added to your wallet.{bal_line} "
+        "Head back to WhatsApp to continue.", business_number=number,
+    ))
 
 
 @router.get("/wallet", response_class=HTMLResponse)
@@ -892,6 +827,16 @@ _STYLE = """
   input.invalid,select.invalid,textarea.invalid{border-color:#ff5b5b !important;
         box-shadow:0 0 0 1px rgba(255,91,91,.35)}
   .field-err{color:#ff7a7a;font-size:12.5px;margin:6px 0 2px;line-height:1.3}
+  /* accordion (collapsible section, e.g. address) */
+  .acc{border:1px solid #2a3942;border-radius:12px;margin:16px 0;overflow:hidden}
+  .acc-hd{width:100%;display:flex;justify-content:space-between;align-items:center;
+        background:#202c33;color:#e9edef;border:0;padding:13px 14px;font-size:14px;
+        font-weight:600;cursor:pointer}
+  .acc-ar{color:#8696a0;transition:transform .2s;font-size:12px}
+  .acc.open .acc-ar{transform:rotate(180deg)}
+  .acc-bd{display:none;padding:2px 14px 14px}
+  .acc.open .acc-bd{display:block}
+  .acc-bd>label:first-child{margin-top:10px}
   .row{display:flex;gap:10px} .row>div{flex:1}
   .btn{margin-top:20px;width:100%;padding:13px;border:0;border-radius:9px;background:#00a884;
        color:#04150f;font-size:16px;font-weight:600;cursor:pointer}
@@ -1032,6 +977,8 @@ _FORM_VALIDATE_JS = r"""<script>
   function wire(form){
     form.setAttribute('novalidate','novalidate');
     form.addEventListener('submit', function(e){
+      // Expand any collapsed accordion so its required fields are validated (and visible).
+      [].forEach.call(form.querySelectorAll('.acc'), function(a){ a.classList.add('open'); });
       [].forEach.call(form.querySelectorAll('.field-err'), function(x){ x.parentNode.removeChild(x); });
       [].forEach.call(form.querySelectorAll('.invalid'), function(x){ x.classList.remove('invalid'); });
       var first=null;
@@ -1136,35 +1083,31 @@ def _register_html(
   <input type="hidden" name="token" value="{_esc(token)}">
   <label>Company name <span class="req">*</span></label>
   <input name="company_name" required placeholder="e.g. Acme Technologies">
-  <div class="row">
-    <div><label>Industry</label>
-      <select name="industry_id" autocomplete="off">{_options_html(o['industries'], placeholder='Select…')}</select></div>
-    <div><label>Company size</label>
-      <select name="company_size" autocomplete="off">{_options_html(COMPANY_SIZES, placeholder='Select…')}</select></div>
-  </div>
-  <div class="row">
-    <div><label>Contact person</label><input name="contact_person" placeholder="Your name"></div>
-    <div><label>Designation</label>
-      <select name="designation_id" autocomplete="off">{_options_html(o['designations'], placeholder='Select…')}</select></div>
-  </div>
   <label>Work email</label>
   <input type="email" name="email" placeholder="hr@company.com">
   <label>Phone</label>
   <input name="primary_phone" value="{_esc(phone)}" readonly>
   <label>Website</label>
   <input type="url" name="website" placeholder="https://…">
-  <label>Address</label>
-  <input name="address" placeholder="Office address">
-  <div class="row">
-    <div><label>State <span class="req">*</span></label>
-      <select name="state_id" id="state_id" autocomplete="off" required>{_options_html(o['states'], placeholder='Select state…')}</select></div>
-    <div><label>District <span class="req">*</span></label>
-      <select name="district_id" id="district_id" autocomplete="off" required><option value="">Select a state first…</option></select></div>
+
+  <div class="acc open" id="addrAcc">
+    <button type="button" class="acc-hd" id="addrHd">📍 Address &amp; Location <span class="acc-ar">▾</span></button>
+    <div class="acc-bd">
+      <label>Address</label>
+      <input name="address" placeholder="Office address">
+      <div class="row">
+        <div><label>State <span class="req">*</span></label>
+          <select name="state_id" id="state_id" autocomplete="off" required>{_options_html(o['states'], placeholder='Select state…')}</select></div>
+        <div><label>District <span class="req">*</span></label>
+          <select name="district_id" id="district_id" autocomplete="off" required><option value="">Select a state first…</option></select></div>
+      </div>
+      <div class="row">
+        <div><label>City</label><input name="city" placeholder="City"></div>
+        <div><label>Pincode</label><input name="pincode" inputmode="numeric" pattern="[1-9][0-9]{{5}}" title="6-digit PIN code" placeholder="600001"></div>
+      </div>
+    </div>
   </div>
-  <div class="row">
-    <div><label>City</label><input name="city" placeholder="City"></div>
-    <div><label>Pincode</label><input name="pincode" inputmode="numeric" pattern="[1-9][0-9]{{5}}" title="6-digit PIN code" placeholder="600001"></div>
-  </div>
+
   <label>About the company</label>
   <textarea name="description" placeholder="What your company does (optional)"></textarea>
   <button class="btn" type="submit">Create profile</button>
@@ -1182,38 +1125,14 @@ document.getElementById('state_id').addEventListener('change', fillDistricts);
 // Chrome may autofill State — force it back to the placeholder on load.
 (function(){{ var s=document.getElementById('state_id');
   function reset(){{ if(s.value){{ s.value=''; }} }} reset(); setTimeout(reset,300); }})();
+// Accordion: tap the header to collapse/expand the address section.
+document.getElementById('addrHd').addEventListener('click', function(){{
+  document.getElementById('addrAcc').classList.toggle('open');
+}});
 </script>
 {_FORM_VALIDATE_JS}
 """
     return _page("Register your company", inner)
-
-
-def _kyc_html(token: str, *, error: str = "") -> str:
-    err = f'<div class="addrbox" style="border-color:#a33;color:#ffb3b3">{_esc(error)}</div>' if error else ""
-    inner = f"""
-<h1>Verify your business</h1>
-<p class="sub">Submit a business proof to unlock full candidate details. Your
-documents are used only for verification.</p>
-{err}
-<form method="post" action="/employer/kyc/submit" autocomplete="off" data-validate>
-  <input type="hidden" name="token" value="{_esc(token)}">
-  <label>Document type <span class="req">*</span></label>
-  <select name="kyc_document_type" required>{_options_html(KYC_DOC_TYPES, placeholder='Select…')}</select>
-  <div class="row">
-    <div><label>GST number</label>
-      <input name="gst_number" pattern="[0-9]{{2}}[A-Za-z]{{5}}[0-9]{{4}}[A-Za-z][0-9A-Za-z]Z[0-9A-Za-z]"
-        title="15-character GST, e.g. 22AAAAA0000A1Z5" placeholder="22AAAAA0000A1Z5"></div>
-    <div><label>PAN number</label>
-      <input name="pan_number" pattern="[A-Za-z]{{5}}[0-9]{{4}}[A-Za-z]"
-        title="10-character PAN, e.g. AAAAA0000A" placeholder="AAAAA0000A"></div>
-  </div>
-  <label>Document link <span class="req">*</span></label>
-  <input type="url" name="kyc_document_url" required placeholder="https://… (Drive/Dropbox link to the proof)">
-  <button class="btn" type="submit">Submit for verification</button>
-</form>
-{_FORM_VALIDATE_JS}
-"""
-    return _page("Verify your business", inner)
 
 
 _JOB_STEPS = (
@@ -1337,11 +1256,11 @@ def _post_job_html(
   </div>
   <div id="phoneInput" hidden>
     <label>Contact Phone Number</label>
-    <input name="contact_phone" data-fmt="phone" inputmode="numeric" placeholder="e.g. 9876543210">
+    <input name="contact_phone" data-fmt="phone" inputmode="numeric" maxlength="10" placeholder="e.g. 9876543210">
   </div>
   <div id="waInput" hidden>
     <label>WhatsApp Number</label>
-    <input name="contact_whatsapp" data-fmt="phone" inputmode="numeric" placeholder="e.g. 9876543210">
+    <input name="contact_whatsapp" data-fmt="phone" inputmode="numeric" maxlength="10" placeholder="e.g. 9876543210">
   </div>
 </section>""",
     ])
@@ -1555,6 +1474,11 @@ function applyChange(){{
 }}
 ['am_call','am_wa'].forEach(function(id){{ document.getElementById(id).addEventListener('change', applyChange); }});
 applyChange();
+
+// Phone / WhatsApp inputs: digits only, capped at 10 (strip anything else as typed/pasted).
+[].forEach.call(document.querySelectorAll('[data-fmt=phone]'), function(el){{
+  el.addEventListener('input', function(){{ el.value = el.value.replace(/\\D/g, '').slice(0, 10); }});
+}});
 
 // The "Post Job" button is type=submit (last step) — guard it through valid().
 document.getElementById('jobForm').addEventListener('submit', function(e){{ if(!valid()){{ e.preventDefault(); }} }});

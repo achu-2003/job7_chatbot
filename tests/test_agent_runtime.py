@@ -604,28 +604,19 @@ def _employer(*, kyc="VERIFIED", paid=False, jobs=None):
     }
 
 
-async def test_registered_employer_unverified_gets_kyc_gate(monkeypatch):
-    """A registered employer whose KYC isn't VERIFIED is sent to the KYC form."""
-    from app.config import get_settings
-
-    monkeypatch.setattr(get_settings(), "public_base_url", "https://abc.ngrok-free.app")
+async def test_registered_employer_goes_straight_to_menu():
+    """No KYC gate anymore — a registered employer (any kyc status) greeting goes
+    straight to the menu hub, not a verification form."""
     rt = _runtime()
     _stub_memory(rt, facts={"full_name": "Asha", "lane": "creator"},
                  employer=_employer(kyc="NOT_SUBMITTED"))
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "hi")
-    assert "verify" in out["response"].lower()
-    assert "/employer/kyc?token=etok123" in out["whatsapp_interactive"]["interactive"]["action"]["parameters"]["url"]
-
-
-async def test_kyc_under_review_message():
-    """KYC PENDING (submitted, awaiting) → an 'under review' note, no form."""
-    rt = _runtime()
-    _stub_memory(rt, facts={"lane": "creator"}, employer=_employer(kyc="PENDING"))
-    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
-    out = await _handle(rt, "hi")
-    assert "under review" in out["response"].lower()
-    assert out.get("whatsapp_interactive") is None
+    assert "verify" not in out["response"].lower()
+    interactive = out["whatsapp_interactive"]["interactive"]
+    assert interactive["type"] == "list"
+    ids = [r["id"] for r in interactive["action"]["sections"][0]["rows"]]
+    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy"]
 
 
 async def test_verified_employer_sees_menu():
@@ -760,16 +751,15 @@ async def test_employer_search_no_match_nudges_to_menu():
     assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy"]
 
 
-async def test_unverified_employer_cannot_view_candidates():
-    """An emp:candidates tap before KYC verification falls back to the KYC gate —
-    candidate data is never served."""
+async def test_registered_employer_can_view_candidates():
+    """No KYC gate — a registered employer tapping View Candidates gets the
+    candidate list straight away (masked tier)."""
     rt = _runtime()
     _stub_memory(rt, facts={"lane": "creator"}, employer=_employer(kyc="NOT_SUBMITTED"),
                  candidates=[{"full_name": "Rahul", "experience_level": "2-3 years"}])
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "View Candidates", interactive_id="emp:candidates")
-    assert "verify" in out["response"].lower()
-    assert "Rahul" not in out["response"]
+    assert "verify" not in out["response"].lower()
 
 
 async def test_new_number_seeker_tap_hands_over_form(monkeypatch):

@@ -95,15 +95,16 @@ def build_employer_record(*, identity: dict[str, Any], form: dict[str, Any]) -> 
     emp_id = _cuid()
     company = (form.get("company_name") or "").strip()
     phone = (identity.get("customer_id") or form.get("primary_phone") or "").strip() or None
-    size = (form.get("company_size") or "").strip().upper() or None
 
     record = {
         "id": emp_id,
         "userId": None,
         "companyName": company,
         "slug": _slugify(company) or emp_id,
-        "contactPerson": _str(form, "contact_person"),
-        "designationId": _str(form, "designation_id"),
+        # contactPerson / designation / industry / companySize were dropped from
+        # the form — left null on the (nullable) columns.
+        "contactPerson": None,
+        "designationId": None,
         "primaryPhone": phone,
         "email": _str(form, "email"),
         "website": _str(form, "website"),
@@ -113,12 +114,14 @@ def build_employer_record(*, identity: dict[str, Any], form: dict[str, Any]) -> 
         "city": _str(form, "city"),
         "districtId": _str(form, "district_id"),
         "pincode": _str(form, "pincode"),
-        "industryId": _str(form, "industry_id"),
-        "companySize": size,
+        "industryId": None,
+        "companySize": None,
         "gstNumber": _str(form, "gst_number"),
         "panNumber": _str(form, "pan_number"),
-        "status": "PENDING",            # EmployerStatus default
-        "kycStatus": "NOT_SUBMITTED",   # KycStatus default
+        # No KYC step — a created profile is immediately ready/verified so the
+        # employer goes straight to the menu (no business-verification gate).
+        "status": "APPROVED",
+        "kycStatus": "VERIFIED",
         "emailVerified": False,
         "phoneVerified": bool(phone),
         "registrationSource": "WHATSAPP_BOT",
@@ -252,29 +255,3 @@ def build_job_record(
         "updatedAt": now,
     }
     return {"ref": f"JOB-{jid[-6:].upper()}", "private_jobs": job}
-
-
-def apply_kyc(record: dict[str, Any], *, doc_type: str | None, doc_url: str | None,
-              gst: str | None, pan: str | None, auto_verify: bool) -> dict[str, Any]:
-    """Merge a Stage-2 KYC submission onto a staged employer record (in place) and
-    advance ``kycStatus``. With ``auto_verify`` the gate flips straight to
-    VERIFIED (test mode); otherwise it sits at PENDING ('under review')."""
-    emp = record.setdefault("private_employers", {})
-    now = _now_iso()
-    if gst:
-        emp["gstNumber"] = gst.strip()
-    if pan:
-        emp["panNumber"] = pan.strip()
-    if doc_type:
-        emp["kycDocumentType"] = doc_type.strip()
-    if doc_url:
-        emp["kycDocumentUrl"] = doc_url.strip()
-    emp["kycSubmittedAt"] = now
-    if auto_verify:
-        emp["kycStatus"] = "VERIFIED"
-        emp["kycVerifiedAt"] = now
-        emp["status"] = "APPROVED"
-    else:
-        emp["kycStatus"] = "PENDING"
-    emp["updatedAt"] = now
-    return record

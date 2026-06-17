@@ -1,8 +1,7 @@
 """Employer (job-poster) Stage 1-2 — record builder + form rendering (pure)."""
-from app.employer import apply_kyc, build_employer_record, build_job_record
+from app.employer import build_employer_record, build_job_record
 from app.api.routes.employer import (
     _expired_html,
-    _kyc_html,
     _post_job_html,
     _register_html,
     _success_html,
@@ -27,10 +26,6 @@ def test_build_employer_record_maps_private_employers_columns():
     identity = {"customer_id": "919876543210", "name": "Asha"}
     form = {
         "company_name": "Acme Technologies",
-        "industry_id": "ind1",
-        "company_size": "medium",
-        "contact_person": "Asha",
-        "designation_id": "des1",
         "email": "hr@acme.com",
         "website": "https://acme.com",
         "address": "1 MG Road",
@@ -43,13 +38,14 @@ def test_build_employer_record_maps_private_employers_columns():
     emp = rec["private_employers"]
     assert emp["companyName"] == "Acme Technologies"
     assert emp["slug"] == "acme-technologies"
-    assert emp["industryId"] == "ind1"
-    assert emp["designationId"] == "des1"
-    assert emp["companySize"] == "MEDIUM"            # normalised to the enum
+    # industry / company size / contact person / designation were removed
+    assert emp["industryId"] is None and emp["designationId"] is None
+    assert emp["companySize"] is None and emp["contactPerson"] is None
     assert emp["primaryPhone"] == "919876543210"
     assert emp["districtId"] == "d1"
-    assert emp["status"] == "PENDING"                # EmployerStatus default
-    assert emp["kycStatus"] == "NOT_SUBMITTED"       # KycStatus default
+    # No KYC step — a created profile is immediately ready/verified.
+    assert emp["status"] == "APPROVED"
+    assert emp["kycStatus"] == "VERIFIED"
     assert emp["phoneVerified"] is True
     assert emp["registrationSource"] == "WHATSAPP_BOT"
 
@@ -61,36 +57,18 @@ def test_build_employer_record_blank_company_still_gets_slug():
     assert emp["slug"]                                # falls back to the id
 
 
-def test_apply_kyc_auto_verify_flips_status():
-    rec = build_employer_record(identity={"customer_id": "91"}, form={"company_name": "Acme"})
-    apply_kyc(rec, doc_type="GST", doc_url="https://drive/x", gst="22AAAAA0000A1Z5",
-              pan=None, auto_verify=True)
-    emp = rec["private_employers"]
-    assert emp["kycStatus"] == "VERIFIED"
-    assert emp["status"] == "APPROVED"
-    assert emp["gstNumber"] == "22AAAAA0000A1Z5"
-    assert emp["kycDocumentType"] == "GST"
-    assert emp["kycVerifiedAt"]
-
-
-def test_apply_kyc_manual_review_stays_pending():
-    rec = build_employer_record(identity={"customer_id": "91"}, form={"company_name": "Acme"})
-    apply_kyc(rec, doc_type="PAN", doc_url="https://drive/x", gst=None, pan="AAAAA0000A",
-              auto_verify=False)
-    assert rec["private_employers"]["kycStatus"] == "PENDING"
-    assert rec["private_employers"]["status"] == "PENDING"
-
-
 def test_register_form_renders_company_fields():
     out = _register_html("tok123", "919876543210", _OPTS)
     assert 'name="token" value="tok123"' in out
     assert 'action="/employer/register/submit"' in out
-    assert 'name="company_name"' in out and 'name="industry_id"' in out
-    assert 'name="company_size"' in out and 'name="designation_id"' in out
+    assert 'name="company_name"' in out
     assert 'value="919876543210" readonly' in out
-    assert "Information Technology" in out and "HR Manager" in out
-    assert "STARTUP" in out and "ENTERPRISE" in out          # CompanySize options
     assert "var DISTRICTS =" in out                          # cascade JS
+    # address fields live in a collapsible accordion (expanded by default)
+    assert 'class="acc open" id="addrAcc"' in out and 'id="addrHd"' in out
+    # Industry / Company size / Contact person / Designation were removed
+    assert 'name="industry_id"' not in out and 'name="company_size"' not in out
+    assert 'name="contact_person"' not in out and 'name="designation_id"' not in out
     # State + District are REQUIRED (district is the job-location fallback)
     assert 'name="state_id" id="state_id" autocomplete="off" required' in out
     assert 'name="district_id" id="district_id" autocomplete="off" required' in out
@@ -99,15 +77,6 @@ def test_register_form_renders_company_fields():
 def test_register_form_shows_error_banner():
     out = _register_html("t", "91", _OPTS, error="Please fill the required fields.")
     assert "Please fill the required fields." in out
-
-
-def test_kyc_form_renders_doc_fields():
-    out = _kyc_html("tok123")
-    assert 'action="/employer/kyc/submit"' in out
-    assert 'name="kyc_document_type"' in out
-    assert 'name="gst_number"' in out and 'name="pan_number"' in out
-    assert 'name="kyc_document_url"' in out
-    assert "GST Certificate" in out
 
 
 def test_post_job_form_is_a_five_step_wizard():
@@ -191,15 +160,13 @@ def test_post_job_form_salary_and_vacancies_required_inline():
 
 
 def test_native_forms_use_inline_validator():
-    """Register + KYC disable native popup bubbles (novalidate) and validate
+    """The register form disables native popup bubbles (novalidate) and validates
     inline (red border + message) via the shared attribute-driven script."""
-    from app.api.routes.employer import _register_html, _kyc_html
-    reg = _register_html("t", "919876543210", _JOB_OPTS | {"industries": [], "designations": []})
-    kyc = _kyc_html("t")
-    for html in (reg, kyc):
-        assert "data-validate" in html
-        assert "form[data-validate]" in html and "novalidate" in html
-        assert "d.className='field-err'" in html
+    from app.api.routes.employer import _register_html
+    reg = _register_html("t", "919876543210", _JOB_OPTS)
+    assert "data-validate" in reg
+    assert "form[data-validate]" in reg and "novalidate" in reg
+    assert "d.className='field-err'" in reg
 
 
 def test_post_job_form_salary_and_jobtype_trimmed():

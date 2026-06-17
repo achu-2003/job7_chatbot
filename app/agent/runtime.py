@@ -1075,20 +1075,13 @@ class AgentRuntime:
                 state, path="register", body=body, cta="Register company"
             )
 
-        kyc = (emp.get("private_employers") or {}).get("kycStatus") or "NOT_SUBMITTED"
-        verified = kyc == "VERIFIED"
-
         # In-flow button taps (emp:<action>) are explicit user intent.
         if prefix == "emp":
-            return await self._employer_action(state, emp, action, verified=verified, kyc=kyc)
+            return await self._employer_action(state, emp, action)
 
-        # Stage 2 — registered but not verified → the KYC gate.
-        if not verified:
-            return await self._employer_kyc_gate(state, emp, kyc)
-
-        # Stage 3 — verified. Typed commands map to the menu actions; a greeting /
-        # "menu" shows the hub; ANYTHING ELSE the employer types is treated as a
-        # candidate SEARCH by skill / role / category.
+        # Registered → full access (no KYC gate). Typed commands map to the menu
+        # actions; a greeting / "menu" shows the hub; ANYTHING ELSE the employer
+        # types is treated as a candidate SEARCH by skill / role / category.
         q = (state.get("inbound_text") or "").strip()
         if not q or _GREETING_RX.match(q) or _EMP_MENU_RX.match(q):
             return self._employer_menu_reply(state, emp)
@@ -1111,13 +1104,10 @@ class AgentRuntime:
         return await self._employer_search_candidates(state, emp, q)
 
     async def _employer_action(
-        self, state: AgentState, emp: dict[str, Any], action: str, *,
-        verified: bool, kyc: str,
+        self, state: AgentState, emp: dict[str, Any], action: str,
     ) -> dict[str, Any]:
-        """Route an emp:<action> tap. Anything that needs candidate data or job
-        posting is gated behind KYC — an unverified tap falls back to the gate."""
-        if not verified:
-            return await self._employer_kyc_gate(state, emp, kyc)
+        """Route an emp:<action> tap. A created company profile has full access
+        (no business-verification/KYC gate)."""
         if action == "post":
             return await self._employer_form_prompt(
                 state, path="post-job",
@@ -1168,30 +1158,15 @@ class AgentRuntime:
             cta="Buy Credits",
         )
 
-    async def _employer_kyc_gate(
-        self, state: AgentState, emp: dict[str, Any], kyc: str
-    ) -> dict[str, Any]:
-        """Stage 2. PENDING means submitted & awaiting review; anything else
-        (NOT_SUBMITTED / REJECTED) prompts the KYC form."""
-        if kyc == "PENDING":
-            return self._creator_reply(
-                "📋 Your KYC is under review — we'll notify you here as soon as your "
-                "business is verified, then you can view full candidate details."
-            )
+    def _employer_menu_reply(self, state: AgentState, emp: dict[str, Any]) -> dict[str, Any]:
+        """The employer hub — a list menu (reply buttons cap at 3) so all actions,
+        incl. Credits & Wallet / Buy Credits, are reachable. Returning-user
+        greeting; fires on every menu/greeting for a registered employer."""
+        company = (emp.get("private_employers") or {}).get("companyName") or "your company"
         first = _first_name((state.get("customer_facts") or {}).get("full_name"))
         who = f", {first}" if first else ""
         body = (
-            f"Almost there{who}! Verify your business to unlock candidate details. "
-            "Tap below to submit your KYC (GST/PAN or a business proof)."
-        )
-        return await self._employer_form_prompt(state, path="kyc", body=body, cta="Verify Business")
-
-    def _employer_menu_reply(self, state: AgentState, emp: dict[str, Any]) -> dict[str, Any]:
-        """Stage 3 — the verified employer hub. A list menu (reply buttons cap at
-        3) so all actions, including Buy Credits / Upgrade Plan, are reachable."""
-        company = (emp.get("private_employers") or {}).get("companyName") or "your company"
-        body = (
-            f"You're verified — *{company}* ✅\n\n"
+            f"👋 Welcome back{who} — *{company}*\n\n"
             "What would you like to do today?"
         )
         return self._creator_reply(body, interactive=_emp_menu(body))
@@ -1308,27 +1283,86 @@ class AgentRuntime:
         return res
 
     def _employer_my_jobs(self, state: AgentState, emp: dict[str, Any]) -> dict[str, Any]:
-        """List the jobs this employer has posted (Redis-staged)."""
+        """List the jobs this employer has posted (Redis-staged), with full
+        details per job."""
         jobs = emp.get("jobs") or []
         if not jobs:
             body = "You haven't posted any jobs yet. Tap below to post your first one."
             return self._creator_reply(
                 body, interactive=wa.buttons_message(body, [("emp:post", "Post a Job")])
             )
-        lines = [f"*Your posted jobs ({len(jobs)})*", ""]
-        for j in jobs:
-            pj = j.get("private_jobs") or {}
-            title = pj.get("title") or j.get("title") or "Untitled role"
-            ref = j.get("ref") or "—"
-            status = pj.get("status") or j.get("status") or "PENDING"
-            line = f"• *{title}* ({ref}) — {status}"
-            vac = pj.get("vacancies")
-            if vac:
-                line += f" · {vac} vacanc" + ("y" if int(vac) == 1 else "ies")
-            lines.append(line)
-        lines.append("\nTap *Menu* for more options.")
-        body = "\n".join(lines)
-        return self._creator_reply(body, interactive=_emp_menu(body))
+        cards = [self._job_card(j) for j in jobs[:10]]
+        body = f"*Your posted jobs ({len(jobs)})*\n\n" + "\n\n".join(cards)
+        if len(jobs) > 10:
+            body += f"\n\n…and {len(jobs) - 10} more."
+        # Just the job list — no Menu (type "menu" any time to bring it back).
+        return self._creator_reply(body)
+
+    @staticmethod
+    def _job_card(j: dict[str, Any]) -> str:
+        """A full, human-readable detail block for one staged job."""
+        pj = j.get("private_jobs") or {}
+
+        def money(v: Any) -> str | None:
+            try:
+                return f"₹{int(float(v)):,}"
+            except (TypeError, ValueError):
+                return None
+
+        def as_int(v: Any) -> int | None:
+            try:
+                return int(float(v))
+            except (TypeError, ValueError):
+                return None
+
+        title = pj.get("title") or j.get("title") or "Untitled role"
+        ref = j.get("ref") or "—"
+        status = pj.get("status") or j.get("status") or "PENDING"
+        L = [f"• *{title}*  ({ref})", f"   📌 Status: {status}"]
+
+        jt = {"FULL_TIME": "Full-time", "PART_TIME": "Part-time"}.get(pj.get("jobType"), pj.get("jobType"))
+        wm = {"OFFICE": "On-site", "REMOTE": "Remote", "HYBRID": "Hybrid"}.get(pj.get("workMode"), pj.get("workMode"))
+        tw = " · ".join(x for x in (f"💼 {jt}" if jt else "", f"🏢 {wm}" if wm else "") if x)
+        if tw:
+            L.append(f"   {tw}")
+
+        loc = "Remote" if pj.get("jobLocationType") == "REMOTE" else (pj.get("locationDetails") or "")
+        if loc:
+            L.append(f"   📍 {loc}")
+
+        lo, hi = money(pj.get("salaryMin")), money(pj.get("salaryMax"))
+        if lo or hi:
+            per = {"MONTHLY": "month", "YEARLY": "year"}.get(pj.get("salaryPeriod"), "month")
+            L.append(f"   💰 {lo or '—'} – {hi or '—'} / {per}")
+
+        et = pj.get("experienceType")
+        if et == "EXPERIENCED":
+            mn, mx = as_int(pj.get("experienceMin")), as_int(pj.get("experienceMax"))
+            yrs = f" ({mn}–{mx} yrs)" if mn is not None and mx is not None else ""
+            L.append(f"   🎯 Experienced{yrs}")
+        elif et == "INTERN":
+            stip = money(pj.get("internStipend")) or money(pj.get("trainingFee"))
+            L.append("   🎯 Intern" + (f" · {stip}" if stip else ""))
+        elif et in ("FRESHER", "ANY"):
+            L.append(f"   🎯 {et.title()}")
+
+        bits = []
+        vac = as_int(pj.get("vacancies"))
+        if vac:
+            bits.append(f"👥 {vac} vacanc" + ("y" if vac == 1 else "ies"))
+        val = as_int(j.get("validityDays") or pj.get("validityDays"))
+        if val:
+            bits.append(f"⏳ {val} days")
+        if bits:
+            L.append("   " + " · ".join(bits))
+
+        modes = pj.get("applyModes") or []
+        mp = {"APPLY": "In-App", "CALL": "Phone", "WHATSAPP": "WhatsApp"}
+        am = [mp.get(m, m) for m in modes]
+        if am:
+            L.append(f"   📲 Apply: {', '.join(am)}")
+
+        return "\n".join(L)
 
     async def _planner(self, state: AgentState) -> dict[str, Any]:
         return await plan(
