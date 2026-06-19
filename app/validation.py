@@ -191,11 +191,13 @@ def validate_kyc(form: dict[str, Any]) -> dict[str, str]:
 
 
 def validate_job_post(form: dict[str, Any]) -> dict[str, str]:
-    """Post-a-job: title required; salary/vacancies/experience numeric (and
-    max ≥ min); contact numbers and intern amounts validated when filled."""
+    """Post-a-job: title + category required; salary/vacancies/experience numeric
+    (and max ≥ min); contact numbers and intern amounts validated when filled."""
     errors: dict[str, str] = {}
     if len(_s(form.get("title"))) < 2:
         errors["title"] = "Please enter a job title."
+    if not _s(form.get("category_id")):
+        errors["category_id"] = "Please select a job category."
     lo, hi = _s(form.get("salary_min")), _s(form.get("salary_max"))
     for key, val in (("salary_min", lo), ("salary_max", hi)):
         if val and not valid_salary(val):

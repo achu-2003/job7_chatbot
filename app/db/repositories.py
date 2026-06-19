@@ -100,6 +100,36 @@ def _map_employment_type(value: str | None) -> str | None:
 # ---------------------------------------------------------------
 
 
+def _best_tier_title_matches(
+    words: list[str], rows: list[dict[str, Any]], limit: int
+) -> list[dict[str, Any]]:
+    """Keep only the rows that match the MOST distinct query words.
+
+    A typed query like "flutter developer" otherwise returns every job that
+    merely shares the generic word "developer" (Frontend Developer, Software
+    Developer …). We score each row by how many distinct query words appear in
+    its title / category / skills, then return only the best-scoring tier — so a
+    real "Flutter Developer" (2 words) wins and the generic 1-word matches drop.
+    Single-word queries ("welder") naturally keep every match (all score 1).
+    """
+    if not rows:
+        return []
+
+    def _hits(row: dict[str, Any]) -> int:
+        hay = " ".join(
+            [
+                str(row.get("title") or ""),
+                str(row.get("department_name") or ""),
+                " ".join(str(s) for s in (row.get("skills") or [])),
+            ]
+        ).lower()
+        return sum(1 for w in words if w in hay)
+
+    scored = [(_hits(r), r) for r in rows]
+    best = max(s for s, _ in scored)
+    return [r for s, r in scored if s == best][:limit]
+
+
 class JobRepository:
     """Read-only search against the live ``jobs7uat`` job board.
 
@@ -204,38 +234,48 @@ class JobRepository:
         query: str, *, limit: int = 8, tenant_id: str | None = None
     ) -> list[dict[str, Any]]:
         """Deterministic free-text job search for a typed query. Splits the query
-        into WORDS and matches a live job if ANY word hits its TITLE, a required
-        SKILL, or its CATEGORY — so "welder" → Welder jobs, "python" → jobs needing
-        Python, and "python developer" → both. Ranked: exact-phrase title first,
-        then most skill matches, then a plain title-word hit, then recency."""
+        into WORDS and scores each live job by how many DISTINCT words hit its
+        TITLE, a required SKILL, or its CATEGORY — then returns only the best-
+        matching tier. So "welder" → Welder jobs, "python" → jobs needing Python,
+        and "flutter developer" → Flutter Developer (2 words) WITHOUT dragging in
+        every generic "… Developer" role (1 word). Ranked: exact-phrase title
+        first, then most words matched, then a title-word hit, then recency."""
         words = [w for w in re.findall(r"[a-z0-9]+", (query or "").lower()) if len(w) >= 2]
         if not words:
             return []
-        params: dict[str, Any] = {
-            "patterns": [f"%{w}%" for w in words],
-            "phrase": f"%{' '.join(words)}%",
-            "limit": limit,
-        }
+        params: dict[str, Any] = {"phrase": f"%{' '.join(words)}%"}
         tenant_sql = _tenant_clause("j", params, tenant_id)
-        skill_overlap = "(SELECT count(*) FROM unnest(j.skills) sk WHERE sk ILIKE ANY(:patterns))"
+        # Per-word match flags so we can rank by the COUNT of distinct query words
+        # a job matches (title / category / skills) — not just "any word hits".
+        hit_terms: list[str] = []
+        title_terms: list[str] = []
+        for i, w in enumerate(words):
+            key = f"w{i}"
+            params[key] = f"%{w}%"
+            hit_terms.append(
+                f"(CASE WHEN j.title ILIKE :{key} OR cat.name ILIKE :{key} "
+                f"OR EXISTS (SELECT 1 FROM unnest(j.skills) sk WHERE sk ILIKE :{key}) "
+                "THEN 1 ELSE 0 END)"
+            )
+            title_terms.append(f"(CASE WHEN j.title ILIKE :{key} THEN 1 ELSE 0 END)")
+        word_hits = "(" + " + ".join(hit_terms) + ")"
+        title_hits = "(" + " + ".join(title_terms) + ")"
+        phrase_hit = "(CASE WHEN j.title ILIKE :phrase THEN 1 ELSE 0 END)"
+        # Fetch a generous window ordered best-first, then keep only the top tier
+        # in Python (so the cut is on distinct-word count, not a hard SQL LIMIT).
+        params["window"] = max(limit * 5, 25)
         sql = text(
             JobRepository._SELECT
-            + f"WHERE {JobRepository._LIVE}{tenant_sql} AND ("
-            "  j.title ILIKE ANY(:patterns) "
-            "  OR cat.name ILIKE ANY(:patterns) "
-            f"  OR {skill_overlap} > 0 "
-            ") "
-            "ORDER BY (CASE WHEN j.title ILIKE :phrase THEN 1 ELSE 0 END) DESC, "
-            f"         {skill_overlap} DESC, "
-            "         (CASE WHEN j.title ILIKE ANY(:patterns) THEN 1 ELSE 0 END) DESC, "
-            '         j."createdAt" DESC '
-            "LIMIT :limit"
+            + f"WHERE {JobRepository._LIVE}{tenant_sql} AND {word_hits} > 0 "
+            + f"ORDER BY {phrase_hit} DESC, {word_hits} DESC, {title_hits} DESC, "
+            + 'j."createdAt" DESC '
+            + "LIMIT :window"
         )
         start = time.perf_counter()
         async with session_scope() as session:
             rows = [dict(r._mapping) for r in (await session.execute(sql, params)).fetchall()]
         SQL_LATENCY.labels(op="job_title_search").observe(time.perf_counter() - start)
-        return rows
+        return _best_tier_title_matches(words, rows, limit)
 
     @staticmethod
     async def get_by_ids(
@@ -749,7 +789,7 @@ class LookupRepository:
 # ---------------------------------------------------------------
 
 # Tables with an updatedAt column (set to now() on insert alongside createdAt).
-_WITH_UPDATED_AT = {"private_job_seekers", "job_seeker_profiles", "private_jobs"}
+_WITH_UPDATED_AT = {"private_job_seekers", "job_seeker_profiles", "private_jobs", "private_employers"}
 # Columns that are Postgres ENUMs → need an explicit CAST on insert.
 _ENUM_CASTS = {
     "private_job_seekers": {"status": '"JobSeekerStatus"'},
@@ -757,6 +797,10 @@ _ENUM_CASTS = {
     "private_jobs": {
         "jobType": '"PrivateJobType"', "status": '"PrivateJobStatus"',
         "workMode": '"WorkMode"', "salaryPeriod": '"SalaryPeriod"',
+    },
+    "private_employers": {
+        "status": '"EmployerStatus"', "kycStatus": '"KycStatus"',
+        "companySize": '"CompanySize"',
     },
 }
 # Columns whose staged 'YYYY-MM-DD[ ...]' string must become a real datetime
@@ -970,6 +1014,99 @@ class JobPostRepository:
         SQL_LATENCY.labels(op="job_post").observe(time.perf_counter() - start)
         return {"committed": commit, "job_id": job["id"]}
 
+    @staticmethod
+    async def list_for_employer(employer_id: str | None, *, limit: int = 20) -> list[dict[str, Any]]:
+        """The employer's own posted jobs from live ``private_jobs`` (newest first),
+        for the 'My Jobs' display. Read-only."""
+        if not employer_id:
+            return []
+        sql = text(
+            'SELECT id, title, slug, status::text AS status, vacancies, '
+            '"jobType"::text AS "jobType", "workMode"::text AS "workMode", '
+            '"jobLocationType", "locationDetails", "salaryMin", "salaryMax", '
+            '"salaryPeriod"::text AS "salaryPeriod", "experienceType", '
+            '"experienceMin", "experienceMax", "internStipend", "trainingFee", '
+            '"creditsUsed", "expiresAt", "createdAt" '
+            'FROM private_jobs WHERE "employerId" = :e AND "deletedAt" IS NULL '
+            'ORDER BY "createdAt" DESC LIMIT :lim')
+        try:
+            async with session_scope() as session:
+                rows = (await session.execute(sql, {"e": employer_id, "lim": limit})).fetchall()
+        except Exception as exc:  # noqa: BLE001 — a read miss must not break the turn
+            log.warning("list_for_employer_failed", error=str(exc)[:200])
+            return []
+        return [dict(r._mapping) for r in rows]
+
+
+class EmployerRepository:
+    """WRITE path: register a company on the live job board (``private_employers``).
+
+    ``commit=False`` is a DRY RUN — the INSERT runs against the DB (so every
+    type / enum / FK / NOT-NULL constraint is exercised) and is then rolled back,
+    writing nothing. Idempotent on the phone: a row with the same trailing-10-digit
+    ``primaryPhone`` already present → no second insert (returns existing id)."""
+
+    @staticmethod
+    async def exists_by_phone(phone: str, *, tenant_id: str | None = None) -> str | None:
+        """The id of an existing employer with this phone (last-10 match), else None."""
+        if not phone:
+            return None
+        sql = text(
+            'SELECT id FROM private_employers '
+            'WHERE right(regexp_replace("primaryPhone", \'\\D\', \'\', \'g\'), 10) '
+            '    = right(regexp_replace(:phone, \'\\D\', \'\', \'g\'), 10) '
+            'LIMIT 1'
+        )
+        async with session_scope() as session:
+            row = (await session.execute(sql, {"phone": phone})).first()
+        return str(row._mapping["id"]) if row else None
+
+    @staticmethod
+    async def create(
+        payload: dict[str, Any], *, commit: bool = True, welcome_job_credits: int = 0,
+    ) -> dict[str, Any]:
+        """Insert the company into ``private_employers`` and — when
+        ``welcome_job_credits > 0`` — create its ``credit_wallets`` row seeded with
+        the free welcome credit + a ``CREDIT_WELCOME_SIGNUP`` ``credit_ledger`` row,
+        all in ONE transaction (so the live wallet exists from registration).
+        Idempotent on the phone (no duplicate employer/wallet)."""
+        emp = _prep_row("private_employers", payload["private_employers"])
+        phone = emp.get("primaryPhone") or ""
+        # Idempotency: never insert a second row for a phone that already exists.
+        if commit:
+            existing = await EmployerRepository.exists_by_phone(phone)
+            if existing:
+                return {"committed": False, "inserted": False, "employer_id": existing}
+        welcome = max(0, int(welcome_job_credits))
+        start = time.perf_counter()
+        async with get_engine().connect() as conn:
+            trans = await conn.begin()
+            try:
+                await conn.execute(text(_insert_sql("private_employers", emp)), emp)
+                if welcome > 0:
+                    wid = uuid.uuid4().hex
+                    await conn.execute(text(
+                        'INSERT INTO credit_wallets (id, "employerId", "jobCredits", '
+                        '"unlockCredits", "boostCredits", "updatedAt") '
+                        'VALUES (:id, :e, :jc, 0, 0, now())'),
+                        {"id": wid, "e": emp["id"], "jc": welcome})
+                    await conn.execute(text(
+                        'INSERT INTO credit_ledger (id, "walletId", "creditType", action, '
+                        'amount, balance, "referenceType", "referenceId", description, "createdAt") '
+                        'VALUES (:id, :w, CAST(:ct AS "CreditType"), CAST(:ac AS "LedgerAction"), '
+                        ':amt, :bal, :rt, :rid, :d, now())'),
+                        {"id": uuid.uuid4().hex, "w": wid, "ct": "JOB_POST",
+                         "ac": "CREDIT_WELCOME_SIGNUP", "amt": welcome, "bal": welcome,
+                         "rt": "signup", "rid": emp["id"],
+                         "d": (f"Congratulations! You have received {welcome} FREE job "
+                               f"credit{'s' if welcome != 1 else ''} to post your first job.")})
+                await (trans.commit() if commit else trans.rollback())
+            except Exception:
+                await trans.rollback()
+                raise
+        SQL_LATENCY.labels(op="employer_register").observe(time.perf_counter() - start)
+        return {"committed": commit, "inserted": commit, "employer_id": emp["id"]}
+
 
 # ---------------------------------------------------------------
 # Employer credit wallet — READ-ONLY (live billing balance)
@@ -1010,6 +1147,178 @@ class CreditWalletRepository:
         m = row._mapping
         return {"job": int(m["jobCredits"]), "unlock": int(m["unlockCredits"]),
                 "boost": int(m["boostCredits"])}
+
+    @staticmethod
+    async def ledger(employer_id: str | None, *, limit: int = 12) -> list[dict[str, Any]]:
+        """The employer's live credit_ledger transactions (newest first), shaped
+        like the Redis ledger so the Credits & Wallet page renders unchanged."""
+        if not employer_id:
+            return []
+        sql = text(
+            'SELECT l."creditType"::text AS ct, l.action::text AS act, l.amount, '
+            'l.balance, l.description, l."createdAt" '
+            'FROM credit_ledger l JOIN credit_wallets w ON w.id = l."walletId" '
+            'WHERE w."employerId" = :e ORDER BY l."createdAt" DESC LIMIT :lim')
+        try:
+            async with session_scope() as session:
+                rows = (await session.execute(sql, {"e": employer_id, "lim": limit})).fetchall()
+        except Exception as exc:  # noqa: BLE001 — a read miss must not break the page
+            log.warning("wallet_ledger_failed", error=str(exc)[:200])
+            return []
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            m = r._mapping
+            created = m["createdAt"]
+            out.append({
+                "creditType": m["ct"],
+                "action": "debit" if str(m["act"]).startswith("DEBIT") else "credit",
+                "amount": int(m["amount"]), "balance": int(m["balance"]),
+                "description": m["description"] or "",
+                "createdAt": int(created.timestamp()) if created else 0,
+            })
+        return out
+
+    @staticmethod
+    async def post_job_with_billing(
+        *, employer_id: str, job_payload: dict[str, Any], need: int,
+        balance_after: int, commit: bool = True,
+    ) -> dict[str, Any]:
+        """ONE transaction: insert the job into ``private_jobs`` AND record the
+        credit consumption — debit ``credit_wallets.jobCredits`` and write a
+        ``DEBIT_JOB_POST`` ``credit_ledger`` row referencing the job.
+
+        Get-or-creates the employer's wallet (seeded so the debit lands on
+        ``balance_after``, keeping the live wallet ≈ the Redis mirror). Idempotent
+        on the job: if a DEBIT_JOB_POST ledger row already references this job, it
+        is a no-op. ``commit=False`` is a DRY RUN (everything runs, then rolls
+        back — exercises every FK/enum/NOT-NULL)."""
+        job = _prep_row("private_jobs", job_payload)
+        job_id = job["id"]
+        need = int(need)
+        start = time.perf_counter()
+        async with get_engine().connect() as conn:
+            trans = await conn.begin()
+            try:
+                # Idempotency: this job already posted + debited?
+                done = (await conn.execute(
+                    text('SELECT 1 FROM credit_ledger WHERE "referenceId" = :j '
+                         'AND action = CAST(:a AS "LedgerAction") LIMIT 1'),
+                    {"j": job_id, "a": "DEBIT_JOB_POST"})).first()
+                if done:
+                    await trans.rollback()
+                    return {"committed": False, "reason": "already_posted", "job_id": job_id}
+                # Wallet: get-or-create, then SET jobCredits to the post-debit balance
+                # (the Redis truth) so live ≈ Redis without drift.
+                bal = max(0, int(balance_after))
+                wid = (await conn.execute(
+                    text('SELECT id FROM credit_wallets WHERE "employerId" = :e LIMIT 1'),
+                    {"e": employer_id})).scalar()
+                if not wid:
+                    wid = uuid.uuid4().hex
+                    await conn.execute(text(
+                        'INSERT INTO credit_wallets (id, "employerId", "jobCredits", '
+                        '"unlockCredits", "boostCredits", "updatedAt") '
+                        'VALUES (:id, :e, :jc, 0, 0, now())'),
+                        {"id": wid, "e": employer_id, "jc": bal})
+                else:
+                    await conn.execute(text(
+                        'UPDATE credit_wallets SET "jobCredits" = :jc, "updatedAt" = now() '
+                        'WHERE id = :w'), {"jc": bal, "w": wid})
+                # Insert the job + record the DEBIT_JOB_POST ledger row.
+                await conn.execute(text(_insert_sql("private_jobs", job)), job)
+                await conn.execute(text(
+                    'INSERT INTO credit_ledger (id, "walletId", "creditType", action, amount, '
+                    'balance, "referenceType", "referenceId", description, "createdAt") '
+                    'VALUES (:id, :w, CAST(:ct AS "CreditType"), CAST(:ac AS "LedgerAction"), '
+                    ':amt, :bal, :rt, :rid, :d, now())'),
+                    {"id": uuid.uuid4().hex, "w": wid, "ct": "JOB_POST", "ac": "DEBIT_JOB_POST",
+                     "amt": need, "bal": bal, "rt": "job_activation", "rid": job_id,
+                     "d": f"Job posted ({need} credit{'s' if need != 1 else ''})"})
+                await (trans.commit() if commit else trans.rollback())
+            except Exception:
+                await trans.rollback()
+                raise
+        SQL_LATENCY.labels(op="job_post_billing").observe(time.perf_counter() - start)
+        return {"committed": commit, "job_id": job_id, "credits": need}
+
+    _BUCKETS = (("job", "jobCredits", "JOB_POST"),
+                ("unlock", "unlockCredits", "UNLOCK"),
+                ("boost", "boostCredits", "BOOST"))
+
+    @staticmethod
+    async def record_purchase(
+        *, employer_id: str, grants: dict[str, int], balances_after: dict[str, int],
+        price: float, payment_id: str, bundle: dict[str, Any] | None = None,
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        """Record a live credit PURCHASE: SET ``credit_wallets`` to the post-purchase
+        balances (the Redis truth), write a ``credit_ledger`` CREDIT row per granted
+        bucket, and — for a bundle — a ``bundle_purchases`` row.
+
+        ``bundle`` (a credit_bundles dict) → ``CREDIT_BUNDLE`` / 'bundle_purchase';
+        else an individual purchase → ``CREDIT_INDIVIDUAL`` / 'individual_purchase'
+        (no credit_pack_purchases row — our individual credits aren't credit_packs).
+        Idempotent on ``payment_id``. ``commit=False`` is a DRY RUN."""
+        grants = {k: int(grants.get(k, 0)) for k in ("job", "unlock", "boost")}
+        if not any(v > 0 for v in grants.values()):
+            return {"committed": False, "reason": "nothing_to_grant"}
+        action = "CREDIT_BUNDLE" if bundle else "CREDIT_INDIVIDUAL"
+        ref_type = "bundle_purchase" if bundle else "individual_purchase"
+        ref_id = payment_id or uuid.uuid4().hex
+        start = time.perf_counter()
+        async with get_engine().connect() as conn:
+            trans = await conn.begin()
+            try:
+                if payment_id:                                  # idempotency on the payment id
+                    seen = (await conn.execute(
+                        text('SELECT 1 FROM credit_ledger WHERE "referenceId" = :r LIMIT 1'),
+                        {"r": payment_id})).first()
+                    if seen:
+                        await trans.rollback()
+                        return {"committed": False, "reason": "already_recorded"}
+                wid = (await conn.execute(
+                    text('SELECT id FROM credit_wallets WHERE "employerId" = :e LIMIT 1'),
+                    {"e": employer_id})).scalar()
+                ba = {k: int(balances_after.get(k, 0)) for k in ("job", "unlock", "boost")}
+                if not wid:
+                    wid = uuid.uuid4().hex
+                    await conn.execute(text(
+                        'INSERT INTO credit_wallets (id, "employerId", "jobCredits", '
+                        '"unlockCredits", "boostCredits", "updatedAt") '
+                        'VALUES (:id, :e, :j, :u, :b, now())'),
+                        {"id": wid, "e": employer_id, "j": ba["job"], "u": ba["unlock"], "b": ba["boost"]})
+                else:
+                    await conn.execute(text(
+                        'UPDATE credit_wallets SET "jobCredits" = :j, "unlockCredits" = :u, '
+                        '"boostCredits" = :b, "updatedAt" = now() WHERE id = :w'),
+                        {"j": ba["job"], "u": ba["unlock"], "b": ba["boost"], "w": wid})
+                if bundle:
+                    await conn.execute(text(
+                        'INSERT INTO bundle_purchases (id, "employerId", "bundleId", '
+                        '"priceAtPurchase", "jobCreditsAdded", "unlockCreditsAdded", '
+                        '"boostCreditsAdded", "expiresAt") VALUES (:id, :e, :bid, :p, :j, :u, :b, '
+                        'now() + make_interval(days => :days))'),
+                        {"id": uuid.uuid4().hex, "e": employer_id, "bid": bundle["id"],
+                         "p": float(price), "j": grants["job"], "u": grants["unlock"],
+                         "b": grants["boost"], "days": int(bundle.get("validityDays") or 365)})
+                for key, _field, ctype in CreditWalletRepository._BUCKETS:
+                    if grants[key] > 0:
+                        await conn.execute(text(
+                            'INSERT INTO credit_ledger (id, "walletId", "creditType", action, '
+                            'amount, balance, "referenceType", "referenceId", description, "createdAt") '
+                            'VALUES (:id, :w, CAST(:ct AS "CreditType"), CAST(:ac AS "LedgerAction"), '
+                            ':amt, :bal, :rt, :rid, :d, now())'),
+                            {"id": uuid.uuid4().hex, "w": wid, "ct": ctype, "ac": action,
+                             "amt": grants[key], "bal": ba[key], "rt": ref_type, "rid": ref_id,
+                             "d": (f"Purchased {bundle['name']} bundle" if bundle
+                                   else f"Purchased {grants[key]} {ctype.lower()} credit"
+                                        f"{'s' if grants[key] != 1 else ''}")})
+                await (trans.commit() if commit else trans.rollback())
+            except Exception:
+                await trans.rollback()
+                raise
+        SQL_LATENCY.labels(op="credit_purchase").observe(time.perf_counter() - start)
+        return {"committed": commit, "granted": grants}
 
 
 class CreditBundleRepository:

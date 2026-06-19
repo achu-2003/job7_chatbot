@@ -61,6 +61,8 @@ def _stub_memory(
     candidates: list | None = None,
     search_results: list | None = None,
     application_ids: dict | None = None,
+    status_data: dict | None = None,
+    employer_jobs: list | None = None,
 ) -> None:
     # Default to a fully-onboarded sender so the identity gate is a no-op and the
     # reasoning tests below exercise the normal path. Onboarding tests pass
@@ -248,6 +250,14 @@ def _stub_memory(
     rt._search_candidates = fake_search_candidates  # type: ignore[assignment]
     rt._application_ids = fake_application_ids      # type: ignore[assignment]
     rt._create_application = fake_create_application  # type: ignore[assignment]
+
+    async def fake_application_status(**kw):
+        return status_data if status_data is not None else {"found": False, "applications": []}
+    rt._application_status = fake_application_status  # type: ignore[assignment]
+
+    async def fake_employer_jobs(employer_id, **kw):
+        return employer_jobs or []
+    rt._employer_jobs = fake_employer_jobs           # type: ignore[assignment]
     rt._test_app_db = app_db_calls                 # type: ignore[attr-defined]
 
     # expose action-call logs for assertions
@@ -598,7 +608,7 @@ async def test_creator_tap_starts_employer_registration(monkeypatch):
 
 def _employer(*, kyc="VERIFIED", paid=False, jobs=None):
     return {
-        "private_employers": {"companyName": "Acme Technologies", "kycStatus": kyc},
+        "private_employers": {"id": "emp1", "companyName": "Acme Technologies", "kycStatus": kyc},
         "paid": paid,
         "jobs": jobs or [],
     }
@@ -635,6 +645,168 @@ async def test_verified_employer_sees_menu():
     assert "acme" in out["response"].lower()
 
 
+def test_application_status_intent_matches_phrasings():
+    """The application-status intent recognises the full range of phrasings, and
+    does NOT trigger on job-search / other intents."""
+    from app.agent import runtime as r
+    for q in ("What is the status of my application?", "Track my application.",
+              "Any update on my application?", "Am I shortlisted for the next round?",
+              "Has the recruiter viewed my application?", "Have I been selected for an interview?",
+              "What is the next step in the hiring process?", "When can I expect a response?",
+              "Status", "Application status", "Check status", "My application",
+              "Track application", "Job status", "Update?", "Any update?"):
+        assert r._MENU_STATUS_RX.search(q), q
+    for q in ("find jobs", "job search", "search jobs", "recommended jobs",
+              "python developer jobs", "i want to apply for a job", "hi", "menu"):
+        assert not r._MENU_STATUS_RX.search(q), q
+
+
+async def test_seeker_status_phrasings_return_status_card():
+    """A status phrasing is answered deterministically (0 LLM) with the status
+    card — covering the many ways a seeker can ask."""
+    apps = {"found": True, "applications": [
+        {"job_title": "Software Developer", "status": "SHORTLISTED",
+         "company": "Acme", "location": "Chennai"},
+    ]}
+    for msg in ("application status", "track my application", "any update?", "Status"):
+        rt = _runtime()
+        _stub_memory(rt, facts={"full_name": "Asha"}, status_data=apps)
+        rt.llm = _FakeLLM(plans=[], reply="(LLM should not be called)")
+        out = await _handle(rt, msg)
+        assert out["used_llm"] is False, msg
+        assert "Your Applications" in out["response"] and "Software Developer" in out["response"], msg
+
+
+def test_seeker_employer_intent_matches():
+    """Employer requests typed in the seeker lane are detected (→ switch hint),
+    and legit job searches like 'post office jobs' are NOT hijacked."""
+    from app.agent import runtime as r
+    for q in ("post job", "post a job", "create a job", "credits plan", "buy credits",
+              "view candidates", "find candidates", "list my posted jobs", "my posted jobs",
+              "manage my jobs", "employer", "i am an employer", "i am a recruiter"):
+        assert r._SEEKER_EMPLOYER_INTENT_RX.search(q), q
+    for q in ("job search", "find jobs", "post office jobs", "postman jobs", "pricing analyst",
+              "application status", "recommended jobs", "i want to apply for a job", "hi",
+              "data entry jobs", "jobs in chennai", "python developer"):
+        assert not r._SEEKER_EMPLOYER_INTENT_RX.search(q), q
+
+
+async def test_seeker_employer_intent_shows_switch_hint():
+    """A seeker typing an employer request gets the lane-switch hint (0 LLM)."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Asha"})
+    rt.llm = _FakeLLM(plans=[], reply="(LLM should not be called)")
+    out = await _handle(rt, "post job")
+    assert out["used_llm"] is False
+    assert "job seeker" in out["response"].lower() and "switch" in out["response"].lower()
+
+
+async def test_my_jobs_reads_from_live_db():
+    """'My Jobs' lists the employer's jobs from live private_jobs (not the Redis
+    record), formatting each row into a detail card."""
+    rt = _runtime()
+    live_rows = [{"id": "cjob000001", "title": "Flutter Developer", "slug": "flutter-developer",
+                  "status": "PENDING", "vacancies": 2, "jobType": "FULL_TIME", "workMode": "OFFICE",
+                  "jobLocationType": "SPECIFIC", "locationDetails": "Chennai",
+                  "salaryMin": 20000, "salaryMax": 40000, "salaryPeriod": "MONTHLY",
+                  "experienceType": "EXPERIENCED", "experienceMin": 1, "experienceMax": 3,
+                  "creditsUsed": 2, "expiresAt": None}]
+    _stub_memory(rt, facts={"lane": "creator"}, employer=_employer(jobs=[]), employer_jobs=live_rows)
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "my jobs", interactive_id="emp:myjobs")
+    assert "Your posted jobs (1)" in out["response"]
+    assert "Flutter Developer" in out["response"] and "Chennai" in out["response"]
+
+
+def test_employer_typed_intent_routing():
+    """Natural-language employer commands route to the right action; genuine
+    skill/role searches still fall through to candidate search (not hijacked)."""
+    from app.agent import runtime as r
+
+    def route(q):
+        if r._EMP_MENU_RX.match(q): return "menu"
+        if r._EMP_JOBS_RX.search(q): return "myjobs"        # "my/posted jobs" ownership wins
+        if r._EMP_POST_RX.search(q): return "post"          # "post a job" / "hire" win
+        if r._EMP_SEEKER_INTENT_RX.search(q): return "seeker_switch"  # then seeker phrasings
+        if r._EMP_VIEW_RX.search(q): return "view"
+        if r._EMP_PLANS_RX.search(q): return "plans"
+        if r._EMP_BUY_RX.search(q): return "buy"
+        if r._EMP_WALLET_RX.search(q): return "wallet"
+        return "search"
+
+    for q in ("Jobs", "my jobs", "list my jobs", "show my posted jobs", "i want to view my jobs",
+              "my postings", "my listings", "my vacancies", "active jobs", "jobs i posted",
+              "manage my jobs", "track my jobs"):
+        assert route(q) == "myjobs", q
+    for q in ("post a job", "create a job", "add job", "i want to post a job", "new job",
+              "advertise a vacancy", "create job listing", "want to hire", "hire staff"):
+        assert route(q) == "post", q
+    for q in ("view candidates", "show me candidates", "candidates", "find candidates",
+              "applicants", "view applicants", "job seekers", "who applied", "view applications"):
+        assert route(q) == "view", q
+    for q in ("buy credits", "purchase credits", "add credits", "pricing", "bundles",
+              "recharge", "top up", "credit packs"):
+        assert route(q) == "buy", q
+    for q in ("wallet", "balance", "my credits", "credit history", "how many credits",
+              "remaining credits", "check my balance"):
+        assert route(q) == "wallet", q
+    for q in ("upgrade plan", "plans", "subscribe", "membership"):
+        assert route(q) == "plans", q
+    # job-SEEKER intents typed in the employer lane → the lane-switch reply (checked
+    # FIRST, so they win over the employer matchers — incl. the two edge cases).
+    for q in ("apply job", "apply for a job", "i want to apply", "search job", "find a job",
+              "looking for a job", "i want a job", "application status", "my applications",
+              "recommended jobs", "looking for work", "show me jobs", "view jobs",
+              "check my application status"):
+        assert route(q) == "seeker_switch", q
+    # employer 'my jobs' phrasings must still win over the seeker matcher
+    for q in ("my jobs", "show my jobs", "view my jobs", "show my posted jobs", "manage my jobs"):
+        assert route(q) == "myjobs", q
+    # genuine candidate searches must NOT be hijacked by command/seeker keywords
+    for q in ("python", "data science", "credit analyst", "data entry operator", "welder",
+              "hiring manager", "recruitment consultant", "application developer",
+              "talent acquisition", "hr manager", "project manager", "business analyst",
+              "find welder", "sales executive"):
+        assert route(q) == "search", q
+
+
+def test_is_searchable_role_guard():
+    """Only role/skill text is a searchable query — lane labels, menu words,
+    filler and non-wordy input are rejected (so we never search for 'Employer')."""
+    from app.agent import runtime as r
+    for ok in ("welder", "python developer", "sales executive", "data entry",
+               "credit analyst", "hr manager", "java"):
+        assert r._is_searchable_role(ok), ok
+    for bad in ("Employer", "employer", "Job Seeker", "switch", "menu", "back",
+                "hi", "ok", "thanks", "please", "123", "?", "a", "", "   "):
+        assert not r._is_searchable_role(bad), bad
+
+
+async def test_employer_lane_word_shows_menu_not_search():
+    """Regression: typing the lane label 'Employer' while already a registered
+    employer re-shows the hub (welcome back) — it must NOT run a literal candidate
+    search ('No candidates found matching Employer')."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"lane": "creator", "full_name": "Asha"}, employer=_employer())
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Employer")
+    assert "welcome back" in out["response"].lower()
+    assert "no candidates found" not in out["response"].lower()
+    # the employer hub list is attached
+    assert out["whatsapp_interactive"]["interactive"]["type"] == "list"
+
+
+async def test_employer_non_role_text_gets_guidance_not_empty_search():
+    """Non-role free text ('123', 'thanks') nudges the employer on how to search
+    by role/skill instead of running an empty candidate search."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"lane": "creator"}, employer=_employer())
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "12345")
+    assert "role" in out["response"].lower() and "skill" in out["response"].lower()
+    assert "no candidates found" not in out["response"].lower()
+
+
 async def test_post_job_tap_hands_over_form(monkeypatch):
     from app.config import get_settings
 
@@ -661,8 +833,10 @@ async def test_view_candidates_masked_until_paid():
     body = out["response"]
     assert "Rahul" in body and "2-3 years" in body
     assert "9990001111" not in body and "rahul@x.com" not in body   # masked
-    titles = [b["reply"]["title"] for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
-    assert any("Unlock" in t for t in titles)
+    # Unlock is a CTA-URL button that opens the employer portal (not in-chat pay)
+    action = out["whatsapp_interactive"]["interactive"]["action"]
+    assert "Unlock" in action["parameters"]["display_text"]
+    assert action["parameters"]["url"] == "https://employer.jobs7.in/"
 
 
 async def test_payment_unlocks_full_candidate_details():
@@ -715,8 +889,10 @@ async def test_employer_text_search_by_skill_masked():
     body = out["response"]
     assert "Vikram" in body and "welder" in body.lower()       # matched + query echoed
     assert "9991112222" not in body and "vik@x.com" not in body  # masked
-    titles = [b["reply"]["title"] for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
-    assert any("Unlock" in t for t in titles)
+    # Unlock → CTA-URL button opening the employer portal
+    action = out["whatsapp_interactive"]["interactive"]["action"]
+    assert "Unlock" in action["parameters"]["display_text"]
+    assert action["parameters"]["url"] == "https://employer.jobs7.in/"
 
 
 async def test_employer_text_search_full_when_paid():
@@ -859,25 +1035,15 @@ async def test_tap_recommended_job_shows_single_card():
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
-async def test_application_status_button_falls_through_to_pipeline():
-    """'Application Status' isn't a menu short-circuit — it flows to the normal
-    planner path (which routes to get_application_status)."""
+async def test_application_status_handled_deterministically():
+    """'Application Status' is a deterministic menu short-circuit (0 LLM) — it no
+    longer needs the planner. An empty record → the friendly 'no applications' line."""
     rt = _runtime()
-    _stub_memory(rt)
-    rt.llm = _FakeLLM(
-        plans=[{"goal": "status", "direct_answer": False,
-                "steps": [{"tool": "get_application_status", "args": {}}]}],
-        reply="(ignored — app-status is formatted deterministically)",
-    )
-
-    async def fake_dispatch(name, args, ctx):
-        assert name == "get_application_status"
-        return {"found": False}
-
-    rt.tool_registry.dispatch = fake_dispatch  # type: ignore[assignment]
+    _stub_memory(rt, status_data={"found": False, "applications": []})
+    rt.llm = _FakeLLM(plans=[], reply="(LLM should not be called)")
     out = await _handle(rt, "Application Status")
     assert "don't have any applications" in out["response"].lower()
-    assert rt.llm.json_calls == ["agent_plan"]              # went through the planner
+    assert out["used_llm"] is False                          # no planner / LLM call
 
 
 async def test_category_browse_shows_tappable_role_list():
@@ -918,6 +1084,42 @@ async def test_typed_specific_role_shows_matching_job_cards():
     assert cards[0]["interactive"]["action"]["buttons"][0]["reply"]["id"] == "apply:w1"
     assert "matching" in out["response"].lower() and "Welder" in out["response"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
+
+
+async def test_typed_role_with_no_exact_match_prepends_recommendation_notice():
+    """Searching a role with NO exact-title match (e.g. 'angular developer' when
+    only other Developer roles exist) sends a 'no such role — here are related
+    jobs' notice BEFORE the cards, then the related job cards."""
+    rt = _runtime()
+    related = [
+        {"job_ref": "fs1", "title": "Fullstack Developer", "location": "Salem"},
+        {"job_ref": "fl1", "title": "Flutter Developer", "location": "Chennai"},
+    ]
+    _stub_memory(rt, browse=None, title_jobs=related)
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "angular developer")
+    msgs = out["whatsapp_messages"]
+    # first bubble is a plain-text notice, not a job card
+    assert msgs[0]["type"] == "text"
+    notice = msgs[0]["text"]["body"]
+    assert "Angular Developer" in notice and "related jobs" in notice.lower()
+    # then the related cards follow (Apply button id present)
+    assert msgs[1]["interactive"]["action"]["buttons"][0]["reply"]["id"] == "apply:fs1"
+    assert len(msgs) == 3                                          # notice + 2 cards
+    assert rt.llm.json_calls == [] and rt.llm.chat_calls == []     # 0 LLM
+
+
+async def test_typed_role_exact_match_has_no_notice():
+    """An exact-title hit ('flutter developer' → Flutter Developer) shows the cards
+    straight away — no 'no such role' notice prepended."""
+    rt = _runtime()
+    jobs = [{"job_ref": "fl1", "title": "Flutter Developer", "location": "Chennai"}]
+    _stub_memory(rt, browse=None, title_jobs=jobs)
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "flutter developer")
+    msgs = out["whatsapp_messages"]
+    assert msgs[0].get("type") != "text"                          # first bubble IS a card
+    assert msgs[0]["interactive"]["action"]["buttons"][0]["reply"]["id"] == "apply:fl1"
 
 
 async def test_non_category_no_title_match_falls_through_to_agent():

@@ -290,3 +290,43 @@ async def test_dispatch_never_raises_on_backend_failure():
     vector.raise_on_query = True
     out = await _registry(vector).dispatch("search_jobs", {"query": "x"}, _ctx())
     assert out["error"] == "tool execution failed"
+
+
+def test_best_tier_title_matches_drops_generic_word_matches():
+    """A typed multi-word role keeps only the rows matching the MOST query words,
+    so "flutter developer" returns the Flutter role and drops every job that
+    merely shares the generic word "developer"."""
+    from app.db.repositories import _best_tier_title_matches
+
+    rows = [
+        {"title": "Flutter Developer", "skills": [], "department_name": "IT"},
+        {"title": "Frontend Developer", "skills": ["React"], "department_name": "IT"},
+        {"title": "Software Developer", "skills": [], "department_name": "IT"},
+    ]
+    flutter = _best_tier_title_matches(["flutter", "developer"], rows, 8)
+    assert [r["title"] for r in flutter] == ["Flutter Developer"]
+
+    # a single generic word keeps every match (all score 1)
+    devs = _best_tier_title_matches(["developer"], rows, 8)
+    assert {r["title"] for r in devs} == {
+        "Flutter Developer", "Frontend Developer", "Software Developer"
+    }
+
+    # a qualifier that matches nothing must NOT over-filter: "senior welder"
+    # still returns the Welder row (only "welder" matches → best tier = 1)
+    welders = _best_tier_title_matches(
+        ["senior", "welder"],
+        [{"title": "Welder", "skills": [], "department_name": "Manufacturing"}],
+        8,
+    )
+    assert [r["title"] for r in welders] == ["Welder"]
+
+    # skills/category count toward the score (react matches a skill)
+    rows2 = [
+        {"title": "Frontend Developer", "skills": ["React", "TS"], "department_name": "IT"},
+        {"title": "Backend Developer", "skills": ["Go"], "department_name": "IT"},
+    ]
+    react = _best_tier_title_matches(["react", "developer"], rows2, 8)
+    assert [r["title"] for r in react] == ["Frontend Developer"]
+
+    assert _best_tier_title_matches(["anything"], [], 8) == []

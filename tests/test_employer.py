@@ -1,4 +1,7 @@
 """Employer (job-poster) Stage 1-2 — record builder + form rendering (pure)."""
+import types
+from urllib.parse import urlencode
+
 from app.employer import build_employer_record, build_job_record
 from app.api.routes.employer import (
     _expired_html,
@@ -27,7 +30,6 @@ def test_build_employer_record_maps_private_employers_columns():
     form = {
         "company_name": "Acme Technologies",
         "email": "hr@acme.com",
-        "website": "https://acme.com",
         "address": "1 MG Road",
         "district_id": "d1",
         "city": "Chennai",
@@ -93,13 +95,16 @@ def test_post_job_form_is_a_five_step_wizard():
     assert "steps[cur].querySelector('[name=job_location_type]')" in out
     assert "Please select the job state." in out and "Please select the job district." in out
     # one field/marker from each remaining section
-    for nm in ("title", "job_type", "experience_type", "job_location_type",
+    for nm in ("title", "category_id", "job_type", "experience_type", "job_location_type",
                "preferred_district_ids", "apply_modes", "contact_whatsapp"):
         assert f'name="{nm}"' in out, nm
+    # the Job Category select is populated from the categories lookup
+    assert '<select name="category_id"' in out
+    assert '<option value="cat1">Engineering</option>' in out
     # the removed sections are gone
     for gone in ("qualification_level", "gender_preference", "english_level",
                  "candidate_distance", "has_security_deposit", "work_start_time",
-                 "interview_date", "category_id", "preferred_languages", "required_assets"):
+                 "interview_date", "preferred_languages", "required_assets"):
         assert f'name="{gone}"' not in out, gone
 
 
@@ -157,6 +162,113 @@ def test_post_job_form_salary_and_vacancies_required_inline():
     assert "e.className='field-err'" in out
     valid_body = out.split("function valid()")[1].split("next.onclick")[0]
     assert "alert(" not in valid_body
+
+
+class _FakeRegMemory:
+    """Minimal memory for register_submit: identity + idempotent SET-NX + save."""
+    def __init__(self, phone="919876543210", tenant="t1"):
+        self.phone, self.tenant = phone, tenant
+        self.saved = None
+        self._seen: set[str] = set()
+        self.save_calls = 0
+
+    async def get_employer_identity(self, token):
+        return {"tenant_id": self.tenant, "customer_id": self.phone, "name": "Asha"}
+
+    async def get_employer(self, phone, *, tenant_id=None):
+        return self.saved
+
+    async def mark_seen(self, key, *, ttl=600):
+        if key in self._seen:
+            return False
+        self._seen.add(key)
+        return True
+
+    async def clear_seen(self, key):
+        self._seen.discard(key)
+
+    async def save_employer(self, phone, record, *, tenant_id=None):
+        self.saved = record
+        self.save_calls += 1
+
+
+def _reg_request(mem, **fields):
+    body = urlencode({"token": "tok", "company_name": "Acme", "district_id": "d1", **fields}).encode()
+    app = types.SimpleNamespace(state=types.SimpleNamespace(memory=mem))
+    return types.SimpleNamespace(app=app, body=lambda: _coro(body))
+
+
+async def _coro(v):
+    return v
+
+
+async def test_register_double_submit_is_idempotent(monkeypatch):
+    """A double-tap on the register submit creates ONE profile and pushes the menu
+    ONCE (no duplicate company profile)."""
+    import app.api.routes.employer as emp
+    pushes = []
+
+    async def _push(*a, **k):
+        pushes.append(1)
+    monkeypatch.setattr(emp.wa_delivery, "send_message", _push)
+
+    mem = _FakeRegMemory()
+    # First submit → creates + pushes.
+    out1 = await emp.register_submit(_reg_request(mem))
+    # Second (double-tap) → already exists → no re-save, no re-push.
+    out2 = await emp.register_submit(_reg_request(mem))
+
+    assert mem.save_calls == 1, "profile saved only once"
+    assert len(pushes) == 1, "menu pushed only once"
+    assert "created" in out1.body.decode().lower() and "created" in out2.body.decode().lower()
+
+
+def test_private_employers_insert_sql_has_enum_casts_and_updated_at():
+    """The live INSERT casts the enum columns and sets created/updatedAt."""
+    from app.db.repositories import _insert_sql, _prep_row
+    rec = build_employer_record(
+        identity={"customer_id": "919876543210"},
+        form={"company_name": "Acme", "district_id": "d1"})["private_employers"]
+    sql = _insert_sql("private_employers", _prep_row("private_employers", rec))
+    assert 'CAST(:status AS "EmployerStatus")' in sql
+    assert 'CAST(:kycStatus AS "KycStatus")' in sql
+    assert '"createdAt"' in sql and '"updatedAt"' in sql and "now(), now()" in sql
+
+
+async def test_register_writes_to_live_db_when_flag_on(monkeypatch):
+    """With EMPLOYER_REGISTER_IN_DB on, the submit also writes to private_employers
+    (idempotent, best-effort) and adopts the live id."""
+    import app.api.routes.employer as emp
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "employer_register_in_db", True)
+
+    async def _noop_push(*a, **k):
+        return None
+    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop_push)
+
+    created = []
+
+    async def fake_create(payload, *, commit=True, welcome_job_credits=0):
+        created.append({"company": payload["private_employers"]["companyName"],
+                        "welcome": welcome_job_credits})
+        return {"committed": True, "inserted": True, "employer_id": "live-emp-1"}
+    monkeypatch.setattr(emp.EmployerRepository, "create", staticmethod(fake_create))
+
+    mem = _FakeRegMemory()
+    await emp.register_submit(_reg_request(mem))
+    assert len(created) == 1 and created[0]["company"] == "Acme"   # written once
+    assert created[0]["welcome"] == 1                # welcome job credit granted live
+    assert mem.saved["private_employers"]["id"] == "live-emp-1"   # adopted live id
+
+
+def test_pages_have_brand_and_back_to_chat(monkeypatch):
+    """Every employer page carries the Jobs7 brand header + a Back-to-chat link."""
+    from app.api.routes.employer import _page
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "whatsapp_business_number", "919876543210")
+    out = _page("x", "<p>body</p>")
+    assert 'class="brand"' in out and 'class="brand-img"' in out and "/static/logo.png" in out
+    assert 'class="backchat"' in out and "https://wa.me/919876543210" in out
 
 
 def test_native_forms_use_inline_validator():

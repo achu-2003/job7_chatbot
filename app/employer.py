@@ -107,7 +107,7 @@ def build_employer_record(*, identity: dict[str, Any], form: dict[str, Any]) -> 
         "designationId": None,
         "primaryPhone": phone,
         "email": _str(form, "email"),
-        "website": _str(form, "website"),
+        "website": None,   # removed from the register form
         "logo": _str(form, "logo"),
         "description": _str(form, "description"),
         "address": _str(form, "address"),

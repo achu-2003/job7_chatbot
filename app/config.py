@@ -208,6 +208,20 @@ class Settings(BaseSettings):
     # (private_job_seekers + job_seeker_profiles + child rows). Default False keeps
     # the safe Redis-only staging; flip to true (REGISTER_IN_DB=true) once verified.
     register_in_db: bool = False
+    # When True, a submitted company registration is ALSO written to the live
+    # ``private_employers`` table (in addition to the Redis staging). Default False
+    # keeps the safe Redis-only flow; flip to true (EMPLOYER_REGISTER_IN_DB=true)
+    # once verified. The write is idempotent on the phone (no duplicate rows).
+    employer_register_in_db: bool = False
+    # When True, an activated job post is ALSO written to the live job board in one
+    # transaction: INSERT private_jobs + debit credit_wallets.jobCredits + a
+    # DEBIT_JOB_POST credit_ledger row (full billing fidelity). Idempotent on the
+    # job. Default False keeps the Redis-only flow; flip with JOB_POST_IN_DB=true.
+    job_post_in_db: bool = False
+    # When True, a completed credit PURCHASE (Razorpay) is ALSO recorded live:
+    # credit_wallets top-up + credit_ledger CREDIT_* rows + a bundle_purchases row
+    # for bundles. Idempotent on the payment id. Flip with CREDITS_PURCHASE_IN_DB=true.
+    credits_purchase_in_db: bool = False
     # Employer (job-poster) flow — Stages 1-5 are staged in Redis ONLY for testing
     # (company profile shaped like private_employers, KYC, posted jobs, the
     # candidate-unlock entitlement). When ``employer_kyc_auto_verify`` is True a
@@ -225,6 +239,9 @@ class Settings(BaseSettings):
     # link (as a tappable "Open in Jobs7" WhatsApp button); an https URL is
     # required for the button (Meta rejects http/localhost), else it's inline text.
     jobs7_app_url: str = "https://play.google.com/store/apps/details?id=com.jobs7"
+    # Employer web portal — where an employer goes to unlock full candidate
+    # details (payment/subscription handled there, not in chat).
+    employer_portal_url: str = "https://employer.jobs7.in/"
 
     # ---- razorpay (employer subscription / credit payments) ----
     # TEST keys start with "rzp_test_" (no real money — pay with Razorpay test

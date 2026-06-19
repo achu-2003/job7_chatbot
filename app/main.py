@@ -132,6 +132,8 @@ from starlette.staticfiles import StaticFiles  # noqa: E402
 
 os.makedirs("uploads/resumes", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+# Committed brand/static assets (logo etc.) — served read-only at /static.
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 @app.get("/metrics")

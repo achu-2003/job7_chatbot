@@ -126,13 +126,14 @@ def test_validate_kyc():
 
 # A minimal-but-complete job: title + a (Remote) location (which needs no
 # state/district) + one candidate district. Clean base for the conditional tests.
-_JOB_OK = {"title": "Welder", "job_location_type": "REMOTE",
+_JOB_OK = {"title": "Welder", "category_id": "cat1", "job_location_type": "REMOTE",
            "preferred_district_ids": ["d1"]}
 
 
 def test_validate_job_post():
     assert "title" in v.validate_job_post({})                          # title required
-    assert "job_location_type" in v.validate_job_post({"title": "Welder"})  # location required
+    assert "category_id" in v.validate_job_post({"title": "Welder"})   # category required
+    assert "job_location_type" in v.validate_job_post({"title": "Welder", "category_id": "c1"})
     ok = {**_JOB_OK, "salary_min": "20000", "salary_max": "30000",
           "vacancies": "3"}
     assert v.validate_job_post(ok) == {}
@@ -149,7 +150,8 @@ def test_validate_job_post_experienced_requires_years():
 
 
 def test_validate_job_post_specific_location_requires_state_district():
-    base = {"title": "Welder", "job_location_type": "SPECIFIC", "preferred_district_ids": ["d1"]}
+    base = {"title": "Welder", "category_id": "cat1", "job_location_type": "SPECIFIC",
+            "preferred_district_ids": ["d1"]}
     errs = v.validate_job_post(base)
     assert "state_id" in errs and "district_id" in errs
     assert v.validate_job_post({**base, "state_id": "s1", "district_id": "d1"}) == {}
@@ -159,7 +161,7 @@ def test_validate_job_post_specific_location_requires_state_district():
 
 def test_validate_job_post_requires_candidate_district():
     # the "Districts *" field must carry at least one district
-    base = {"title": "Welder", "job_location_type": "REMOTE"}
+    base = {"title": "Welder", "category_id": "cat1", "job_location_type": "REMOTE"}
     assert "preferred_district_ids" in v.validate_job_post(base)
     assert v.validate_job_post({**base, "preferred_district_ids": ["d1"]}) == {}
     assert "preferred_district_ids" in v.validate_job_post({**base, "preferred_district_ids": []})

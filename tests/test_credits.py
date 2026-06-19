@@ -133,7 +133,39 @@ async def test_finalize_job_debits_and_posts(monkeypatch):
     assert summary["need"] == 2 and summary["ref"] == "JOB-XYZ"
     rec = await mem.get_employer("919042177457", tenant_id="t1")
     assert rec["walletJobCredits"] == 0
-    assert rec["jobs"][-1]["private_jobs"]["status"] == "PENDING"
-    assert rec["jobs"][-1]["private_jobs"]["validityDays"] == 15
+    pj = rec["jobs"][-1]["private_jobs"]
+    assert pj["status"] == "PENDING"
+    # validity maps to expiresAt (a real private_jobs column), NOT validityDays
+    assert "validityDays" not in pj and pj.get("expiresAt")
+    assert rec["jobs"][-1]["validityDays"] == 15              # kept as Redis meta
     assert rec["lastActivated"]["ref"] == "JOB-XYZ"
     assert await mem.get_job_draft("tokF") is None        # draft consumed
+
+
+async def test_finalize_job_writes_live_billing_when_flag_on(monkeypatch):
+    """With JOB_POST_IN_DB on, activation calls the transactional live write
+    (private_jobs + wallet debit + ledger) once, with the right amounts."""
+    import app.api.routes.employer as emp
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "job_post_in_db", True)
+
+    async def _noop(*a, **k):
+        return None
+    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop)
+
+    calls = []
+
+    async def fake_billing(*, employer_id, job_payload, need, balance_after, commit=True):
+        calls.append({"employer_id": employer_id, "need": need, "balance_after": balance_after})
+        return {"committed": True, "job_id": job_payload["id"], "credits": need}
+    monkeypatch.setattr(emp.CreditWalletRepository, "post_job_with_billing", staticmethod(fake_billing))
+
+    mem = await _mem_with_employer()                       # employerId = "emp1"
+    await mem.ensure_job_credits("919042177457", tenant_id="t1", seed=2)
+    await mem.stage_job_draft("tokB", {"ref": "JOB-B1", "id": "j1",
+        "private_jobs": {"id": "j1", "title": "Dev", "employerId": "emp1",
+                         "preferredDistrictIds": ["d1", "d2"]}})
+    await emp._finalize_job(mem, "919042177457", "t1", "tokB", "15")
+    assert len(calls) == 1
+    assert calls[0]["employer_id"] == "emp1" and calls[0]["need"] == 2
+    assert calls[0]["balance_after"] == 0                  # 2 → 0 after the debit

@@ -46,7 +46,12 @@ from app.agent.state import AgentState
 from app.chatbot import wa_format as wa
 from app.chatbot.memory import ConversationMemory
 from app.chatbot.validator import HallucinationValidator
-from app.db.repositories import ApplicationRepository, CandidateRepository, JobSeekerRepository
+from app.db.repositories import (
+    ApplicationRepository,
+    CandidateRepository,
+    JobPostRepository,
+    JobSeekerRepository,
+)
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.core.metrics import AGENT_LOOPS
@@ -54,6 +59,7 @@ from app.core.tenancy import get_current_tenant_id
 from app.llm.client import LLMClient
 from app.mcp.tools import (
     ToolRegistry,
+    get_application_status_core,
     get_job_core,
     list_category_jobs_core,
     list_jobs_overview_core,
@@ -101,11 +107,36 @@ _MENU_BUTTONS = (
     ("menu_recommend", "Recommended Jobs"),
 )
 # Tapped/typed "Job Search" → show the category list. "Recommended Jobs" →
-# profile-based recommendations. "Application Status" is left to the normal
-# pipeline (planner → get_application_status), which already handles it.
+# profile-based recommendations. "Application Status" → a deterministic status
+# lookup (any of the many phrasings below), no LLM needed.
 _MENU_SEARCH_RX = re.compile(r"^\s*(job\s*search|search\s*jobs?)\s*$", re.IGNORECASE)
 _MENU_RECOMMEND_RX = re.compile(
     r"^\s*(recommend(ed)?\s*jobs?|recommendations?|recommend)\s*$", re.IGNORECASE
+)
+# Application-status intent — covers the full range a seeker might type/tap:
+# "application status", "track my application", "any update?", "am I shortlisted?",
+# "have I been selected for an interview?", bare "status"/"update?", etc.
+_MENU_STATUS_RX = re.compile(
+    r"\bapplication\b"                                  # any "...application..." phrasing
+    r"|\bapplied\b"                                     # "I applied for a job recently…"
+    r"|^\s*(application\s*)?status\s*[!.?]*$|^\s*(check\s*status|job\s*status)\s*[!.?]*$"
+    r"|^\s*(any\s*)?update\s*[!.?]*$|^\s*track(\s*application)?\s*[!.?]*$"
+    r"|\b(shortlist(ed)?|under\s+review|been\s+(accepted|rejected|viewed|selected))\b"
+    r"|\bselected\s+for\s+(an?\s+)?interview\b|\bnext\s+(step|round)\b|\bhiring\s+process\b"
+    r"|\bexpect\b.*\bresponse\b",
+    re.IGNORECASE,
+)
+# EMPLOYER intents typed while in the JOB-SEEKER lane (e.g. "post job", "credits
+# plan", "view candidates", "list my posted jobs") — these aren't seeker actions,
+# so we explain the lane + how to switch. Kept specific so it never hijacks a
+# legit job search like "post office jobs" or "pricing analyst".
+_SEEKER_EMPLOYER_INTENT_RX = re.compile(
+    r"\b(post|create|publish|advertise)\s+(a\s+|an\s+|new\s+|the\s+)?(jobs?|vacanc(y|ies)|openings?|positions?)\b"
+    r"|\b(view|see|find|browse|show|unlock)\b[\w\s]*\bcandidates?\b"
+    r"|\bbuy\b[\w\s]*\bcredits?\b|\bcredits?\s+(plan|pack|bundle)s?\b|\bcredits?\s*(&|and)?\s*wallet\b"
+    r"|\b(my\s+)?posted\s+jobs?\b|\bmanage\s+(my\s+)?jobs?\b|\bemployer\s+(login|side|mode|account)\b"
+    r"|\bi\s*(a?m|'?m)\s+(an?\s+)?(employer|recruiter)\b|^\s*(employer|recruiter)\s*[!.?]*$",
+    re.IGNORECASE,
 )
 
 
@@ -127,6 +158,31 @@ _ROLE_BUTTONS = (
 )
 _ROLE_SEEKER_RX = re.compile(r"^\s*job\s*seeker\s*$", re.IGNORECASE)
 _ROLE_CREATOR_RX = re.compile(r"^\s*(employer|job\s*creator|creator)\s*$", re.IGNORECASE)
+
+# Free text in the employer lane that is NOT a candidate search — lane labels, the
+# bot's own menu words, bare filler/acknowledgements. Such text must never be run
+# as a literal candidate search (e.g. searching for someone named "Employer"); the
+# employer lane only searches by ROLE or SKILL. Anything matching here (or that is
+# too short / has no letters) gets a guidance nudge instead of an empty search.
+_NOT_A_SEARCH_RX = re.compile(
+    r"^\s*(employer|job\s*creator|creator|job\s*seeker|seeker|switch|change|"
+    r"menu|back|home|main(\s*menu)?|options?|hub|start|begin|"
+    r"hi|hello|hey|hii+|ok(ay)?|yes|no|yep|nope|sure|"
+    r"thanks?|thank\s*you|ty|please|pls|help)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_searchable_role(text: str) -> bool:
+    """True only when free text looks like a ROLE/SKILL worth searching candidates
+    by. Rejects lane labels, menu words, filler, and non-wordy input so we never
+    run (and then apologise for) a literal search for "Employer"/"hi"/"123"."""
+    t = (text or "").strip()
+    if len(t) < 2:                       # single char / empty — nothing to match
+        return False
+    if not re.search(r"[A-Za-z]", t):    # digits/punctuation only — not a role
+        return False
+    return not _NOT_A_SEARCH_RX.match(t)
 
 
 # ---- employer (job-poster) flow --------------------------------------
@@ -154,23 +210,70 @@ def _emp_menu(body: str) -> dict[str, Any]:
     return wa.list_message(body=body, button_text="Menu",
                            rows=list(_EMP_MENU_ROWS), section_title="Employer menu")
 # Typed (not tapped) employer commands → the same actions as the menu buttons.
-# Anything else a VERIFIED employer types is treated as a candidate search query
-# (by skill / role / category).
-_EMP_MENU_RX = re.compile(r"^\s*(menu|back|home|options?|start)\s*$", re.IGNORECASE)
+# These match ANYWHERE in the message (re.search) and tolerate natural phrasings
+# like "list my jobs" / "i want to view my jobs", but stay specific enough not to
+# hijack a genuine candidate search (e.g. a "credit analyst" skill query). Order
+# in the router matters (View/Post are checked before My Jobs). Anything that
+# matches NONE of these is treated as a candidate search (by skill / role).
+_EMP_MENU_RX = re.compile(r"^\s*(menu|back|go\s*back|home|main(\s*menu)?|options?|start|hub)\s*$", re.IGNORECASE)
+# View Candidates — words about candidates/applicants/seekers (NOT bare role words,
+# so a skill search like "application developer" / "talent acquisition" stays a search).
 _EMP_VIEW_RX = re.compile(
-    r"^\s*(view\s*candidates?|all\s*candidates?|show\s*(me\s*)?candidates?|candidates?|list\s*candidates?)\s*$",
+    r"\b(view|see|show|browse|find|get|all|list|search|display|check)\b.*"
+    r"\b(candidates?|applicants?|job\s*seekers?|seekers?|profiles?|applications?)\b"
+    r"|^\s*(candidates?|applicants?|job\s*seekers?|seekers?)\s*$"
+    r"|\bwho\s+(applied|has\s+applied)\b",
     re.IGNORECASE,
 )
-_EMP_POST_RX = re.compile(r"^\s*(post\s*(a\s*)?job|create\s*(a\s*)?job)\s*$", re.IGNORECASE)
-_EMP_JOBS_RX = re.compile(r"^\s*(my\s*jobs?|posted\s*jobs?)\s*$", re.IGNORECASE)
-_EMP_PLANS_RX = re.compile(
-    r"^\s*(upgrade(\s*plan)?|plans?|subscri\w*)\s*$", re.IGNORECASE,
+# Post a Job — create/advertise a listing, or an explicit hire-intent phrase
+# ("hire someone", not bare "hiring" → avoids hijacking a "hiring manager" search).
+_EMP_POST_RX = re.compile(
+    r"\b(post|create|add|publish|advertise|put\s*up)\b.*"
+    r"\b(jobs?|vacanc(y|ies)|openings?|positions?|listings?|roles?|requirements?)\b"
+    r"|^\s*post\s*(a\s*)?job\b|\bnew\s+(job|vacancy|opening|position)\b"
+    r"|\b(want|need|like|looking|wish)\s+to\s+hire\b"
+    r"|\bhire\s+(someone|people|staff|employees?|workers?|candidates?)\b",
+    re.IGNORECASE,
 )
+# My Jobs — the employer's own posted listings (lots of natural phrasings).
+_EMP_JOBS_RX = re.compile(
+    r"\b(my|posted)\s+(jobs?|posts?|postings?|listings?|vacanc(y|ies)|openings?|ads?|advertisements?)\b"
+    # a verb + MY jobs ("view my jobs") — the "my" ownership distinguishes this
+    # from a seeker's "view jobs" (which should go to the lane-switch hint).
+    r"|\b(view|see|list|show|check|manage|display|track|edit)\b.*"
+    r"\bmy\s+(jobs?|postings?|listings?|vacanc(y|ies)|openings?)\b"
+    r"|\bjobs?\s+i\s+(posted|created|added|put\s*up)\b|\bactive\s+jobs?\b"
+    r"|^\s*(my\s+)?(jobs?|postings?|listings?)\s*$",
+    re.IGNORECASE,
+)
+_EMP_PLANS_RX = re.compile(r"\b(upgrade|subscri\w*|membership)\b|\bplans?\b", re.IGNORECASE)
+# Buy Credits — purchase/top-up intents.
 _EMP_BUY_RX = re.compile(
-    r"^\s*(buy\s*credits?|buy|pricing|bundles?)\s*$", re.IGNORECASE,
+    r"\b(buy|purchase|get|add|recharge|top\s*-?\s*up)\b.*\bcredits?\b"
+    r"|\b(pricing|bundles?|packages?|credit\s*packs?)\b"
+    r"|^\s*(buy|purchase|recharge|top\s*-?\s*up)\b",
+    re.IGNORECASE,
 )
+# Credits & Wallet — check balance / history (NOT bare "credits" → avoids "credit analyst").
 _EMP_WALLET_RX = re.compile(
-    r"^\s*(credits?\s*(&|and)?\s*wallet|wallet|my\s*credits?|credits?|balance|recharge|top.?up|history)\s*$",
+    r"\b(wallet|balance)\b|\b(credit|transaction)\s*history\b|\bmy\s+credits?\b"
+    r"|\b(remaining|available|left|current)\s+credits?\b|\bhow\s+many\s+credits?\b"
+    r"|\bcheck\s+(my\s+)?balance\b|\bcredits?\s*(&|and)\s*wallet\b",
+    re.IGNORECASE,
+)
+# JOB-SEEKER intents typed while in the EMPLOYER lane (e.g. "apply job",
+# "search for a job", "application status") — these aren't candidate searches, so
+# we explain the lane and offer to switch instead of returning empty results.
+_EMP_SEEKER_INTENT_RX = re.compile(
+    r"\bapply\b"
+    r"|\b(search|searching|find|finding|want|need|looking|get|browse)\b.*\bjobs?\b"
+    # "show me jobs" / "view jobs" — but NOT "show MY jobs" (the employer's own
+    # listings; strict spacing means 'my'/'posted' won't match) and NOT "view job
+    # SEEKERS" (that's the employer asking for candidates → View Candidates).
+    r"|\b(show|see|view)\s+(me\s+|the\s+|any\s+|some\s+|available\s+)?jobs?\b(?!\s*seekers?\b)"
+    r"|\bjobs?\s+for\s+me\b|\bjob\s*search\b|\b(find|looking\s+for)\s+work\b"
+    r"|\bapplication\s*status\b|\bmy\s+applications?\b|\brecommend(ed)?\s+jobs?\b"
+    r"|\b(i\s+am|i'?m)\s+a\s+(job\s*)?seeker\b|\bi\s+want\s+(a\s+)?jobs?\b",
     re.IGNORECASE,
 )
 
@@ -300,6 +403,8 @@ class AgentRuntime:
         self._list_candidates = JobSeekerRepository.list_candidates
         self._application_ids = CandidateRepository.application_ids
         self._create_application = ApplicationRepository.create
+        self._application_status = get_application_status_core
+        self._employer_jobs = JobPostRepository.list_for_employer
         self._search_candidates = JobSeekerRepository.search_candidates
         self._graph = self._build_graph()
 
@@ -389,12 +494,30 @@ class AgentRuntime:
         if not jobs:
             return {}
         cards, body = jobflow.job_cards(jobs, limit=5)
-        plural = "opening" if len(jobs) == 1 else "openings"
-        header = f"{len(jobs)} {plural} matching “{query.title()}”:"
+        # Did we find the role they actually typed, or only RELATED jobs? An "exact"
+        # hit = some result's TITLE contains every query word ("flutter developer" →
+        # a Flutter Developer). If none does (e.g. "angular developer" → only other
+        # Developer roles), say so up front and frame the rest as recommendations.
+        words = [w for w in re.findall(r"[a-z0-9]+", query.lower()) if len(w) >= 2]
+        exact = any(
+            all(w in (j.get("title") or "").lower() for w in words) for j in jobs
+        )
+        if exact:
+            plural = "opening" if len(jobs) == 1 else "openings"
+            header = f"{len(jobs)} {plural} matching “{query.title()}”:"
+            messages = cards
+        else:
+            header = (
+                f"😕 No *{query.title()}* roles open right now — "
+                "here are some related jobs you might like 👇"
+            )
+            # A heads-up bubble BEFORE the job cards (the cards are sent as their
+            # own messages, so the notice must be its own message too).
+            messages = [wa.text_message(header), *cards]
         await self._save_browse(state, {"stage": "results"})
         return {
             "intent": "browse", "did_browse": True, "used_llm": False,
-            "draft_response": f"{header}\n\n{body}", "whatsapp_messages": cards,
+            "draft_response": f"{header}\n\n{body}", "whatsapp_messages": messages,
             "catalog_hits": jobs,
         }
 
@@ -733,7 +856,51 @@ class AgentRuntime:
             return await self._category_menu(state)
         if _MENU_RECOMMEND_RX.match(text):
             return await self._recommend_menu(state)
+        if _MENU_STATUS_RX.search(text):
+            handled = await self._status_menu(state)
+            if handled:
+                return handled
+        if _SEEKER_EMPLOYER_INTENT_RX.search(text):
+            return self._seeker_employer_intent_reply(state)
         return {}
+
+    def _seeker_employer_intent_reply(self, state: AgentState) -> dict[str, Any]:
+        """The user is on the JOB-SEEKER side but typed an employer request (e.g.
+        'post job' / 'credits plan' / 'view candidates'). Explain the lane + how
+        to switch."""
+        body = (
+            "🙋 You're on the *Job Seeker* side — this is for finding and applying "
+            "to jobs.\n\n"
+            "Want to *post jobs* or *hire* candidates? Type *switch* to move to the "
+            "Employer side.\n\nOr pick a job-seeker option below."
+        )
+        return {
+            "intent": "lane_hint", "did_menu": True, "used_llm": False,
+            "single_bubble": True, "draft_response": body,
+            "whatsapp_interactive": _menu_buttons_message(body),
+        }
+
+    async def _status_menu(self, state: AgentState) -> dict[str, Any]:
+        """Deterministic 'application status' lookup — covers the many ways a
+        seeker can ask ('track my application', 'any update?', 'am I shortlisted?'
+        …). Reuses the responder's status-card formatter; 0 LLM. Returns {} (fall
+        through to the normal pipeline) on any error."""
+        phone = (state.get("customer_id") or "").strip()
+        if not phone:
+            return {}
+        try:
+            data = await self._application_status(tenant_id=state["tenant_id"], phone=phone)
+        except Exception as exc:  # noqa: BLE001 — never break the turn; fall through
+            log.warning("menu_status_failed", error=str(exc)[:200])
+            return {}
+        from app.agent.nodes.responder import _application_status_reply
+        reply = _application_status_reply([{"tool": "get_application_status", "result": data}])
+        if not reply:
+            return {}
+        return {
+            "intent": "application_status", "did_menu": True, "used_llm": False,
+            "single_bubble": True, "draft_response": reply,
+        }
 
     def _route_after_menu(self, state: AgentState) -> Literal["humanize", "browse"]:
         """A handled menu tap goes straight to delivery; otherwise continue into
@@ -1085,23 +1252,64 @@ class AgentRuntime:
         q = (state.get("inbound_text") or "").strip()
         if not q or _GREETING_RX.match(q) or _EMP_MENU_RX.match(q):
             return self._employer_menu_reply(state, emp)
-        if _EMP_VIEW_RX.match(q):
-            return await self._employer_view_candidates(state, emp)
-        if _EMP_POST_RX.match(q):
+        # Exact lane labels typed while already in the employer hub (e.g. after
+        # tapping "Employer" on the lane choice): "Employer" → just re-show the hub
+        # (the user landed here on purpose); "Job Seeker" → they want the OTHER
+        # lane, so offer the switch. Checked before the command/search matchers so
+        # the bare word is never run as a literal candidate search.
+        if _ROLE_CREATOR_RX.match(q):
+            return self._employer_menu_reply(state, emp)
+        if _ROLE_SEEKER_RX.match(q):
+            return self._employer_seeker_intent_reply(state, emp)
+        # Unambiguous employer-command verbs win first — "my/posted jobs" (their own
+        # listings) and "post a job" / "hire …" — so they aren't swallowed by the
+        # seeker matcher's broad "want…job" / "view…jobs" patterns (e.g. "i want to
+        # post a job" must reach Post, not the lane-switch hint).
+        if _EMP_JOBS_RX.search(q):
+            return await self._employer_my_jobs(state, emp)
+        if _EMP_POST_RX.search(q):
             return await self._employer_form_prompt(
                 state, path="post-job",
                 body="Let's post a job. Tap below to fill in the role details.",
                 cta="Post a Job",
             )
-        if _EMP_JOBS_RX.match(q):
-            return self._employer_my_jobs(state, emp)
-        if _EMP_PLANS_RX.match(q):
+        # Then job-seeker phrasings ("apply job", "show me jobs", "application
+        # status") — checked before View Candidates so "application status" isn't
+        # read as viewing applicants — explain the lane + offer to switch.
+        if _EMP_SEEKER_INTENT_RX.search(q):
+            return self._employer_seeker_intent_reply(state, emp)
+        if _EMP_VIEW_RX.search(q):
+            return await self._employer_view_candidates(state, emp)
+        if _EMP_PLANS_RX.search(q):
             return await self._employer_plans_prompt(state)
-        if _EMP_BUY_RX.match(q):
+        if _EMP_BUY_RX.search(q):
             return await self._employer_buy_prompt(state)
-        if _EMP_WALLET_RX.match(q):
+        if _EMP_WALLET_RX.search(q):
             return await self._employer_wallet_prompt(state)
+        # Free text is a candidate search ONLY when it looks like a role/skill;
+        # anything else (filler, junk) gets a guidance nudge instead of a literal
+        # "No candidates found matching <word>" search.
+        if not _is_searchable_role(q):
+            body = (
+                "🔎 I search candidates by *role* or *skill* — for example "
+                "“welder”, “sales executive”, “python developer” or “data entry”.\n\n"
+                "What role are you hiring for? Or pick an option below."
+            )
+            return self._creator_reply(body, interactive=_emp_menu(body))
         return await self._employer_search_candidates(state, emp, q)
+
+    def _employer_seeker_intent_reply(
+        self, state: AgentState, emp: dict[str, Any]
+    ) -> dict[str, Any]:
+        """The user is on the EMPLOYER side but typed a job-seeker request (e.g.
+        'apply job' / 'search for a job'). Explain the lane + how to switch."""
+        body = (
+            "🙋 You're on the *Employer* side — this is for posting jobs and "
+            "viewing candidates.\n\n"
+            "Looking for a job *yourself*? Type *switch* to move to the Job Seeker "
+            "side.\n\nOr pick an employer option below."
+        )
+        return self._creator_reply(body, interactive=_emp_menu(body))
 
     async def _employer_action(
         self, state: AgentState, emp: dict[str, Any], action: str,
@@ -1121,7 +1329,7 @@ class AgentRuntime:
         if action == "pay":
             return await self._employer_pay(state, emp)
         if action == "myjobs":
-            return self._employer_my_jobs(state, emp)
+            return await self._employer_my_jobs(state, emp)
         if action == "plans":
             return await self._employer_plans_prompt(state)
         if action == "buy":
@@ -1190,33 +1398,56 @@ class AgentRuntime:
         happens HERE so locked fields never leave the server."""
         paid = bool(emp.get("paid"))
         lines = [header_full if paid else header_masked, ""]
-        for c in cands:
-            lines.append(f"👤 *{c.get('full_name')}* · {self._candidate_experience(c)}")
+        # Each field is flush-left (no leading-space indent): WhatsApp doesn't keep
+        # a hanging indent, so an indented long list wraps back to the margin and
+        # looks ragged. A thin divider separates candidates for a clean, scannable
+        # card. Numbered so the employer can refer to "candidate 2".
+        divider = "──────────────"
+        total = len(cands)
+        for i, c in enumerate(cands, 1):
+            lines.append(f"*{i}. {c.get('full_name')}*  ·  {self._candidate_experience(c)}")
             roles = self._fmt_list(c.get("roles"), 3)
             if roles:
-                lines.append(f"   💼 {roles}")
+                lines.append(f"💼 {roles}")
             skills = self._fmt_list(c.get("skills"), 6)
             if skills:
-                lines.append(f"   🛠️ {skills}")
+                lines.append(f"🛠️ {skills}")
             if paid:
                 if c.get("phone"):
-                    lines.append(f"   📞 {c['phone']}")
+                    lines.append(f"📞 {c['phone']}")
                 if c.get("email"):
-                    lines.append(f"   ✉️ {c['email']}")
+                    lines.append(f"✉️ {c['email']}")
                 loc = c.get("city") or c.get("district")
                 if loc:
-                    lines.append(f"   📍 {loc}")
-            lines.append("")
+                    lines.append(f"📍 {loc}")
+            if i < total:                       # divider between cards, not after the last
+                lines.append(divider)
         if paid:
             return self._creator_reply("\n".join(lines).rstrip())
-        # Tier 1 — role/skills shown, but contact + resume locked behind payment.
+        lines.append("")
+        # Tier 1 — role/skills shown, but contact + resume locked. Unlocking is
+        # handled on the Jobs7 employer portal (not an in-chat payment), so the
+        # button opens that site directly.
         lines += [
-            "🔒 Contact details and resume are locked. Unlock to view phone, email & "
-            "the full profile, and reach out.",
+            "🔒 Contact details and resume are locked. Unlock the full profiles — "
+            "phone, email & resume — on the Jobs7 employer portal.",
         ]
         body = "\n".join(lines)
-        return self._creator_reply(
-            body, interactive=wa.buttons_message(body, [("emp:unlock", "🔓 Unlock details")])
+        interactive = self._unlock_interactive(body)
+        if interactive:
+            return self._creator_reply(body, interactive=interactive)
+        portal = get_settings().employer_portal_url
+        return self._creator_reply(f"{body}\n\n🔓 Unlock here: {portal}")
+
+    def _unlock_interactive(self, body: str) -> dict[str, Any] | None:
+        """A CTA-URL button that opens the employer portal to unlock full
+        candidate details. Returns None for a non-https portal (Meta rejects
+        cta_url with http/localhost) so callers fall back to an inline link."""
+        portal = get_settings().employer_portal_url
+        if not portal.startswith("https://"):
+            return None
+        return wa.cta_url_message(
+            body=body, display_text="🔓 Unlock details", url=portal,
         )
 
     async def _employer_view_candidates(
@@ -1254,18 +1485,21 @@ class AgentRuntime:
         )
 
     async def _employer_unlock(self, state: AgentState, emp: dict[str, Any]) -> dict[str, Any]:
-        """Payment gate. Already paid → just show full details; otherwise offer a
-        (simulated, test-mode) payment confirmation."""
+        """Unlock = open the Jobs7 employer portal (payment / subscription is
+        handled there, not in chat). An already-unlocked employer just sees the
+        full details inline."""
         if emp.get("paid"):
             return await self._employer_view_candidates(state, emp)
         body = (
             "🔓 *Unlock full candidate details*\n\n"
-            "Get contact info, resumes and complete profiles for all candidates with "
-            "a one-time payment.\n\n_(Test mode — tap Confirm Payment to simulate.)_"
+            "View contact info, resumes and complete profiles on the Jobs7 employer "
+            "portal."
         )
-        return self._creator_reply(
-            body, interactive=wa.buttons_message(body, [("emp:pay", "Confirm Payment")])
-        )
+        interactive = self._unlock_interactive(body)
+        if interactive:
+            return self._creator_reply(body, interactive=interactive)
+        portal = get_settings().employer_portal_url
+        return self._creator_reply(f"{body}\n\n🔓 {portal}")
 
     async def _employer_pay(self, state: AgentState, emp: dict[str, Any]) -> dict[str, Any]:
         """Simulate a successful payment: set the unlock entitlement, then reveal
@@ -1282,10 +1516,20 @@ class AgentRuntime:
         )
         return res
 
-    def _employer_my_jobs(self, state: AgentState, emp: dict[str, Any]) -> dict[str, Any]:
-        """List the jobs this employer has posted (Redis-staged), with full
-        details per job."""
-        jobs = emp.get("jobs") or []
+    async def _employer_my_jobs(self, state: AgentState, emp: dict[str, Any]) -> dict[str, Any]:
+        """List the jobs this employer has posted, with full details per job.
+        Reads from the live ``private_jobs`` table, falling back to the Redis
+        record (test employers not in the live DB / a DB read miss)."""
+        jobs: list[dict[str, Any]] = []
+        employer_id = (emp.get("private_employers") or {}).get("id")
+        if employer_id:
+            try:
+                rows = await self._employer_jobs(employer_id, limit=20)
+                jobs = [self._live_job_to_card_shape(r) for r in rows]
+            except Exception as exc:  # noqa: BLE001 — fall back to Redis on a read miss
+                log.warning("employer_my_jobs_db_failed", error=str(exc)[:200])
+        if not jobs:
+            jobs = emp.get("jobs") or []                      # Redis fallback
         if not jobs:
             body = "You haven't posted any jobs yet. Tap below to post your first one."
             return self._creator_reply(
@@ -1297,6 +1541,23 @@ class AgentRuntime:
             body += f"\n\n…and {len(jobs) - 10} more."
         # Just the job list — no Menu (type "menu" any time to bring it back).
         return self._creator_reply(body)
+
+    @staticmethod
+    def _live_job_to_card_shape(row: dict[str, Any]) -> dict[str, Any]:
+        """Wrap a live private_jobs row into the {ref, validityDays, private_jobs}
+        shape _job_card expects. Validity is derived from expiresAt − now."""
+        days = None
+        exp = row.get("expiresAt")
+        if exp is not None:
+            try:
+                from datetime import datetime, timezone
+                ref = exp if getattr(exp, "tzinfo", None) else exp.replace(tzinfo=timezone.utc)
+                days = max(0, (ref - datetime.now(timezone.utc)).days)
+            except Exception:  # noqa: BLE001
+                days = None
+        jid = str(row.get("id") or "")
+        return {"ref": f"JOB-{jid[-6:].upper()}" if jid else "—",
+                "validityDays": days, "private_jobs": row}
 
     @staticmethod
     def _job_card(j: dict[str, Any]) -> str:

@@ -20,7 +20,7 @@ from __future__ import annotations
 import html
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -45,6 +45,7 @@ from app.credits import (
 from app.db.repositories import (
     CreditBundleRepository,
     CreditWalletRepository,
+    EmployerRepository,
     LookupRepository,
     SubscriptionPlanRepository,
 )
@@ -141,7 +142,6 @@ async def register_submit(request: Request) -> HTMLResponse:
         "company_name": one("company_name"),
         "email": one("email"),
         "primary_phone": identity.get("customer_id") or one("primary_phone"),
-        "website": one("website"),
         "address": one("address"),
         "district_id": one("district_id"),
         "city": one("city"),
@@ -159,16 +159,58 @@ async def register_submit(request: Request) -> HTMLResponse:
                            error=next(iter(errors.values()))),
             status_code=400,
         )
+    phone = identity.get("customer_id") or ""
+    tenant_id = identity["tenant_id"]
+    digits = re.sub(r"\D", "", phone)
+    settings = get_settings()
+
+    def _done() -> HTMLResponse:
+        number = re.sub(r"\D", "", settings.whatsapp_business_number or "")
+        return HTMLResponse(_success_html(
+            "Company profile created!",
+            "Your details are saved. Head back to WhatsApp to start posting jobs and "
+            "viewing candidates.",
+            business_number=number,
+        ))
+
+    # IDEMPOTENCY — a double-tap submits the form twice. (1) If the profile already
+    # exists, never overwrite it (that would wipe their posted jobs / wallet) and
+    # don't push the menu again. (2) A short SET-NX lock covers the true-concurrent
+    # race where both requests read "no employer" before either has saved.
+    if await memory.get_employer(phone, tenant_id=tenant_id):
+        return _done()
+    if digits and not await memory.mark_seen(f"emp_register:{digits}", ttl=120):
+        return _done()
+
     record = build_employer_record(identity=identity, form=form)
     record.setdefault("paid", False)
     record.setdefault("jobs", [])
-    phone = identity.get("customer_id") or ""
-    await memory.save_employer(phone, record, tenant_id=identity["tenant_id"])
+    try:
+        await memory.save_employer(phone, record, tenant_id=tenant_id)
+    except Exception:
+        if digits:                           # release the lock so a real retry works
+            await memory.clear_seen(f"emp_register:{digits}")
+        raise
+
+    # Optionally persist to the live private_employers table (flag-gated, idempotent
+    # on the phone). Best-effort: a DB hiccup never fails the registration — the
+    # employer is already saved in Redis and the chat continues.
+    if get_settings().employer_register_in_db:
+        try:
+            res = await EmployerRepository.create(
+                record, commit=True, welcome_job_credits=WELCOME_JOB_CREDITS)
+            log.info("employer_db_write", inserted=res.get("inserted"),
+                     employer_id=res.get("employer_id"))
+            live_id = res.get("employer_id")
+            if live_id and live_id != record["private_employers"].get("id"):
+                # Reuse the existing live row's id so later job posts link to it.
+                record["private_employers"]["id"] = live_id
+                await memory.save_employer(phone, record, tenant_id=tenant_id)
+        except Exception as exc:  # noqa: BLE001 — never fail registration on a DB error
+            log.error("employer_db_write_failed", error=str(exc)[:300])
 
     company = record["private_employers"].get("companyName") or "your company"
-    # No KYC step — the profile is ready, so proactively push the menu.
-    settings = get_settings()
-    digits = re.sub(r"\D", "", phone)
+    # No KYC step — the profile is ready, so proactively push the menu (once).
     if digits:
         body = (
             f"✅ Company profile created for *{company}*!\n\nYou're all set. "
@@ -179,13 +221,7 @@ async def register_submit(request: Request) -> HTMLResponse:
         except Exception as exc:  # noqa: BLE001 — proactive push is best-effort
             log.warning("employer_register_push_failed", error=str(exc)[:200])
 
-    number = re.sub(r"\D", "", settings.whatsapp_business_number or "")
-    return HTMLResponse(_success_html(
-        "Company profile created!",
-        "Your details are saved. Head back to WhatsApp to start posting jobs and "
-        "viewing candidates.",
-        business_number=number,
-    ))
+    return _done()
 
 
 @router.get("/post-job", response_class=HTMLResponse)
@@ -240,6 +276,7 @@ async def post_job_submit(request: Request) -> HTMLResponse:
     form = {
         # Job Details
         "title": title,
+        "category_id": one("category_id"),
         "job_type": one("job_type"),
         "description": one("description"),
         # Experience & Salary
@@ -307,7 +344,7 @@ async def post_job_submit(request: Request) -> HTMLResponse:
     seed = live if live is not None else {"job": WELCOME_JOB_CREDITS, "unlock": 0, "boost": 0}
     bal = await memory.ensure_wallet(phone, tenant_id=identity["tenant_id"], seed=seed,
                                      welcome=(live is None))
-    have = bal["job"]
+    have = live["job"] if live is not None else bal["job"]   # show the live balance when available
 
     district_names = _district_names(form.get("preferred_district_ids") or [], opts=await _job_options())
     settings = get_settings()
@@ -344,7 +381,14 @@ async def _finalize_job(memory, phone: str, tenant_id: str, token: str, validity
     await memory.adjust_job_credits(phone, -need, tenant_id=tenant_id,
                                     description=f"Posted “{title}” ({validity} days)")
     job["private_jobs"]["status"] = "PENDING"
-    job["private_jobs"]["validityDays"] = int(validity)
+    # Validity → a real private_jobs column: expiresAt = now + N days. (There is no
+    # "validityDays" column; keep that only as Redis-side meta for display.)
+    job["private_jobs"]["expiresAt"] = (
+        datetime.now(timezone.utc) + timedelta(days=int(validity))
+    ).isoformat()
+    # The credits this post cost (#districts × validity multiplier) → the real
+    # private_jobs.creditsUsed column, so the live row records what was charged.
+    job["private_jobs"]["creditsUsed"] = need
     job["creditsCharged"] = need
     job["validityDays"] = int(validity)
     await memory.add_employer_job(phone, job, tenant_id=tenant_id)
@@ -354,12 +398,31 @@ async def _finalize_job(memory, phone: str, tenant_id: str, token: str, validity
 
     settings = get_settings()
     digits = re.sub(r"\D", "", phone)
+    bal = (await memory.wallet_balances(phone, tenant_id=tenant_id))["job"]
+
+    # Optionally persist to the live job board WITH billing fidelity: insert
+    # private_jobs + debit credit_wallets + a DEBIT_JOB_POST credit_ledger row, in
+    # one transaction. Flag-gated, idempotent, best-effort (a DB hiccup never
+    # fails the activation — the job is already staged in Redis).
+    if settings.job_post_in_db:
+        emp_id = (job.get("private_jobs") or {}).get("employerId")
+        try:
+            res = await CreditWalletRepository.post_job_with_billing(
+                employer_id=emp_id, job_payload=job["private_jobs"], need=need,
+                balance_after=bal, commit=True)
+            log.info("job_post_db_write", **{k: res.get(k) for k in ("committed", "reason", "job_id")})
+        except Exception as exc:  # noqa: BLE001 — never fail activation on a DB error
+            log.error("job_post_db_write_failed", error=str(exc)[:300])
+
     if digits:
-        bal = (await memory.wallet_balances(phone, tenant_id=tenant_id))["job"]
         body = (
-            f"✅ Job submitted: *{title}* ({job['ref']}) for {validity} days.\n\n"
-            f"💳 {need} job credit{'s' if need != 1 else ''} used — balance {bal}.\n\n"
-            "📞 Our team will review it and contact you shortly. What next?"
+            f"✅ *Job submitted!*\n\n"
+            f"📋 *{title}*\n"
+            f"🔖 {job['ref']}\n"
+            f"🗓 Valid for {validity} days\n"
+            f"💳 {need} credit{'s' if need != 1 else ''} used · balance {bal}\n\n"
+            "Our team will review it and contact you shortly.\n"
+            "What next?"
         )
         try:
             await wa_delivery.send_message(settings, digits, _emp_menu_list(body))
@@ -468,10 +531,24 @@ async def post_job_credits_verify(request: Request) -> JSONResponse:
     if not pending or pending.get("kind") != "job_credits":
         return JSONResponse({"error": "unknown_order"}, status_code=404)
     phone, tenant_id = pending["phone"], pending["tenant_id"]
+    buy = int(pending["buy"])
     # Credit the purchased shortfall, then activate (which debits the cost).
-    await memory.adjust_job_credits(phone, int(pending["buy"]), tenant_id=tenant_id,
-                                    description=f"Purchased {pending['buy']} job credit"
-                                    f"{'s' if int(pending['buy']) != 1 else ''}")
+    await memory.adjust_job_credits(phone, buy, tenant_id=tenant_id,
+                                    description=f"Purchased {buy} job credit"
+                                    f"{'s' if buy != 1 else ''}")
+    # Record the purchase live (CREDIT_INDIVIDUAL) — the matching DEBIT_JOB_POST is
+    # written by _finalize_job. Flag-gated, idempotent, best-effort.
+    if get_settings().credits_purchase_in_db:
+        try:
+            emp = await memory.get_employer(phone, tenant_id=tenant_id)
+            emp_id = (emp or {}).get("private_employers", {}).get("id")
+            bals = await memory.wallet_balances(phone, tenant_id=tenant_id)   # post-purchase
+            if emp_id:
+                await CreditWalletRepository.record_purchase(
+                    employer_id=emp_id, grants={"job": buy}, balances_after=bals,
+                    price=buy * JOB_CREDIT_PRICE, payment_id=payment_id, bundle=None, commit=True)
+        except Exception as exc:  # noqa: BLE001 — never fail activation on a DB error
+            log.error("jobcredits_purchase_db_failed", error=str(exc)[:300])
     summary = await _finalize_job(memory, phone, tenant_id, pending["token"], pending["validity"])
     await memory.clear_payment_order(order_id)
     if summary is None:
@@ -687,8 +764,9 @@ async def buy_credits_page(request: Request, token: str = Query(default="")) -> 
     employer_id = (employer or {}).get("private_employers", {}).get("id")
     live = await CreditWalletRepository.balances(employer_id)
     seed = live if live is not None else {"job": WELCOME_JOB_CREDITS, "unlock": 0, "boost": 0}
-    bal = await memory.ensure_wallet(phone, tenant_id=identity["tenant_id"], seed=seed,
-                                     welcome=(live is None))
+    redis_bal = await memory.ensure_wallet(phone, tenant_id=identity["tenant_id"], seed=seed,
+                                           welcome=(live is None))
+    bal = live if live is not None else redis_bal      # show the live balance when available
     bundles = await CreditBundleRepository.list_active()
     return HTMLResponse(_buy_credits_html(
         token, bundles=bundles, balance=bal, key_id=settings.razorpay_key_id,
@@ -722,9 +800,12 @@ async def buy_credits_order(request: Request) -> JSONResponse:
     except rzp.RazorpayError as exc:
         log.warning("buy_credits_order_failed", error=str(exc)[:200])
         return JSONResponse({"error": "order_failed"}, status_code=502)
+    employer = await memory.get_employer(phone, tenant_id=tenant_id)
     await memory.stage_payment_order(order["id"], {
         "kind": "buy_credits", "token": token, "phone": phone, "tenant_id": tenant_id,
-        "grant": resolved["grant"], "label": resolved["label"],
+        "grant": resolved["grant"], "label": resolved["label"], "item": item,
+        "price": resolved["price"],
+        "employer_id": (employer or {}).get("private_employers", {}).get("id"),
     })
     return JSONResponse({
         "order_id": order["id"], "amount": order["amount"], "currency": order["currency"],
@@ -755,10 +836,27 @@ async def buy_credits_verify(request: Request) -> JSONResponse:
                                      job=int(g.get("job", 0)), unlock=int(g.get("unlock", 0)),
                                      boost=int(g.get("boost", 0)),
                                      description=f"Purchased {label}")
-    await memory.clear_payment_order(order_id)
     await memory.update_employer(phone, {"lastPurchase": {"label": label, "balance": bal}},
                                  tenant_id=tenant_id)
     settings = get_settings()
+
+    # Record the purchase live (wallet top-up + CREDIT ledger + bundle_purchases),
+    # flag-gated, idempotent on the payment id, best-effort.
+    if settings.credits_purchase_in_db and bal is not None:
+        emp_id = pending.get("employer_id")
+        bundle = None
+        if str(pending.get("item", "")).startswith("bundle:"):
+            bundle = await CreditBundleRepository.get(pending["item"].split(":", 1)[1])
+        if emp_id:
+            try:
+                res = await CreditWalletRepository.record_purchase(
+                    employer_id=emp_id, grants=g, balances_after=bal,
+                    price=float(pending.get("price") or 0), payment_id=payment_id,
+                    bundle=bundle, commit=True)
+                log.info("credit_purchase_db", **{k: res.get(k) for k in ("committed", "reason")})
+            except Exception as exc:  # noqa: BLE001 — never fail the purchase on a DB error
+                log.error("credit_purchase_db_failed", error=str(exc)[:300])
+    await memory.clear_payment_order(order_id)
     digits = re.sub(r"\D", "", phone)
     if digits and bal is not None:
         body = (
@@ -802,8 +900,13 @@ async def wallet_page(request: Request, token: str = Query(default="")) -> HTMLR
     employer = await memory.get_employer(phone, tenant_id=tenant_id)
     employer_id = (employer or {}).get("private_employers", {}).get("id")
     live = await CreditWalletRepository.balances(employer_id)
-    seed = live if live is not None else {"job": WELCOME_JOB_CREDITS, "unlock": 0, "boost": 0}
-    bal = await memory.ensure_wallet(phone, tenant_id=tenant_id, seed=seed, welcome=(live is None))
+    if live is not None:
+        # Live DB is the source of truth: show the live balance + ledger.
+        ledger = await CreditWalletRepository.ledger(employer_id)
+        return HTMLResponse(_wallet_html(token, balance=live, ledger=ledger))
+    # No live wallet (Redis-only test employer) → the Redis mirror.
+    seed = {"job": WELCOME_JOB_CREDITS, "unlock": 0, "boost": 0}
+    bal = await memory.ensure_wallet(phone, tenant_id=tenant_id, seed=seed, welcome=True)
     ledger = await memory.wallet_ledger(phone, tenant_id=tenant_id)
     return HTMLResponse(_wallet_html(token, balance=bal, ledger=ledger))
 
@@ -823,6 +926,12 @@ _STYLE = """
   input,select,textarea{width:100%;box-sizing:border-box;padding:11px 12px;border-radius:8px;
         border:1px solid #2a3942;background:#202c33;color:#e9edef;font-size:15px}
   textarea{min-height:74px;resize:vertical}
+  /* brand header + back-to-chat */
+  .brand{text-align:center;margin:0 0 16px;padding:0 0 12px;border-bottom:1px solid #2a3942}
+  .brand-img{width:58px;height:58px;border-radius:50%;object-fit:contain;background:#fff;
+        padding:6px;box-sizing:border-box;box-shadow:0 2px 8px rgba(0,0,0,.3)}
+  .backchat{display:inline-block;margin:0 0 10px;color:#00d3a7;text-decoration:none;font-size:13px}
+  .backchat:hover{text-decoration:underline}
   /* inline validation errors (red border + message below the field) */
   input.invalid,select.invalid,textarea.invalid{border-color:#ff5b5b !important;
         box-shadow:0 0 0 1px rgba(255,91,91,.35)}
@@ -840,8 +949,8 @@ _STYLE = """
   .row{display:flex;gap:10px} .row>div{flex:1}
   .btn{margin-top:20px;width:100%;padding:13px;border:0;border-radius:9px;background:#00a884;
        color:#04150f;font-size:16px;font-weight:600;cursor:pointer}
-  .tick{width:54px;height:54px;border-radius:50%;background:#00a884;color:#04150f;font-size:30px;
-        display:flex;align-items:center;justify-content:center;margin:0 auto 14px}
+  .tick-sm{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;
+        border-radius:50%;background:#00a884;color:#04150f;font-size:13px;vertical-align:middle;margin-left:2px}
   .ok{text-align:center}
   /* multi-step wizard */
   .dots{display:flex;gap:6px;justify-content:center;margin:0 0 8px;flex-wrap:wrap}
@@ -959,12 +1068,29 @@ _STYLE = """
 """
 
 
-def _page(title: str, inner: str) -> str:
+def _brand() -> str:
+    """The Jobs7 logo header (committed asset served from /static/logo.png)."""
+    base = get_settings().public_base_url.rstrip("/")
+    return (f'<div class="brand"><img class="brand-img" src="{base}/static/logo.png" '
+            'alt="Jobs7 — India\'s Job Portal"></div>')
+
+
+def _back_to_chat() -> str:
+    """A '← Back to chat' link to the business WhatsApp (employer pages), so the
+    user can return to the chat from any form/payment page. Empty if no number."""
+    num = re.sub(r"\D", "", get_settings().whatsapp_business_number or "")
+    return f'<a class="backchat" href="https://wa.me/{num}">← Back to chat</a>' if num else ""
+
+
+def _page(title: str, inner: str, *, back: bool = True) -> str:
+    # ``back`` adds the top '← Back to chat' link; success pages set back=False
+    # because they already show a "Back to chat" button in the body.
+    top = _back_to_chat() if back else ""
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         f"<title>{_esc(title)}</title><style>{_STYLE}</style></head>"
-        f'<body><div class="card">{inner}</div></body></html>'
+        f'<body><div class="card">{top}{_brand()}{inner}</div></body></html>'
     )
 
 
@@ -976,7 +1102,9 @@ _FORM_VALIDATE_JS = r"""<script>
 (function(){
   function wire(form){
     form.setAttribute('novalidate','novalidate');
+    var submitting=false;
     form.addEventListener('submit', function(e){
+      if(submitting){ e.preventDefault(); return; }   // ignore a double-tap
       // Expand any collapsed accordion so its required fields are validated (and visible).
       [].forEach.call(form.querySelectorAll('.acc'), function(a){ a.classList.add('open'); });
       [].forEach.call(form.querySelectorAll('.field-err'), function(x){ x.parentNode.removeChild(x); });
@@ -994,7 +1122,10 @@ _FORM_VALIDATE_JS = r"""<script>
         var pat=el.getAttribute('pattern');
         if(pat){ try{ if(!(new RegExp('^(?:'+pat+')$')).test(v)){ err(el, el.getAttribute('title')||'Please match the requested format.'); } }catch(_){ } }
       });
-      if(first){ e.preventDefault(); if(first.focus){ try{ first.focus(); }catch(_){ } } first.scrollIntoView({block:'center'}); }
+      if(first){ e.preventDefault(); if(first.focus){ try{ first.focus(); }catch(_){ } } first.scrollIntoView({block:'center'}); return; }
+      // Valid → lock the form so a double-tap can't submit twice.
+      submitting=true;
+      var b=form.querySelector('[type=submit]'); if(b){ b.disabled=true; b.textContent='Submitting…'; }
     });
   }
   [].forEach.call(document.querySelectorAll('form[data-validate]'), wire);
@@ -1087,8 +1218,6 @@ def _register_html(
   <input type="email" name="email" placeholder="hr@company.com">
   <label>Phone</label>
   <input name="primary_phone" value="{_esc(phone)}" readonly>
-  <label>Website</label>
-  <input type="url" name="website" placeholder="https://…">
 
   <div class="acc open" id="addrAcc">
     <button type="button" class="acc-hd" id="addrHd">📍 Address &amp; Location <span class="acc-ar">▾</span></button>
@@ -1158,6 +1287,8 @@ def _post_job_html(
         f"""<section class="step"><h1>Job Details</h1>
   <label>Job Title <span class="req">*</span></label>
   <input name="title" required placeholder="e.g. Software Developer">
+  <label>Job Category <span class="req">*</span></label>
+  <select name="category_id" autocomplete="off" required>{_options_html(o['categories'], placeholder='Select a category…')}</select>
   <label>Job Type</label>
   {_radios("job_type", JOB_TYPES)}
   <label>Description</label>
@@ -1316,7 +1447,10 @@ function showErr(el, msg){{
 function grp(name){{ var r = steps[cur].querySelector('[name='+name+']'); return r ? r.closest('.opts, .chips') : null; }}
 function valid(){{
   clearErrs(steps[cur]);
-  if(cur===0){{ var t=document.querySelector('[name=title]'); if(!t.value.trim()) return showErr(t,'Please enter a job title.'); }}
+  if(cur===0){{
+    var t=document.querySelector('[name=title]'); if(!t.value.trim()) return showErr(t,'Please enter a job title.');
+    var ct=document.querySelector('[name=category_id]'); if(!ct.value) return showErr(ct,'Please select a job category.');
+  }}
   // Experience & Salary: conditionally-required fields by experience type.
   if(steps[cur].querySelector('[name=experience_type]')){{
     var exp=picked('experience_type');
@@ -1906,11 +2040,10 @@ def _success_html(title: str, sub: str, *, business_number: str = "") -> str:
                  'and continue the chat.</p>')
     return _page(title, f"""
 <div class="ok">
-  <div class="tick">&#10003;</div>
-  <h1>{_esc(title)}</h1>
+  <h1>{_esc(title)} <span class="tick-sm">&#10003;</span></h1>
   <p class="sub">{_esc(sub)}</p>
   {close}
-</div>""")
+</div>""", back=False)   # body already has a 'Back to chat' button — no top link
 
 
 def _expired_html() -> str:

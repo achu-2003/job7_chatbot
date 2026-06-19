@@ -157,6 +157,18 @@ _SALARY = (
 )
 
 
+def _brand_html() -> str:
+    """The Jobs7 logo header (committed asset served from /static/logo.png)."""
+    base = get_settings().public_base_url.rstrip("/")
+    return (f'<div class="brand"><img class="brand-img" src="{base}/static/logo.png" '
+            'alt="Jobs7 — India\'s Job Portal"></div>')
+
+
+def _render_page(body: str) -> str:
+    """Wrap a page body in the shell with the Jobs7 brand header."""
+    return _PAGE.format(body=body, brand=_brand_html())
+
+
 async def _load_options() -> dict[str, list[dict[str, Any]]]:
     """Fetch every dropdown's options (read-only reference data).
 
@@ -455,7 +467,9 @@ _PAGE = """\
           border-radius:8px;background:#00a884;color:#fff;font-size:16px;font-weight:600;cursor:pointer;
           text-align:center;text-decoration:none}}
   .err{{background:#3a1d1d;color:#ffb4b4;padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:12px}}
-  .ok{{text-align:center}} .ok .tick{{font-size:44px}}
+  .ok{{text-align:center}}
+  .tick-sm{{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;
+        border-radius:50%;background:#00a884;color:#04150f;font-size:13px;vertical-align:middle;margin-left:2px}}
   .ts{{position:relative}}
   .ts-box{{display:flex;flex-wrap:wrap;gap:6px;min-height:44px;padding:7px 8px;border:1px solid #2a3942;
            border-radius:8px;background:#202c33;align-items:center;cursor:text}}
@@ -492,7 +506,12 @@ _PAGE = """\
   .lang label{{display:inline-flex;align-items:center;gap:6px;margin:0 16px 0 0;color:#cfd9de;font-size:14px}}
   .lang input{{width:auto}}
   .ro{{background:#161f25;color:#8696a0}}
-</style></head><body><div class="card">{body}</div></body></html>"""
+  .brand{{text-align:center;margin:0 0 16px;padding:0 0 12px;border-bottom:1px solid #2a3942}}
+  .brand-img{{width:58px;height:58px;border-radius:50%;object-fit:contain;background:#fff;
+        padding:6px;box-sizing:border-box;box-shadow:0 2px 8px rgba(0,0,0,.3)}}
+</style></head><body><div class="card">
+{brand}
+{body}</div></body></html>"""
 
 
 def _esc(s: Any) -> str:
@@ -929,7 +948,7 @@ const SPECS = {_js_rows(o["specializations"])};
 const OTHER_STATES = {_js_rows(o["other_states"])};
 </script>
 <script>{_FORM_JS}</script>"""
-    return _PAGE.format(body=body)
+    return _render_page(body)
 
 
 def _success_html(name: str, *, business_number: str = "") -> str:
@@ -959,13 +978,12 @@ def _success_html(name: str, *, business_number: str = "") -> str:
         )
     body = f"""\
 <div class="ok">
-  <div class="tick">&#10003;</div>
-  <h1>Registration successful{who}!</h1>
+  <h1>Registration successful{who}! <span class="tick-sm">&#10003;</span></h1>
   <p class="sub">Your profile is saved. Tap below to head back to WhatsApp —
   your menu is already waiting in the chat.</p>
   {close}
 </div>"""
-    return _PAGE.format(body=body)
+    return _render_page(body)
 
 
 def _expired_html() -> str:
@@ -973,7 +991,7 @@ def _expired_html() -> str:
 <h1>Link expired</h1>
 <p class="sub">This form link is invalid or has expired. Please go back to
 WhatsApp and message us so we can send you a fresh one.</p>"""
-    return _PAGE.format(body=body)
+    return _render_page(body)
 
 
 def _resume_html(token: str, *, error: str = "") -> str:
@@ -1002,7 +1020,7 @@ def _resume_html(token: str, *, error: str = "") -> str:
   }});
 }})();
 </script>"""
-    return _PAGE.format(body=body)
+    return _render_page(body)
 
 
 def _resume_done_html(sub: str, *, business_number: str = "") -> str:
@@ -1016,9 +1034,8 @@ def _resume_done_html(sub: str, *, business_number: str = "") -> str:
         )
     body = f"""\
 <div class="ok">
-  <div class="tick">&#10003;</div>
-  <h1>Resume uploaded!</h1>
+  <h1>Resume uploaded! <span class="tick-sm">&#10003;</span></h1>
   <p class="sub">{_esc(sub)}</p>
   {close}
 </div>"""
-    return _PAGE.format(body=body)
+    return _render_page(body)

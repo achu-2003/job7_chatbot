@@ -117,6 +117,73 @@ async def test_payment_order_stage_get_clear():
     assert await m.get_payment_order("order_abc") is None
 
 
+class _StubMem:
+    def __init__(self, *, employer_id, pending):
+        self._pending, self.employer_id = pending, employer_id
+
+    async def get_payment_order(self, oid):
+        return self._pending
+
+    async def grant_credits(self, phone, *, tenant_id, job=0, unlock=0, boost=0, description=""):
+        return {"job": job, "unlock": unlock, "boost": boost}
+
+    async def update_employer(self, phone, fields, *, tenant_id=None):
+        return None
+
+    async def clear_payment_order(self, oid):
+        return None
+
+
+def _ReqJSON(fields, mem):
+    import types
+    from urllib.parse import urlencode
+    body = urlencode(fields).encode()
+    app = types.SimpleNamespace(state=types.SimpleNamespace(memory=mem))
+    return types.SimpleNamespace(app=app, body=lambda: _aret(body))
+
+
+async def _aret(v):
+    return v
+
+
+async def test_buy_credits_records_live_purchase_when_flag_on(monkeypatch):
+    """With CREDITS_PURCHASE_IN_DB on, a verified bundle purchase calls the live
+    record_purchase with the bundle + post-purchase balances."""
+    import app.api.routes.employer as emp
+    from app.config import get_settings
+    import types
+    monkeypatch.setattr(get_settings(), "credits_purchase_in_db", True)
+    monkeypatch.setattr(emp.rzp, "verify_payment_signature", lambda **k: True)
+
+    async def _noop(*a, **k):
+        return None
+    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop)
+
+    async def fake_get_bundle(bid):
+        return {"id": bid, "name": "Growth", "validityDays": 30}
+    monkeypatch.setattr(emp.CreditBundleRepository, "get", staticmethod(fake_get_bundle))
+
+    calls = []
+
+    async def fake_record(*, employer_id, grants, balances_after, price, payment_id, bundle=None, commit=True):
+        calls.append({"employer_id": employer_id, "grants": grants, "bundle": bundle, "price": price})
+        return {"committed": True, "granted": grants}
+    monkeypatch.setattr(emp.CreditWalletRepository, "record_purchase", staticmethod(fake_record))
+
+    mem = _StubMem(employer_id="emp1", pending={
+        "kind": "buy_credits", "token": "t", "phone": "919876543210", "tenant_id": "t1",
+        "grant": {"job": 2, "unlock": 60, "boost": 2}, "label": "Growth bundle",
+        "item": "bundle:b1", "price": 1999.0, "employer_id": "emp1"})
+    req = _ReqJSON({"razorpay_order_id": "order_1", "razorpay_payment_id": "pay_1",
+                    "razorpay_signature": "sig"}, mem)
+    out = await emp.buy_credits_verify(req)
+    import json as _j
+    assert _j.loads(out.body)["ok"] is True
+    assert len(calls) == 1
+    assert calls[0]["employer_id"] == "emp1" and calls[0]["bundle"]["id"] == "b1"
+    assert calls[0]["grants"] == {"job": 2, "unlock": 60, "boost": 2} and calls[0]["price"] == 1999.0
+
+
 async def test_wallet_ledger_records_transactions():
     m = await _mem()
     # welcome seed → a 'Congratulations …FREE job credit' ledger row
