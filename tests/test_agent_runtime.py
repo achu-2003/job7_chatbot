@@ -626,7 +626,7 @@ async def test_registered_employer_goes_straight_to_menu():
     interactive = out["whatsapp_interactive"]["interactive"]
     assert interactive["type"] == "list"
     ids = [r["id"] for r in interactive["action"]["sections"][0]["rows"]]
-    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy"]
+    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy", "emp:plans"]
 
 
 async def test_verified_employer_sees_menu():
@@ -641,7 +641,7 @@ async def test_verified_employer_sees_menu():
     rows = interactive["action"]["sections"][0]["rows"]
     ids = [r["id"] for r in rows]
     # core three + Credits & Wallet + Buy Credits (no Upgrade Plan)
-    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy"]
+    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy", "emp:plans"]
     assert "acme" in out["response"].lower()
 
 
@@ -924,7 +924,7 @@ async def test_employer_search_no_match_nudges_to_menu():
     interactive = out["whatsapp_interactive"]["interactive"]
     assert interactive["type"] == "list"
     ids = [r["id"] for r in interactive["action"]["sections"][0]["rows"]]
-    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy"]
+    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy", "emp:plans"]
 
 
 async def test_registered_employer_can_view_candidates():
@@ -1301,10 +1301,94 @@ async def test_tap_save_adds_to_saved_list():
     assert "saved" in out["response"].lower()
 
 
+async def test_tap_save_persists_to_db_when_flag_on(monkeypatch):
+    """With SAVED_JOBS_IN_DB on, a Save tap ALSO writes the bookmark to
+    private_saved_jobs using the live jobSeekerId (candidate_id) + the resolved
+    job id."""
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "saved_jobs_in_db", True)
+    rt = _runtime()
+    _stub_memory(rt, candidate={"id": "seeker-9", "full_name": "Asha", "email": "a@x.com"},
+                 job_lookup={"id": "job-db-1", "job_ref": "r2", "title": "Python Developer"})
+    calls = []
+
+    async def fake_save_db(*, job_seeker_id, job_id, commit=True):
+        calls.append({"job_seeker_id": job_seeker_id, "job_id": job_id})
+        return {"created": True}
+    rt._save_job_db = fake_save_db                    # type: ignore[assignment]
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Save", interactive_id="save:r2")
+    assert calls == [{"job_seeker_id": "seeker-9", "job_id": "job-db-1"}]
+    assert "saved" in out["response"].lower()
+    assert rt._test_saved and rt._test_saved[0]["ref"] == "r2"   # Redis save still happens
+
+
+async def test_tap_save_skips_db_when_flag_off_or_no_ids(monkeypatch):
+    """No DB write when the flag is off, or when the seeker isn't in the DB / the
+    job id can't be resolved (so a non-registered seeker still saves to Redis)."""
+    from app.config import get_settings
+    rt = _runtime()
+    calls = []
+
+    async def fake_save_db(**k):
+        calls.append(k)
+        return {}
+    rt._save_job_db = fake_save_db                    # type: ignore[assignment]
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+
+    # flag OFF (with ids present) → no DB write
+    monkeypatch.setattr(get_settings(), "saved_jobs_in_db", False)
+    _stub_memory(rt, candidate={"id": "seeker-9"},
+                 job_lookup={"id": "job-db-1", "job_ref": "r2"})
+    await _handle(rt, "Save", interactive_id="save:r2")
+    assert calls == []
+
+    # flag ON but no resolvable job id → no DB write (still saves to Redis)
+    monkeypatch.setattr(get_settings(), "saved_jobs_in_db", True)
+    _stub_memory(rt, candidate={"id": "seeker-9"}, job_lookup=None)
+    await _handle(rt, "Save", interactive_id="save:r9")
+    assert calls == []
+
+
 # ---- apply-time progressive top-up ------------------------------------------
 
 _REG = {"private_job_seekers": {"id": "seeker1"}, "job_seeker_profiles": {"id": "profile1"}}
 _JOB = {"id": "job-db-1", "job_ref": "r1", "title": "Backend Developer"}
+
+
+async def test_apply_blocked_when_daily_cap_reached(monkeypatch):
+    """A subscription's dailyApplyCap turns a new applicant away UPFRONT (before
+    collecting details) when the job's employer has hit their daily limit."""
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "subscriptions_in_db", True)
+    rt = _runtime()
+    _stub_memory(rt, registration=_REG,
+                 job_lookup={"id": "job-cap-1", "job_ref": "r1", "title": "Welder"})
+
+    async def cap_reached(job_id):
+        assert job_id == "job-cap-1"
+        return True
+    rt._daily_cap_reached = cap_reached               # type: ignore[assignment]
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Apply", interactive_id="apply:r1")
+    assert "limit for today" in out["response"].lower()
+    assert rt._test_applications == []                # nothing applied/recorded
+
+
+async def test_apply_proceeds_when_cap_not_reached(monkeypatch):
+    """Under the cap → the apply flow proceeds normally (no block message)."""
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "subscriptions_in_db", True)
+    rt = _runtime()
+    _stub_memory(rt, registration=_REG,
+                 job_lookup={"id": "job-cap-1", "job_ref": "r1", "title": "Welder"})
+
+    async def cap_ok(job_id):
+        return False
+    rt._daily_cap_reached = cap_ok                    # type: ignore[assignment]
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "Apply", interactive_id="apply:r1")
+    assert "limit for today" not in out["response"].lower()
 
 
 async def test_apply_writes_application_to_live_db_with_resume(monkeypatch):

@@ -51,6 +51,7 @@ from app.db.repositories import (
     CandidateRepository,
     JobPostRepository,
     JobSeekerRepository,
+    SavedJobRepository,
 )
 from app.config import get_settings
 from app.core.logging import get_logger
@@ -202,6 +203,7 @@ _EMP_MENU_ROWS = (
     {"id": "emp:myjobs", "title": "My Jobs", "description": "Your posted jobs"},
     {"id": "emp:wallet", "title": "🪪 Credits & Wallet", "description": "Manage your credits"},
     {"id": "emp:buy", "title": "💳 Buy Credits", "description": "View pricing and bundles"},
+    {"id": "emp:plans", "title": "💎 Upgrade Plan", "description": "Plans with included job posts"},
 )
 
 
@@ -403,8 +405,10 @@ class AgentRuntime:
         self._list_candidates = JobSeekerRepository.list_candidates
         self._application_ids = CandidateRepository.application_ids
         self._create_application = ApplicationRepository.create
+        self._daily_cap_reached = ApplicationRepository.employer_daily_cap_reached
         self._application_status = get_application_status_core
         self._employer_jobs = JobPostRepository.list_for_employer
+        self._save_job_db = SavedJobRepository.create
         self._search_candidates = JobSeekerRepository.search_candidates
         self._graph = self._build_graph()
 
@@ -602,6 +606,12 @@ class AgentRuntime:
         kw = {"tenant_id": state["tenant_id"], "conversation_id": state["conversation_id"]}
         if action == "save":
             await self._safe_store(self.gateway.save_job, ref=ref, job=job or {"job_ref": ref}, **kw)
+            # Durable bookmark in private_saved_jobs (flag-gated, idempotent,
+            # best-effort) — needs the seeker in the DB + the resolved job id.
+            seeker_id = state.get("candidate_id")
+            job_id = (job or {}).get("id")
+            if get_settings().saved_jobs_in_db and seeker_id and job_id:
+                await self._safe_store(self._save_job_db, job_seeker_id=seeker_id, job_id=job_id)
             msg = f"Saved {title} to your list. Tap Apply on it whenever you're ready."
         else:  # share
             msg = jobflow.share_text(job) if job else f"Job reference: {ref}"
@@ -615,6 +625,16 @@ class AgentRuntime:
         — or we have no staged profile — go straight to recording the apply."""
         job = await self._job_lookup(tenant_id=state["tenant_id"], ref=ref)
         title = (job or {}).get("title") or "this role"
+        # Subscription dailyApplyCap: turn the applicant away (upfront, before
+        # collecting any details) once the job's employer has hit their plan's
+        # daily application limit. Self-gating — only blocks when an ACTIVE plan
+        # with a cap is present; no sub / unlimited → never blocks.
+        if get_settings().subscriptions_in_db and (job or {}).get("id") \
+                and await self._daily_cap_reached(job["id"]):
+            return _apply_reply(
+                f"🙏 *{title}* has reached its application limit for today. "
+                "Please try again tomorrow — thanks for your interest!"
+            )
         reg = await self._registration(state)
         if not job or not reg:
             # No job id / no staged profile → fall back to recording interest.

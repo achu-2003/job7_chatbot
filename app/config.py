@@ -222,6 +222,22 @@ class Settings(BaseSettings):
     # credit_wallets top-up + credit_ledger CREDIT_* rows + a bundle_purchases row
     # for bundles. Idempotent on the payment id. Flip with CREDITS_PURCHASE_IN_DB=true.
     credits_purchase_in_db: bool = False
+    # When True, every Razorpay ORDER is persisted to private_payments at creation
+    # (status PAYMENT_PENDING, full context in metadata) and flipped to SUCCESS on
+    # verify — so a Redis loss can't strand a paid order (verify reconciles the
+    # order context from the DB). Idempotent on razorpayOrderId. PAYMENTS_IN_DB=true.
+    payments_in_db: bool = False
+    # When True, a seeker's "Save" tap is ALSO written to the live ``private_saved_jobs``
+    # table (so the bookmark survives a Redis loss and syncs with the main app).
+    # Idempotent on (jobSeekerId, jobId); needs the seeker in the DB (REGISTER_IN_DB).
+    # SAVED_JOBS_IN_DB=true.
+    saved_jobs_in_db: bool = False
+    # When True, an activated subscription is ALSO written to the live ``subscriptions``
+    # table (status ACTIVE, endDate = now + plan validity, paymentId → private_payments)
+    # and the plan's monthly credit grant is mirrored to credit_wallets + a CREDIT_PLAN
+    # credit_ledger row. Supersedes the employer's prior ACTIVE sub; idempotent on the
+    # payment (paid) or one ACTIVE per employer+plan (free). SUBSCRIPTIONS_IN_DB=true.
+    subscriptions_in_db: bool = False
     # Employer (job-poster) flow — Stages 1-5 are staged in Redis ONLY for testing
     # (company profile shaped like private_employers, KYC, posted jobs, the
     # candidate-unlock entitlement). When ``employer_kyc_auto_verify`` is True a

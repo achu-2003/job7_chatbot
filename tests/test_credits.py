@@ -155,9 +155,11 @@ async def test_finalize_job_writes_live_billing_when_flag_on(monkeypatch):
 
     calls = []
 
-    async def fake_billing(*, employer_id, job_payload, need, balance_after, commit=True):
-        calls.append({"employer_id": employer_id, "need": need, "balance_after": balance_after})
-        return {"committed": True, "job_id": job_payload["id"], "credits": need}
+    async def fake_billing(*, employer_id, job_payload, need, commit=True):
+        calls.append({"employer_id": employer_id, "need": need})
+        # the DB atomic debit returns the new authoritative balance
+        return {"committed": True, "job_id": job_payload["id"], "credits": need,
+                "balances": {"job": 0, "unlock": 0, "boost": 0}}
     monkeypatch.setattr(emp.CreditWalletRepository, "post_job_with_billing", staticmethod(fake_billing))
 
     mem = await _mem_with_employer()                       # employerId = "emp1"
@@ -167,5 +169,242 @@ async def test_finalize_job_writes_live_billing_when_flag_on(monkeypatch):
                          "preferredDistrictIds": ["d1", "d2"]}})
     await emp._finalize_job(mem, "919042177457", "t1", "tokB", "15")
     assert len(calls) == 1
-    assert calls[0]["employer_id"] == "emp1" and calls[0]["need"] == 2
-    assert calls[0]["balance_after"] == 0                  # 2 → 0 after the debit
+    assert calls[0]["employer_id"] == "emp1" and calls[0]["need"] == 2   # atomic debit of 2
+
+
+# --- subscription precedence: included free job posts ----------------------
+
+async def test_plan_covers_post_logic(monkeypatch):
+    """_plan_covers_post: covered only when an active sub has a free slot AND the
+    job fits the plan's per-job location cap; off-flag / no-sub / over-cap → not."""
+    import app.api.routes.employer as emp
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "subscriptions_in_db", True)
+
+    async def mem_get_employer(phone, *, tenant_id=None):
+        return {"private_employers": {"id": "emp1"}}
+    mem = type("M", (), {"get_employer": staticmethod(mem_get_employer)})()
+
+    ent = {"active": True, "max_active_jobs": 2, "max_locations_per_job": 2}
+
+    async def fake_ent(eid):
+        return ent
+    monkeypatch.setattr(emp.SubscriptionRepository, "get_entitlement", staticmethod(fake_ent))
+
+    async def fake_count(eid):
+        return fake_count.n
+    fake_count.n = 1
+    monkeypatch.setattr(emp.JobPostRepository, "count_active_for_employer", staticmethod(fake_count))
+
+    # active sub, 1/2 slots used, 2 districts ≤ 2 locations → covered
+    assert await emp._plan_covers_post(mem, "9", "t", 2) is True
+    # slots full (2/2) → not covered
+    fake_count.n = 2
+    assert await emp._plan_covers_post(mem, "9", "t", 1) is False
+    fake_count.n = 1
+    # job has more districts than the plan allows per job → not covered (pay credits)
+    assert await emp._plan_covers_post(mem, "9", "t", 3) is False
+    # inactive subscription → not covered
+    ent2 = {"active": False, "max_active_jobs": 2, "max_locations_per_job": 2}
+    monkeypatch.setattr(emp.SubscriptionRepository, "get_entitlement",
+                        staticmethod(lambda eid: _aval(ent2)))
+    assert await emp._plan_covers_post(mem, "9", "t", 1) is False
+    # flag off → never covered (credit model)
+    monkeypatch.setattr(get_settings(), "subscriptions_in_db", False)
+    assert await emp._plan_covers_post(mem, "9", "t", 1) is False
+
+
+async def _aval(v):
+    return v
+
+
+async def test_finalize_job_free_when_plan_covers(monkeypatch):
+    """A plan-covered post charges 0 job credits (no wallet debit), still posts,
+    and the summary/message flag it as covered."""
+    import app.api.routes.employer as emp
+
+    async def _noop(*a, **k):
+        return None
+    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop)
+
+    async def covered(*a, **k):
+        return True
+    monkeypatch.setattr(emp, "_plan_covers_post", covered)
+
+    mem = await _mem_with_employer()
+    await mem.ensure_job_credits("919042177457", tenant_id="t1", seed=5)   # has credits…
+    await mem.stage_job_draft("tokP", {"ref": "JOB-PLN",
+        "private_jobs": {"title": "Dev", "preferredDistrictIds": ["d1", "d2"]}})
+    summary = await emp._finalize_job(mem, "919042177457", "t1", "tokP", "15")
+    assert summary["need"] == 0 and summary["covered"] is True
+    rec = await mem.get_employer("919042177457", tenant_id="t1")
+    assert rec["walletJobCredits"] == 5                 # …but NONE were debited
+    assert rec["jobs"][-1]["private_jobs"]["creditsUsed"] == 0
+    assert rec["jobs"][-1]["coveredByPlan"] is True
+
+
+async def test_job_quote_covered_needs_no_payment(monkeypatch):
+    """When a plan covers the post, the quote is need=0 / sufficient / covered."""
+    import app.api.routes.employer as emp
+
+    async def covered(*a, **k):
+        return True
+    monkeypatch.setattr(emp, "_plan_covers_post", covered)
+    mem = await _mem_with_employer()
+    job = {"private_jobs": {"preferredDistrictIds": ["d1", "d2", "d3"]}}
+    need, q = await emp._job_credit_quote(mem, "919042177457", "t1", job, "30")
+    assert need == 0 and q["covered"] is True and q["sufficient"] is True
+
+
+# --- lazy monthly renewal (every 30 days while active) ----------------------
+
+class _RenewMem:
+    def __init__(self):
+        self.grants = []
+
+    async def get_employer(self, phone, *, tenant_id=None):
+        return {"private_employers": {"id": "emp1"}}
+
+    async def grant_credits(self, phone, *, tenant_id, job=0, unlock=0, boost=0, description=""):
+        self.grants.append({"unlock": unlock, "boost": boost, "desc": description})
+        return {"job": 0, "unlock": unlock, "boost": boost}
+
+
+async def test_apply_due_renewal_grants_when_due(monkeypatch):
+    import app.api.routes.employer as emp
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "subscriptions_in_db", True)
+
+    async def fake_claim(eid, *, cycle_days=30):
+        return {"sub_id": "sub1", "monthly_credits": 200, "monthly_boosts": 5}
+    monkeypatch.setattr(emp.SubscriptionRepository, "claim_due_renewal", staticmethod(fake_claim))
+    recorded = []
+
+    async def fake_record(**k):
+        recorded.append(k); return {"recorded": True}
+    monkeypatch.setattr(emp.SubscriptionRepository, "record_renewal_grant", staticmethod(fake_record))
+    notes = []
+
+    async def fake_notify(phone, body):
+        notes.append(body)
+    monkeypatch.setattr(emp, "_notify_subscription", fake_notify)
+
+    mem = _RenewMem()
+    await emp._apply_due_renewal(mem, "919", "t1")
+    assert mem.grants == [{"unlock": 200, "boost": 5, "desc": "Plan monthly credits (renewal)"}]
+    assert len(recorded) == 1 and recorded[0]["monthly_credits"] == 200
+    # #5: the employer is notified of the monthly re-grant
+    assert len(notes) == 1 and "renewed" in notes[0].lower() and "200 unlock" in notes[0]
+
+
+async def test_apply_due_renewal_noop_when_not_due(monkeypatch):
+    import app.api.routes.employer as emp
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "subscriptions_in_db", True)
+
+    async def fake_claim(eid, *, cycle_days=30):
+        return None
+    monkeypatch.setattr(emp.SubscriptionRepository, "claim_due_renewal", staticmethod(fake_claim))
+    mem = _RenewMem()
+    await emp._apply_due_renewal(mem, "919", "t1")
+    assert mem.grants == []          # nothing due → no grant
+
+
+async def test_apply_due_renewal_gated_by_flag(monkeypatch):
+    import app.api.routes.employer as emp
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "subscriptions_in_db", False)
+    called = []
+
+    async def boom(eid, *, cycle_days=30):
+        called.append(eid); return None
+    monkeypatch.setattr(emp.SubscriptionRepository, "claim_due_renewal", staticmethod(boom))
+    await emp._apply_due_renewal(_RenewMem(), "919", "t1")
+    assert called == []              # flag off → never touches the DB
+
+
+# --- #4 plan status card + #5 expiry notify + #2 cancel ---------------------
+
+from datetime import datetime, timedelta
+
+
+async def test_plan_status_shapes_active_entitlement(monkeypatch):
+    """_plan_status turns an active entitlement into the 'Your Plan' card data
+    (name, days left, slots used/total, daily cap); inactive → None."""
+    import app.api.routes.employer as emp
+
+    async def fake_count(eid):
+        return 1
+    monkeypatch.setattr(emp.JobPostRepository, "count_active_for_employer", staticmethod(fake_count))
+    ent = {"active": True, "plan_name": "Growth", "max_active_jobs": 2,
+           "daily_apply_cap": None, "end_date": datetime.utcnow() + timedelta(days=12)}
+    card = await emp._plan_status(ent, "emp1")
+    assert card["name"] == "Growth" and card["slots_total"] == 2 and card["slots_used"] == 1
+    assert 11 <= card["days_left"] <= 12
+    # inactive / no employer → None
+    assert await emp._plan_status({"active": False}, "emp1") is None
+    assert await emp._plan_status({"active": True}, None) is None
+
+
+async def test_resolve_entitlement_notifies_once_on_expiry(monkeypatch):
+    """When get_entitlement reports a just-expired plan, the employer gets a
+    one-time expiry notification."""
+    import app.api.routes.employer as emp
+
+    class _M:
+        async def get_employer(self, phone, *, tenant_id=None):
+            return {"private_employers": {"id": "emp1"}}
+
+    async def expired(eid):
+        return {"active": False, "plan_name": "Pro", "just_expired": True}
+    monkeypatch.setattr(emp.SubscriptionRepository, "get_entitlement", staticmethod(expired))
+    notes = []
+
+    async def fake_notify(phone, body):
+        notes.append(body)
+    monkeypatch.setattr(emp, "_notify_subscription", fake_notify)
+    ent, eid = await emp._resolve_entitlement(_M(), "919", "t1")
+    assert eid == "emp1" and ent["active"] is False
+    assert len(notes) == 1 and "expired" in notes[0].lower() and "Pro" in notes[0]
+
+
+async def test_subscribe_cancel_confirm_endpoint(monkeypatch):
+    """POST /subscribe/cancel/confirm cancels the active sub, clears the Redis
+    cache, and notifies."""
+    import app.api.routes.employer as emp
+
+    cancelled = []
+
+    async def fake_cancel(eid, *, commit=True):
+        cancelled.append(eid); return {"cancelled": True, "plan_name": "Growth"}
+    monkeypatch.setattr(emp.SubscriptionRepository, "cancel", staticmethod(fake_cancel))
+    notes, cache = [], []
+
+    async def fake_notify(phone, body):
+        notes.append(body)
+    monkeypatch.setattr(emp, "_notify_subscription", fake_notify)
+
+    class _M:
+        async def get_employer_identity(self, token):
+            return {"customer_id": "919876543210", "tenant_id": "t1"}
+
+        async def get_employer(self, phone, *, tenant_id=None):
+            return {"private_employers": {"id": "emp1"}}
+
+        async def update_employer(self, phone, fields, *, tenant_id=None):
+            cache.append(fields); return None
+
+    import types
+    from urllib.parse import urlencode
+    body = urlencode({"token": "tok"}).encode()
+    app = types.SimpleNamespace(state=types.SimpleNamespace(memory=_M()))
+    req = types.SimpleNamespace(app=app, body=lambda: _aret2(body))
+    out = await emp.subscribe_cancel_do(req)
+    assert cancelled == ["emp1"]
+    assert cache == [{"subscription": None}]                       # Redis cache cleared
+    assert len(notes) == 1 and "cancelled" in notes[0].lower()
+    assert "cancelled" in out.body.decode().lower()
+
+
+async def _aret2(v):
+    return v

@@ -46,8 +46,11 @@ from app.db.repositories import (
     CreditBundleRepository,
     CreditWalletRepository,
     EmployerRepository,
+    JobPostRepository,
     LookupRepository,
+    PaymentRepository,
     SubscriptionPlanRepository,
+    SubscriptionRepository,
 )
 from app.payments import razorpay as rzp
 from app.employer import (
@@ -76,6 +79,7 @@ _EMP_MENU_ROWS = (
     {"id": "emp:myjobs", "title": "My Jobs", "description": "Your posted jobs"},
     {"id": "emp:wallet", "title": "🪪 Credits & Wallet", "description": "Manage your credits"},
     {"id": "emp:buy", "title": "💳 Buy Credits", "description": "View pricing and bundles"},
+    {"id": "emp:plans", "title": "💎 Upgrade Plan", "description": "Plans with included job posts"},
 )
 
 
@@ -105,6 +109,56 @@ def _district_names(ids: list[str], *, opts: dict[str, list[dict[str, Any]]]) ->
     screen header). Unknown ids fall back to the id so the count is never wrong."""
     by_id = {str(d.get("id")): d.get("name") for d in (opts.get("districts") or [])}
     return [by_id.get(str(i)) or str(i) for i in ids]
+
+
+# --- durable payment-order persistence (private_payments) -------------------
+# A Razorpay order is staged in Redis AND (when PAYMENTS_IN_DB) written to
+# private_payments, so a Redis loss can't strand a paid order: the verify
+# callback reconciles the order context from the DB. All best-effort — a DB
+# hiccup never blocks taking/verifying a payment.
+
+async def _persist_payment_order(
+    employer_id: str | None, amount: float, payment_type: str,
+    order_id: str, ctx: dict[str, Any], description: str,
+) -> None:
+    if not get_settings().payments_in_db:
+        return
+    try:
+        await PaymentRepository.create_order(
+            employer_id=employer_id, amount=float(amount), payment_type=payment_type,
+            order_id=order_id, metadata=ctx, description=description, commit=True)
+    except Exception as exc:  # noqa: BLE001 — never fail order creation on a DB error
+        log.error("payment_order_db_failed", error=str(exc)[:300])
+
+
+async def _load_pending_order(memory, order_id: str, kind: str | None = None) -> dict[str, Any] | None:
+    """The staged order context — from Redis, or reconciled from private_payments
+    when Redis lost it (so a paid order is never stranded). Returns None if the
+    order is unknown, already consumed, or its kind doesn't match."""
+    pending = await memory.get_payment_order(order_id)
+    if not pending and get_settings().payments_in_db:
+        ctx = await PaymentRepository.get_context(order_id)
+        # Only reconcile an UNCONSUMED order (still PAYMENT_PENDING) — a SUCCESS
+        # row means it was already granted, so we must not replay the grant.
+        if ctx and ctx.get("status") == "PAYMENT_PENDING":
+            pending = ctx.get("metadata") or None
+            if pending:
+                log.info("payment_order_reconciled_from_db", order_id=order_id)
+    if not pending:
+        return None
+    if kind is not None and pending.get("kind") != kind:
+        return None
+    return pending
+
+
+async def _mark_payment_success(order_id: str, payment_id: str, signature: str) -> None:
+    if not get_settings().payments_in_db:
+        return
+    try:
+        await PaymentRepository.mark_success(
+            order_id=order_id, payment_id=payment_id, signature=signature, commit=True)
+    except Exception as exc:  # noqa: BLE001 — never fail verify on a DB error
+        log.error("payment_mark_success_db_failed", error=str(exc)[:300])
 
 
 # ---------------------------------------------------------------------------
@@ -360,12 +414,103 @@ def _clean_validity(value: str) -> str:
     return value if value in {str(d) for d, _ in VALIDITY_OPTIONS} else str(VALIDITY_OPTIONS[0][0])
 
 
+async def _notify_subscription(phone: str, body: str) -> None:
+    """Push a subscription WhatsApp nudge (renewal / expiry) + the employer menu.
+    Best-effort — a delivery failure never blocks the turn."""
+    digits = re.sub(r"\D", "", phone or "")
+    if not digits:
+        return
+    try:
+        await wa_delivery.send_message(get_settings(), digits, _emp_menu_list(body))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("subscription_notify_failed", error=str(exc)[:200])
+
+
+async def _apply_due_renewal(memory, phone: str, tenant_id: str) -> None:
+    """Lazily re-grant a subscription's monthly unlock/boost credits every 30 days
+    while it's active — no scheduler. Atomically CLAIMS the renewal in the DB (so
+    concurrent calls can't double-grant), then grants to Redis + mirrors to the
+    live wallet/ledger, and notifies the employer. Best-effort; never blocks."""
+    if not get_settings().subscriptions_in_db:
+        return
+    try:
+        employer = await memory.get_employer(phone, tenant_id=tenant_id)
+        employer_id = (employer or {}).get("private_employers", {}).get("id")
+        if not employer_id:
+            return
+        due = await SubscriptionRepository.claim_due_renewal(employer_id, cycle_days=30)
+        if not due:
+            return
+        mc, mb = int(due["monthly_credits"]), int(due["monthly_boosts"])
+        if mc <= 0 and mb <= 0:
+            return
+        await memory.grant_credits(phone, tenant_id=tenant_id, unlock=mc, boost=mb,
+                                   description="Plan monthly credits (renewal)")
+        await SubscriptionRepository.record_renewal_grant(
+            employer_id=employer_id, sub_id=due["sub_id"], monthly_credits=mc,
+            monthly_boosts=mb, commit=True)
+        log.info("subscription_renewed", employer_id=employer_id, unlock=mc, boost=mb)
+        parts = ([f"{mc} unlock credit{'s' if mc != 1 else ''}"] if mc else []) + \
+                ([f"{mb} boost{'s' if mb != 1 else ''}"] if mb else [])
+        await _notify_subscription(
+            phone, "🔄 *Plan renewed* — " + " and ".join(parts) + " added to your wallet for this month. 🎉")
+    except Exception as exc:  # noqa: BLE001 — a renewal hiccup must never block the turn
+        log.error("subscription_renewal_failed", error=str(exc)[:300])
+
+
+async def _resolve_entitlement(memory, phone: str, tenant_id: str) -> tuple[dict[str, Any], str | None]:
+    """The employer's live entitlement, sending a ONE-TIME expiry notification when
+    the plan lapses (get_entitlement flips it to EXPIRED exactly once). Returns
+    ``(entitlement, employer_id)``."""
+    employer = await memory.get_employer(phone, tenant_id=tenant_id)
+    employer_id = (employer or {}).get("private_employers", {}).get("id")
+    if not employer_id:
+        return {"active": False}, None
+    ent = await SubscriptionRepository.get_entitlement(employer_id)
+    if ent.get("just_expired"):
+        await _notify_subscription(
+            phone, f"⏳ Your *{ent.get('plan_name') or 'subscription'}* plan has expired. "
+            "Renew anytime to keep included job posts and monthly credits — tap *Upgrade Plan*.")
+    return ent, employer_id
+
+
+async def _plan_covers_post(memory, phone: str, tenant_id: str, n_districts: int) -> bool:
+    """True when an ACTIVE subscription covers this job post for FREE: the employer
+    is under their plan's ``maxActiveJobs`` slot cap AND the job fits within the
+    plan's ``maxLocationsPerJob`` (a job with more districts than the plan allows
+    falls back to the credit model — you pay per district). Driven by the live
+    ``subscriptions`` table; off / unknown → not covered (credit model)."""
+    if not get_settings().subscriptions_in_db:
+        return False
+    await _apply_due_renewal(memory, phone, tenant_id)   # keep monthly credits fresh
+    ent, employer_id = await _resolve_entitlement(memory, phone, tenant_id)
+    if not employer_id or not ent.get("active"):
+        return False
+    if int(n_districts) > int(ent.get("max_locations_per_job") or 0):
+        return False
+    used = await JobPostRepository.count_active_for_employer(employer_id)
+    return used < int(ent.get("max_active_jobs") or 0)
+
+
 async def _job_credit_quote(memory, phone: str, tenant_id: str, job: dict[str, Any], validity: str):
-    """(need, quote) for a staged job at a chosen validity, vs the live balance."""
+    """(need, quote) for a staged job at a chosen validity. A post covered by the
+    employer's subscription costs 0 credits (``covered`` flagged on the quote);
+    otherwise it's #districts × validity multiplier vs the live balance."""
     districts = (job.get("private_jobs") or {}).get("preferredDistrictIds") or []
+    if await _plan_covers_post(memory, phone, tenant_id, len(districts)):
+        q = credit_quote(0, 0)          # need=0 → sufficient, no payment
+        q["covered"] = True
+        return 0, q
     need = credits_required(len(districts), validity)
-    have = int((await memory.get_employer(phone, tenant_id=tenant_id) or {}).get("walletJobCredits") or 0)
-    return need, credit_quote(have, need)
+    # Read the balance DB-first (the live credit_wallets is the source of truth),
+    # falling back to the Redis cache for a non-live employer.
+    employer = await memory.get_employer(phone, tenant_id=tenant_id)
+    employer_id = (employer or {}).get("private_employers", {}).get("id")
+    live = await CreditWalletRepository.balances(employer_id) if employer_id else None
+    have = live["job"] if live else int((employer or {}).get("walletJobCredits") or 0)
+    q = credit_quote(have, need)
+    q["covered"] = False
+    return need, q
 
 
 async def _finalize_job(memory, phone: str, tenant_id: str, token: str, validity: str) -> dict | None:
@@ -376,10 +521,14 @@ async def _finalize_job(memory, phone: str, tenant_id: str, token: str, validity
     if job is None:
         return None
     districts = (job.get("private_jobs") or {}).get("preferredDistrictIds") or []
-    need = credits_required(len(districts), validity)
     title = (job.get("private_jobs") or {}).get("title") or "your job"
-    await memory.adjust_job_credits(phone, -need, tenant_id=tenant_id,
-                                    description=f"Posted “{title}” ({validity} days)")
+    # Subscription precedence: a plan-covered post is FREE (no job-credit debit);
+    # otherwise it costs #districts × validity multiplier.
+    covered = await _plan_covers_post(memory, phone, tenant_id, len(districts))
+    need = 0 if covered else credits_required(len(districts), validity)
+    if need:
+        await memory.adjust_job_credits(phone, -need, tenant_id=tenant_id,
+                                        description=f"Posted “{title}” ({validity} days)")
     job["private_jobs"]["status"] = "PENDING"
     # Validity → a real private_jobs column: expiresAt = now + N days. (There is no
     # "validityDays" column; keep that only as Redis-side meta for display.)
@@ -390,37 +539,46 @@ async def _finalize_job(memory, phone: str, tenant_id: str, token: str, validity
     # private_jobs.creditsUsed column, so the live row records what was charged.
     job["private_jobs"]["creditsUsed"] = need
     job["creditsCharged"] = need
+    job["coveredByPlan"] = covered
     job["validityDays"] = int(validity)
     await memory.add_employer_job(phone, job, tenant_id=tenant_id)
-    summary = {"title": title, "ref": job.get("ref"), "validity": int(validity), "need": need}
+    summary = {"title": title, "ref": job.get("ref"), "validity": int(validity),
+               "need": need, "covered": covered}
     await memory.update_employer(phone, {"lastActivated": summary}, tenant_id=tenant_id)
     await memory.clear_job_draft(token)
 
     settings = get_settings()
     digits = re.sub(r"\D", "", phone)
-    bal = (await memory.wallet_balances(phone, tenant_id=tenant_id))["job"]
+    bal = (await memory.wallet_balances(phone, tenant_id=tenant_id))["job"]   # Redis fallback
 
     # Optionally persist to the live job board WITH billing fidelity: insert
-    # private_jobs + debit credit_wallets + a DEBIT_JOB_POST credit_ledger row, in
-    # one transaction. Flag-gated, idempotent, best-effort (a DB hiccup never
+    # private_jobs + ATOMICALLY debit credit_wallets + a DEBIT_JOB_POST credit_ledger
+    # row, in one transaction. Flag-gated, idempotent, best-effort (a DB hiccup never
     # fails the activation — the job is already staged in Redis).
     if settings.job_post_in_db:
         emp_id = (job.get("private_jobs") or {}).get("employerId")
         try:
             res = await CreditWalletRepository.post_job_with_billing(
-                employer_id=emp_id, job_payload=job["private_jobs"], need=need,
-                balance_after=bal, commit=True)
+                employer_id=emp_id, job_payload=job["private_jobs"], need=need, commit=True)
+            if res.get("balances"):                  # DB is the source of truth for the shown balance
+                bal = res["balances"]["job"]
             log.info("job_post_db_write", **{k: res.get(k) for k in ("committed", "reason", "job_id")})
         except Exception as exc:  # noqa: BLE001 — never fail activation on a DB error
             log.error("job_post_db_write_failed", error=str(exc)[:300])
 
     if digits:
+        cost_line = (
+            "💳 Covered by your plan · "
+            f"balance {bal} job credit{'s' if bal != 1 else ''}"
+            if covered else
+            f"💳 {need} credit{'s' if need != 1 else ''} used · balance {bal}"
+        )
         body = (
             f"✅ *Job submitted!*\n\n"
             f"📋 *{title}*\n"
             f"🔖 {job['ref']}\n"
             f"🗓 Valid for {validity} days\n"
-            f"💳 {need} credit{'s' if need != 1 else ''} used · balance {bal}\n\n"
+            f"{cost_line}\n\n"
             "Our team will review it and contact you shortly.\n"
             "What next?"
         )
@@ -503,10 +661,16 @@ async def post_job_credits_order(request: Request) -> JSONResponse:
     except rzp.RazorpayError as exc:
         log.warning("jobcredits_order_failed", error=str(exc)[:200])
         return JSONResponse({"error": "order_failed"}, status_code=502)
-    await memory.stage_payment_order(order["id"], {
+    employer = await memory.get_employer(phone, tenant_id=tenant_id)
+    employer_id = (employer or {}).get("private_employers", {}).get("id")
+    ctx = {
         "kind": "job_credits", "token": token, "validity": validity,
         "buy": quote["buy"], "phone": phone, "tenant_id": tenant_id,
-    })
+        "employer_id": employer_id,
+    }
+    await memory.stage_payment_order(order["id"], ctx)
+    await _persist_payment_order(employer_id, float(quote["pay"]), "CREDIT_PURCHASE",
+                                 order["id"], ctx, f"Job credits — {quote['buy']} × ₹{JOB_CREDIT_PRICE}")
     return JSONResponse({
         "order_id": order["id"], "amount": order["amount"], "currency": order["currency"],
         "key_id": get_settings().razorpay_key_id, "buy": quote["buy"],
@@ -527,8 +691,8 @@ async def post_job_credits_verify(request: Request) -> JSONResponse:
     if not rzp.verify_payment_signature(order_id=order_id, payment_id=payment_id, signature=signature):
         return JSONResponse({"error": "bad_signature"}, status_code=400)
     memory = get_memory(request)
-    pending = await memory.get_payment_order(order_id)
-    if not pending or pending.get("kind") != "job_credits":
+    pending = await _load_pending_order(memory, order_id, kind="job_credits")
+    if not pending:
         return JSONResponse({"error": "unknown_order"}, status_code=404)
     phone, tenant_id = pending["phone"], pending["tenant_id"]
     buy = int(pending["buy"])
@@ -542,14 +706,14 @@ async def post_job_credits_verify(request: Request) -> JSONResponse:
         try:
             emp = await memory.get_employer(phone, tenant_id=tenant_id)
             emp_id = (emp or {}).get("private_employers", {}).get("id")
-            bals = await memory.wallet_balances(phone, tenant_id=tenant_id)   # post-purchase
             if emp_id:
                 await CreditWalletRepository.record_purchase(
-                    employer_id=emp_id, grants={"job": buy}, balances_after=bals,
+                    employer_id=emp_id, grants={"job": buy},
                     price=buy * JOB_CREDIT_PRICE, payment_id=payment_id, bundle=None, commit=True)
         except Exception as exc:  # noqa: BLE001 — never fail activation on a DB error
             log.error("jobcredits_purchase_db_failed", error=str(exc)[:300])
     summary = await _finalize_job(memory, phone, tenant_id, pending["token"], pending["validity"])
+    await _mark_payment_success(order_id, payment_id, signature)   # private_payments → SUCCESS
     await memory.clear_payment_order(order_id)
     if summary is None:
         return JSONResponse({"error": "expired"}, status_code=404)
@@ -631,10 +795,15 @@ async def subscribe_order(request: Request) -> JSONResponse:
         log.warning("subscribe_order_failed", error=str(exc)[:200])
         return JSONResponse({"error": "order_failed"}, status_code=502)
 
-    await memory.stage_payment_order(order["id"], {
-        "token": token, "plan_id": plan_id, "phone": phone, "tenant_id": tenant_id,
-        "amount": order["amount"],
-    })
+    employer = await memory.get_employer(phone, tenant_id=tenant_id)
+    employer_id = (employer or {}).get("private_employers", {}).get("id")
+    ctx = {
+        "kind": "subscribe", "token": token, "plan_id": plan_id, "phone": phone,
+        "tenant_id": tenant_id, "amount": order["amount"], "employer_id": employer_id,
+    }
+    await memory.stage_payment_order(order["id"], ctx)
+    await _persist_payment_order(employer_id, price, "SUBSCRIPTION", order["id"], ctx,
+                                 f"Subscription — {plan.get('name', 'Plan')}")
     return JSONResponse({
         "order_id": order["id"], "amount": order["amount"], "currency": order["currency"],
         "key_id": get_settings().razorpay_key_id, "plan_name": plan.get("name", "Plan"),
@@ -655,14 +824,15 @@ async def subscribe_verify(request: Request) -> JSONResponse:
     if not rzp.verify_payment_signature(order_id=order_id, payment_id=payment_id, signature=signature):
         return JSONResponse({"error": "bad_signature"}, status_code=400)
     memory = get_memory(request)
-    pending = await memory.get_payment_order(order_id)
+    pending = await _load_pending_order(memory, order_id)   # reconciles from DB if Redis lost it
     if not pending:
         return JSONResponse({"error": "unknown_order"}, status_code=404)
     plan = await SubscriptionPlanRepository.get(pending.get("plan_id"))
     if not plan:
         return JSONResponse({"error": "unknown_plan"}, status_code=400)
     await _activate_subscription(memory, pending["phone"], pending["tenant_id"], plan,
-                                 payment_id=payment_id)
+                                 payment_id=payment_id, order_id=order_id)
+    await _mark_payment_success(order_id, payment_id, signature)   # private_payments → SUCCESS
     await memory.clear_payment_order(order_id)
     return JSONResponse({"ok": True, "redirect": f"/employer/subscribe/done?token={pending.get('token','')}"})
 
@@ -682,9 +852,11 @@ async def subscribe_done(request: Request, token: str = Query(default="")) -> HT
 
 
 async def _activate_subscription(memory, phone: str, tenant_id: str, plan: dict[str, Any],
-                                 *, payment_id: str = "") -> None:
+                                 *, payment_id: str = "", order_id: str = "") -> None:
     """Record the plan on the employer record + grant its monthly credits, then
-    push a WhatsApp confirmation. Redis-only (never the live subscriptions table)."""
+    push a WhatsApp confirmation. Always staged in Redis; when SUBSCRIPTIONS_IN_DB
+    is on, ALSO written to the live ``subscriptions`` table with the credit grant
+    mirrored to credit_wallets (best-effort, never blocks activation)."""
     label, days = _BILLING.get(plan.get("billingCycle"), ("subscription", 30))
     sub = {
         "planId": plan.get("id"), "planType": plan.get("type"), "planName": plan.get("name"),
@@ -696,6 +868,23 @@ async def _activate_subscription(memory, phone: str, tenant_id: str, plan: dict[
         phone, sub, grant_unlock=int(plan.get("monthlyCredits") or 0),
         grant_boost=int(plan.get("monthlyBoosts") or 0), tenant_id=tenant_id,
     )
+    # Durable subscription record (+ mirror the credit grant to the live wallet /
+    # CREDIT_PLAN ledger). paymentId references the private_payments row for this
+    # order; a free plan has none. Flag-gated, idempotent, best-effort.
+    if get_settings().subscriptions_in_db:
+        try:
+            employer = await memory.get_employer(phone, tenant_id=tenant_id)
+            employer_id = (employer or {}).get("private_employers", {}).get("id")
+            payment_row_id = await PaymentRepository.id_for_order(order_id) if order_id else None
+            if employer_id:
+                res = await SubscriptionRepository.activate(
+                    employer_id=employer_id, plan=plan, days=days,
+                    monthly_credits=int(plan.get("monthlyCredits") or 0),
+                    monthly_boosts=int(plan.get("monthlyBoosts") or 0),
+                    payment_row_id=payment_row_id, commit=True)
+                log.info("subscription_db_write", **{k: res.get(k) for k in ("created", "reason")})
+        except Exception as exc:  # noqa: BLE001 — never fail activation on a DB error
+            log.error("subscription_db_failed", error=str(exc)[:300])
     settings = get_settings()
     digits = re.sub(r"\D", "", phone)
     if digits:
@@ -801,12 +990,17 @@ async def buy_credits_order(request: Request) -> JSONResponse:
         log.warning("buy_credits_order_failed", error=str(exc)[:200])
         return JSONResponse({"error": "order_failed"}, status_code=502)
     employer = await memory.get_employer(phone, tenant_id=tenant_id)
-    await memory.stage_payment_order(order["id"], {
+    employer_id = (employer or {}).get("private_employers", {}).get("id")
+    ctx = {
         "kind": "buy_credits", "token": token, "phone": phone, "tenant_id": tenant_id,
         "grant": resolved["grant"], "label": resolved["label"], "item": item,
-        "price": resolved["price"],
-        "employer_id": (employer or {}).get("private_employers", {}).get("id"),
-    })
+        "price": resolved["price"], "employer_id": employer_id,
+    }
+    await memory.stage_payment_order(order["id"], ctx)
+    # Durable order record so a Redis loss can't strand a paid order (verify
+    # reconciles the context from private_payments). Flag-gated, best-effort.
+    await _persist_payment_order(employer_id, resolved["price"], "CREDIT_PURCHASE",
+                                 order["id"], ctx, f"Buy credits — {resolved['label']}")
     return JSONResponse({
         "order_id": order["id"], "amount": order["amount"], "currency": order["currency"],
         "key_id": get_settings().razorpay_key_id, "label": resolved["label"],
@@ -826,8 +1020,8 @@ async def buy_credits_verify(request: Request) -> JSONResponse:
     if not rzp.verify_payment_signature(order_id=order_id, payment_id=payment_id, signature=signature):
         return JSONResponse({"error": "bad_signature"}, status_code=400)
     memory = get_memory(request)
-    pending = await memory.get_payment_order(order_id)
-    if not pending or pending.get("kind") != "buy_credits":
+    pending = await _load_pending_order(memory, order_id, kind="buy_credits")
+    if not pending:
         return JSONResponse({"error": "unknown_order"}, status_code=404)
     g = pending.get("grant") or {}
     phone, tenant_id = pending["phone"], pending["tenant_id"]
@@ -850,12 +1044,13 @@ async def buy_credits_verify(request: Request) -> JSONResponse:
         if emp_id:
             try:
                 res = await CreditWalletRepository.record_purchase(
-                    employer_id=emp_id, grants=g, balances_after=bal,
+                    employer_id=emp_id, grants=g,
                     price=float(pending.get("price") or 0), payment_id=payment_id,
                     bundle=bundle, commit=True)
                 log.info("credit_purchase_db", **{k: res.get(k) for k in ("committed", "reason")})
             except Exception as exc:  # noqa: BLE001 — never fail the purchase on a DB error
                 log.error("credit_purchase_db_failed", error=str(exc)[:300])
+    await _mark_payment_success(order_id, payment_id, signature)   # private_payments → SUCCESS
     await memory.clear_payment_order(order_id)
     digits = re.sub(r"\D", "", phone)
     if digits and bal is not None:
@@ -897,18 +1092,88 @@ async def wallet_page(request: Request, token: str = Query(default="")) -> HTMLR
     if not identity:
         return HTMLResponse(_expired_html(), status_code=404)
     phone, tenant_id = identity.get("customer_id") or "", identity["tenant_id"]
-    employer = await memory.get_employer(phone, tenant_id=tenant_id)
-    employer_id = (employer or {}).get("private_employers", {}).get("id")
+    await _apply_due_renewal(memory, phone, tenant_id)   # surface any monthly re-grant
+    ent, employer_id = await _resolve_entitlement(memory, phone, tenant_id)
+    plan = await _plan_status(ent, employer_id)          # the 'Your Plan' card data (or None)
     live = await CreditWalletRepository.balances(employer_id)
     if live is not None:
         # Live DB is the source of truth: show the live balance + ledger.
         ledger = await CreditWalletRepository.ledger(employer_id)
-        return HTMLResponse(_wallet_html(token, balance=live, ledger=ledger))
+        return HTMLResponse(_wallet_html(token, balance=live, ledger=ledger, plan=plan))
     # No live wallet (Redis-only test employer) → the Redis mirror.
     seed = {"job": WELCOME_JOB_CREDITS, "unlock": 0, "boost": 0}
     bal = await memory.ensure_wallet(phone, tenant_id=tenant_id, seed=seed, welcome=True)
     ledger = await memory.wallet_ledger(phone, tenant_id=tenant_id)
-    return HTMLResponse(_wallet_html(token, balance=bal, ledger=ledger))
+    return HTMLResponse(_wallet_html(token, balance=bal, ledger=ledger, plan=plan))
+
+
+async def _plan_status(ent: dict[str, Any], employer_id: str | None) -> dict[str, Any] | None:
+    """Shape an active entitlement into the 'Your Plan' card data (name, days left,
+    slots used/total, daily cap), or None when there's no active plan."""
+    if not (ent.get("active") and employer_id):
+        return None
+    end = ent.get("end_date")
+    days_left = max(0, (end - datetime.utcnow()).days) if end else 0
+    used = await JobPostRepository.count_active_for_employer(employer_id)
+    return {
+        "name": ent.get("plan_name") or "Plan", "days_left": days_left,
+        "slots_used": used, "slots_total": int(ent.get("max_active_jobs") or 0),
+        "daily_cap": ent.get("daily_apply_cap"),
+    }
+
+
+@router.get("/subscribe/cancel", response_class=HTMLResponse)
+async def subscribe_cancel_confirm(request: Request, token: str = Query(default="")) -> HTMLResponse:
+    """Confirmation page before cancelling — cancellation is immediate (no refund
+    for the remaining period), so we ask first."""
+    memory = get_memory(request)
+    identity = await memory.get_employer_identity(token) if token else None
+    if not identity:
+        return HTMLResponse(_expired_html(), status_code=404)
+    phone, tenant_id = identity.get("customer_id") or "", identity["tenant_id"]
+    ent, _ = await _resolve_entitlement(memory, phone, tenant_id)
+    if not ent.get("active"):
+        return HTMLResponse(_page("No active plan", (
+            '<div class="ok"><h1>No active plan</h1>'
+            '<p class="sub">You don\'t have a subscription to cancel.</p></div>')))
+    name = _esc(ent.get("plan_name") or "your")
+    inner = (
+        f'<div class="ok"><h1>Cancel {name} plan?</h1>'
+        '<p class="sub">This ends your plan <b>now</b> — you\'ll lose included job '
+        'posts and stop monthly credits. There\'s no refund for the remaining days.</p>'
+        '<form method="post" action="/employer/subscribe/cancel/confirm">'
+        f'<input type="hidden" name="token" value="{_esc(token)}">'
+        '<button class="btn" type="submit" style="background:#a33;border-color:#a33">'
+        'Yes, cancel my plan</button></form>'
+        f'<a class="btn" href="/employer/wallet?token={_esc(token)}" '
+        'style="display:block;text-align:center;text-decoration:none;margin-top:10px">'
+        'Keep my plan</a></div>')
+    return HTMLResponse(_page("Cancel plan", inner))
+
+
+@router.post("/subscribe/cancel/confirm", response_class=HTMLResponse)
+async def subscribe_cancel_do(request: Request) -> HTMLResponse:
+    """Perform the cancellation (status → CANCELLED). Idempotent; clears the Redis
+    subscription cache + notifies the employer."""
+    raw = parse_qs((await request.body()).decode("utf-8"))
+    token = (raw.get("token") or [""])[0].strip()
+    memory = get_memory(request)
+    identity = await memory.get_employer_identity(token) if token else None
+    if not identity:
+        return HTMLResponse(_expired_html(), status_code=404)
+    phone, tenant_id = identity.get("customer_id") or "", identity["tenant_id"]
+    employer = await memory.get_employer(phone, tenant_id=tenant_id)
+    employer_id = (employer or {}).get("private_employers", {}).get("id")
+    res = await SubscriptionRepository.cancel(employer_id) if employer_id else {"cancelled": False}
+    if res.get("cancelled"):
+        await memory.update_employer(phone, {"subscription": None}, tenant_id=tenant_id)   # clear cache
+        await _notify_subscription(
+            phone, f"Your *{res.get('plan_name') or 'plan'}* has been cancelled. "
+            "You can re-subscribe anytime — tap *Upgrade Plan*.")
+    number = re.sub(r"\D", "", get_settings().whatsapp_business_number or "")
+    return HTMLResponse(_success_html(
+        "Plan cancelled", "Your subscription has been cancelled. Head back to WhatsApp to continue.",
+        business_number=number))
 
 
 # ---------------------------------------------------------------------------
@@ -947,8 +1212,8 @@ _STYLE = """
   .acc.open .acc-bd{display:block}
   .acc-bd>label:first-child{margin-top:10px}
   .row{display:flex;gap:10px} .row>div{flex:1}
-  .btn{margin-top:20px;width:100%;padding:13px;border:0;border-radius:9px;background:#00a884;
-       color:#04150f;font-size:16px;font-weight:600;cursor:pointer}
+  .btn{margin-top:20px;width:100%;box-sizing:border-box;padding:13px;border:0;border-radius:9px;
+       background:#00a884;color:#04150f;font-size:16px;font-weight:600;cursor:pointer}
   .tick-sm{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;
         border-radius:50%;background:#00a884;color:#04150f;font-size:13px;vertical-align:middle;margin-left:2px}
   .ok{text-align:center}
@@ -1638,9 +1903,30 @@ def _fmt_ts(ts: Any) -> str:
 _WALLET_ICONS = {"JOB": "💼", "UNLOCK": "🔓", "BOOST": "🚀"}
 
 
-def _wallet_html(token: str, *, balance: dict[str, int], ledger: list[dict[str, Any]]) -> str:
-    """Credits & Wallet — a Credit Wallet balance card + transaction history with
-    All / Unlocks / Boosts filters (the 'Credit History' screen)."""
+def _plan_card_html(token: str, plan: dict[str, Any] | None) -> str:
+    """The 'Your Plan' status card shown above the wallet when a subscription is
+    active: plan name, days left, job slots used, daily-apply cap + a Cancel link."""
+    if not plan:
+        return ""
+    days = int(plan.get("days_left", 0))
+    cap = plan.get("daily_cap")
+    cap_line = f" · 📨 {int(cap)}/day applies" if cap else ""
+    return f"""
+<div style="background:#10241d;border:1px solid #1f7a52;border-radius:14px;padding:14px 16px;margin-bottom:14px">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <span style="font-weight:700;color:#34d399">💎 {_esc(plan.get('name') or 'Plan')} Plan</span>
+    <a href="/employer/subscribe/cancel?token={_esc(token)}" style="color:#ff8a8a;font-size:13px;text-decoration:none">Cancel</a>
+  </div>
+  <div style="color:#9fb4ab;font-size:13px;margin-top:6px">
+    🗓 {days} day{'s' if days != 1 else ''} left · 📋 {int(plan.get('slots_used', 0))}/{int(plan.get('slots_total', 0))} job slots used{cap_line}
+  </div>
+</div>"""
+
+
+def _wallet_html(token: str, *, balance: dict[str, int], ledger: list[dict[str, Any]],
+                 plan: dict[str, Any] | None = None) -> str:
+    """Credits & Wallet — an optional 'Your Plan' card + Credit Wallet balance card
+    + transaction history with All / Unlocks / Boosts filters."""
     rows = []
     for tx in ledger:
         ctype = str(tx.get("creditType", "JOB")).upper()
@@ -1657,7 +1943,7 @@ def _wallet_html(token: str, *, balance: dict[str, int], ledger: list[dict[str, 
             f'<span class="txbal">Bal: {int(tx.get("balance", 0))}</span></div></div>'
         )
     empty = '<p class="sub" id="txEmpty" style="text-align:center;margin-top:24px">No transactions yet.</p>'
-    inner = f"""
+    inner = f"""{_plan_card_html(token, plan)}
 <div class="wallethdr">
   <div class="wrow"><span class="wlbl">🪪 Credit Wallet</span>
     <a class="recharge" href="/employer/buy-credits?token={_esc(token)}">＋ Recharge</a></div>

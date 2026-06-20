@@ -508,6 +508,39 @@ def _new_app_ref() -> str:
 
 class ApplicationRepository:
     @staticmethod
+    async def employer_daily_cap_reached(job_id: str | None) -> bool:
+        """True when the job's employer is on an ACTIVE plan whose ``dailyApplyCap``
+        has already been reached TODAY (across all their jobs) — so a new applicant
+        should be turned away until tomorrow. No job / no active sub / NULL cap →
+        False (unlimited). Fails SAFE to False (a DB blip never blocks an apply)."""
+        if not job_id:
+            return False
+        try:
+            async with session_scope() as session:
+                row = (await session.execute(text(
+                    'SELECT j."employerId" AS emp, s."dailyApplyCap" AS cap '
+                    'FROM private_jobs j '
+                    'LEFT JOIN subscriptions s ON s."employerId" = j."employerId" '
+                    '  AND s.status = CAST(:ac AS "SubscriptionStatus") AND s."endDate" > now() '
+                    'WHERE j.id = :j ORDER BY s."endDate" DESC NULLS LAST LIMIT 1'),
+                    {"j": job_id, "ac": "ACTIVE"})).first()
+                if not row:
+                    return False
+                m = row._mapping
+                if m["cap"] is None:                  # no active plan / unlimited cap
+                    return False
+                used = (await session.execute(text(
+                    'SELECT count(*) FROM private_job_applications a '
+                    'JOIN private_jobs j2 ON j2.id = a."jobId" '
+                    'WHERE j2."employerId" = :e '
+                    "AND a.\"appliedAt\" >= date_trunc('day', now())"),
+                    {"e": m["emp"]})).scalar()
+                return int(used or 0) >= int(m["cap"])
+        except Exception as exc:  # noqa: BLE001 — never block an apply on a DB error
+            log.warning("daily_cap_check_failed", error=str(exc)[:200])
+            return False
+
+    @staticmethod
     async def submit(
         *,
         tenant_id: str,
@@ -1037,6 +1070,26 @@ class JobPostRepository:
             return []
         return [dict(r._mapping) for r in rows]
 
+    @staticmethod
+    async def count_active_for_employer(employer_id: str | None) -> int:
+        """How many job 'slots' the employer currently occupies — non-deleted,
+        non-expired jobs that aren't closed/rejected. Drives subscription
+        ``maxActiveJobs`` enforcement (a free slot is available while this is below
+        the plan's cap). Fails safe to 0 on error."""
+        if not employer_id:
+            return 0
+        sql = text(
+            'SELECT count(*) FROM private_jobs WHERE "employerId" = :e '
+            'AND "deletedAt" IS NULL '
+            'AND ("expiresAt" IS NULL OR "expiresAt" > now()) '
+            "AND status::text NOT IN ('CLOSED', 'EXPIRED', 'REJECTED')")
+        try:
+            async with session_scope() as session:
+                return int((await session.execute(sql, {"e": employer_id})).scalar() or 0)
+        except Exception as exc:  # noqa: BLE001 — a read miss must not break posting
+            log.warning("count_active_jobs_failed", error=str(exc)[:200])
+            return 0
+
 
 class EmployerRepository:
     """WRITE path: register a company on the live job board (``private_employers``).
@@ -1181,17 +1234,18 @@ class CreditWalletRepository:
     @staticmethod
     async def post_job_with_billing(
         *, employer_id: str, job_payload: dict[str, Any], need: int,
-        balance_after: int, commit: bool = True,
+        commit: bool = True,
     ) -> dict[str, Any]:
         """ONE transaction: insert the job into ``private_jobs`` AND record the
-        credit consumption — debit ``credit_wallets.jobCredits`` and write a
-        ``DEBIT_JOB_POST`` ``credit_ledger`` row referencing the job.
+        credit consumption — ATOMICALLY debit ``credit_wallets.jobCredits``
+        (``jobCredits = GREATEST(0, jobCredits - need)`` — the DB is the source of
+        truth, never a SET to a cached value) and write a ``DEBIT_JOB_POST``
+        ``credit_ledger`` row referencing the job.
 
-        Get-or-creates the employer's wallet (seeded so the debit lands on
-        ``balance_after``, keeping the live wallet ≈ the Redis mirror). Idempotent
-        on the job: if a DEBIT_JOB_POST ledger row already references this job, it
-        is a no-op. ``commit=False`` is a DRY RUN (everything runs, then rolls
-        back — exercises every FK/enum/NOT-NULL)."""
+        Idempotent on the job: if the ``private_jobs`` row already exists it's a
+        no-op (so a plan-covered post, which writes no debit row, is idempotent
+        too). ``need=0`` (plan-covered) inserts the job and debits nothing.
+        ``commit=False`` is a DRY RUN. Returns the new authoritative ``balances``."""
         job = _prep_row("private_jobs", job_payload)
         job_id = job["id"]
         need = int(need)
@@ -1199,66 +1253,88 @@ class CreditWalletRepository:
         async with get_engine().connect() as conn:
             trans = await conn.begin()
             try:
-                # Idempotency: this job already posted + debited?
                 done = (await conn.execute(
-                    text('SELECT 1 FROM credit_ledger WHERE "referenceId" = :j '
-                         'AND action = CAST(:a AS "LedgerAction") LIMIT 1'),
-                    {"j": job_id, "a": "DEBIT_JOB_POST"})).first()
+                    text('SELECT 1 FROM private_jobs WHERE id = :j LIMIT 1'),
+                    {"j": job_id})).first()
                 if done:
                     await trans.rollback()
                     return {"committed": False, "reason": "already_posted", "job_id": job_id}
-                # Wallet: get-or-create, then SET jobCredits to the post-debit balance
-                # (the Redis truth) so live ≈ Redis without drift.
-                bal = max(0, int(balance_after))
-                wid = (await conn.execute(
-                    text('SELECT id FROM credit_wallets WHERE "employerId" = :e LIMIT 1'),
-                    {"e": employer_id})).scalar()
-                if not wid:
-                    wid = uuid.uuid4().hex
-                    await conn.execute(text(
-                        'INSERT INTO credit_wallets (id, "employerId", "jobCredits", '
-                        '"unlockCredits", "boostCredits", "updatedAt") '
-                        'VALUES (:id, :e, :jc, 0, 0, now())'),
-                        {"id": wid, "e": employer_id, "jc": bal})
-                else:
-                    await conn.execute(text(
-                        'UPDATE credit_wallets SET "jobCredits" = :jc, "updatedAt" = now() '
-                        'WHERE id = :w'), {"jc": bal, "w": wid})
-                # Insert the job + record the DEBIT_JOB_POST ledger row.
+                # Atomic debit (floored at 0). need=0 → no-op increment, current balance.
+                wid, nb = await CreditWalletRepository._apply_delta(
+                    conn, employer_id, {"job": -need})
+                # Insert the job. Record a DEBIT_JOB_POST ledger row ONLY when credits
+                # were actually charged — a subscription-covered post (need=0) writes
+                # the job but no debit row.
                 await conn.execute(text(_insert_sql("private_jobs", job)), job)
-                await conn.execute(text(
-                    'INSERT INTO credit_ledger (id, "walletId", "creditType", action, amount, '
-                    'balance, "referenceType", "referenceId", description, "createdAt") '
-                    'VALUES (:id, :w, CAST(:ct AS "CreditType"), CAST(:ac AS "LedgerAction"), '
-                    ':amt, :bal, :rt, :rid, :d, now())'),
-                    {"id": uuid.uuid4().hex, "w": wid, "ct": "JOB_POST", "ac": "DEBIT_JOB_POST",
-                     "amt": need, "bal": bal, "rt": "job_activation", "rid": job_id,
-                     "d": f"Job posted ({need} credit{'s' if need != 1 else ''})"})
+                if need > 0:
+                    await conn.execute(text(
+                        'INSERT INTO credit_ledger (id, "walletId", "creditType", action, amount, '
+                        'balance, "referenceType", "referenceId", description, "createdAt") '
+                        'VALUES (:id, :w, CAST(:ct AS "CreditType"), CAST(:ac AS "LedgerAction"), '
+                        ':amt, :bal, :rt, :rid, :d, now())'),
+                        {"id": uuid.uuid4().hex, "w": wid, "ct": "JOB_POST", "ac": "DEBIT_JOB_POST",
+                         "amt": need, "bal": nb["job"], "rt": "job_activation", "rid": job_id,
+                         "d": f"Job posted ({need} credit{'s' if need != 1 else ''})"})
                 await (trans.commit() if commit else trans.rollback())
             except Exception:
                 await trans.rollback()
                 raise
         SQL_LATENCY.labels(op="job_post_billing").observe(time.perf_counter() - start)
-        return {"committed": commit, "job_id": job_id, "credits": need}
+        return {"committed": commit, "job_id": job_id, "credits": need, "balances": nb}
 
     _BUCKETS = (("job", "jobCredits", "JOB_POST"),
                 ("unlock", "unlockCredits", "UNLOCK"),
                 ("boost", "boostCredits", "BOOST"))
 
     @staticmethod
+    async def _apply_delta(conn, employer_id: str, delta: dict[str, int]) -> tuple[str, dict[str, int]]:
+        """ATOMICALLY apply a per-bucket delta to ``credit_wallets`` inside an EXISTING
+        transaction (``conn``), get-or-creating the wallet. Uses
+        ``col = GREATEST(0, col + :delta)`` so the DB itself is the source of truth —
+        a concurrent/external writer is added on top, never overwritten. Returns
+        ``(wallet_id, new_balances)`` where new_balances is the authoritative post-op
+        ``{job, unlock, boost}`` read back from the DB."""
+        d = {k: int(delta.get(k, 0)) for k in ("job", "unlock", "boost")}
+        wid = (await conn.execute(
+            text('SELECT id FROM credit_wallets WHERE "employerId" = :e LIMIT 1'),
+            {"e": employer_id})).scalar()
+        if not wid:
+            # New wallet starts at 0, so the opening balance IS the (non-negative) delta.
+            wid = uuid.uuid4().hex
+            seed = {k: max(0, v) for k, v in d.items()}
+            await conn.execute(text(
+                'INSERT INTO credit_wallets (id, "employerId", "jobCredits", '
+                '"unlockCredits", "boostCredits", "updatedAt") '
+                'VALUES (:id, :e, :j, :u, :b, now())'),
+                {"id": wid, "e": employer_id, "j": seed["job"],
+                 "u": seed["unlock"], "b": seed["boost"]})
+            return wid, seed
+        row = (await conn.execute(text(
+            'UPDATE credit_wallets SET '
+            '"jobCredits" = GREATEST(0, "jobCredits" + :dj), '
+            '"unlockCredits" = GREATEST(0, "unlockCredits" + :du), '
+            '"boostCredits" = GREATEST(0, "boostCredits" + :db), '
+            '"updatedAt" = now() WHERE id = :w '
+            'RETURNING "jobCredits" AS job, "unlockCredits" AS unlock, "boostCredits" AS boost'),
+            {"dj": d["job"], "du": d["unlock"], "db": d["boost"], "w": wid})).first()
+        m = row._mapping
+        return wid, {"job": int(m["job"]), "unlock": int(m["unlock"]), "boost": int(m["boost"])}
+
+    @staticmethod
     async def record_purchase(
-        *, employer_id: str, grants: dict[str, int], balances_after: dict[str, int],
+        *, employer_id: str, grants: dict[str, int],
         price: float, payment_id: str, bundle: dict[str, Any] | None = None,
         commit: bool = True,
     ) -> dict[str, Any]:
-        """Record a live credit PURCHASE: SET ``credit_wallets`` to the post-purchase
-        balances (the Redis truth), write a ``credit_ledger`` CREDIT row per granted
-        bucket, and — for a bundle — a ``bundle_purchases`` row.
+        """Record a live credit PURCHASE by ATOMICALLY INCREMENTING ``credit_wallets``
+        (``col = col + grant`` in the DB — never a SET to a cached value, so a
+        concurrent/external writer is never clobbered), write a ``credit_ledger``
+        CREDIT row per bucket with the resulting DB balance, and — for a bundle — a
+        ``bundle_purchases`` row.
 
-        ``bundle`` (a credit_bundles dict) → ``CREDIT_BUNDLE`` / 'bundle_purchase';
-        else an individual purchase → ``CREDIT_INDIVIDUAL`` / 'individual_purchase'
-        (no credit_pack_purchases row — our individual credits aren't credit_packs).
-        Idempotent on ``payment_id``. ``commit=False`` is a DRY RUN."""
+        ``bundle`` → ``CREDIT_BUNDLE`` / 'bundle_purchase'; else ``CREDIT_INDIVIDUAL``
+        / 'individual_purchase'. Idempotent on ``payment_id``. Returns the new
+        authoritative ``balances``. ``commit=False`` is a DRY RUN."""
         grants = {k: int(grants.get(k, 0)) for k in ("job", "unlock", "boost")}
         if not any(v > 0 for v in grants.values()):
             return {"committed": False, "reason": "nothing_to_grant"}
@@ -1276,22 +1352,7 @@ class CreditWalletRepository:
                     if seen:
                         await trans.rollback()
                         return {"committed": False, "reason": "already_recorded"}
-                wid = (await conn.execute(
-                    text('SELECT id FROM credit_wallets WHERE "employerId" = :e LIMIT 1'),
-                    {"e": employer_id})).scalar()
-                ba = {k: int(balances_after.get(k, 0)) for k in ("job", "unlock", "boost")}
-                if not wid:
-                    wid = uuid.uuid4().hex
-                    await conn.execute(text(
-                        'INSERT INTO credit_wallets (id, "employerId", "jobCredits", '
-                        '"unlockCredits", "boostCredits", "updatedAt") '
-                        'VALUES (:id, :e, :j, :u, :b, now())'),
-                        {"id": wid, "e": employer_id, "j": ba["job"], "u": ba["unlock"], "b": ba["boost"]})
-                else:
-                    await conn.execute(text(
-                        'UPDATE credit_wallets SET "jobCredits" = :j, "unlockCredits" = :u, '
-                        '"boostCredits" = :b, "updatedAt" = now() WHERE id = :w'),
-                        {"j": ba["job"], "u": ba["unlock"], "b": ba["boost"], "w": wid})
+                wid, nb = await CreditWalletRepository._apply_delta(conn, employer_id, grants)
                 if bundle:
                     await conn.execute(text(
                         'INSERT INTO bundle_purchases (id, "employerId", "bundleId", '
@@ -1309,7 +1370,7 @@ class CreditWalletRepository:
                             'VALUES (:id, :w, CAST(:ct AS "CreditType"), CAST(:ac AS "LedgerAction"), '
                             ':amt, :bal, :rt, :rid, :d, now())'),
                             {"id": uuid.uuid4().hex, "w": wid, "ct": ctype, "ac": action,
-                             "amt": grants[key], "bal": ba[key], "rt": ref_type, "rid": ref_id,
+                             "amt": grants[key], "bal": nb[key], "rt": ref_type, "rid": ref_id,
                              "d": (f"Purchased {bundle['name']} bundle" if bundle
                                    else f"Purchased {grants[key]} {ctype.lower()} credit"
                                         f"{'s' if grants[key] != 1 else ''}")})
@@ -1318,7 +1379,7 @@ class CreditWalletRepository:
                 await trans.rollback()
                 raise
         SQL_LATENCY.labels(op="credit_purchase").observe(time.perf_counter() - start)
-        return {"committed": commit, "granted": grants}
+        return {"committed": commit, "granted": grants, "balances": nb}
 
 
 class CreditBundleRepository:
@@ -1400,3 +1461,399 @@ class SubscriptionPlanRepository:
             if str(p.get("id")) == str(plan_id):
                 return p
         return None
+
+
+class PaymentRepository:
+    """Durable Razorpay order/payment records in ``private_payments``.
+
+    A PAYMENT_PENDING row (with the full order context in the ``metadata`` jsonb)
+    is written when an order is CREATED, then flipped to SUCCESS on verify. This
+    is what stops a Redis loss from stranding a paid order: the verify callback
+    can reconcile the order context (grant / plan / validity / token …) from the
+    DB when the Redis copy is gone. ``amount`` is stored in RUPEES (matching the
+    existing rows). Idempotent on ``razorpayOrderId``; ``mark_success`` only
+    transitions PAYMENT_PENDING → SUCCESS so a replayed verify is detectable.
+    """
+
+    @staticmethod
+    async def create_order(
+        *, employer_id: str | None, amount: float, payment_type: str,
+        order_id: str, metadata: dict[str, Any], description: str = "",
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        """Write the PENDING payment row. No-op (idempotent) if a row for this
+        ``order_id`` already exists. ``commit=False`` is a DRY RUN."""
+        if not (employer_id and order_id):
+            return {"created": False, "reason": "missing_employer_or_order"}
+        start = time.perf_counter()
+        async with get_engine().connect() as conn:
+            trans = await conn.begin()
+            try:
+                exists = (await conn.execute(
+                    text('SELECT id FROM private_payments WHERE "razorpayOrderId" = :o LIMIT 1'),
+                    {"o": order_id})).scalar()
+                if exists:
+                    await trans.rollback()
+                    return {"created": False, "reason": "already_exists", "id": exists}
+                pid = "c" + uuid.uuid4().hex[:24]
+                await conn.execute(text(
+                    'INSERT INTO private_payments (id, "employerId", amount, currency, '
+                    '"paymentType", "paymentGateway", "razorpayOrderId", status, metadata, '
+                    'description, "createdAt", "updatedAt") '
+                    'VALUES (:id, :e, :amt, :cur, :pt, :gw, :o, '
+                    'CAST(:st AS "PaymentStatus"), CAST(:md AS jsonb), :d, now(), now())'),
+                    {"id": pid, "e": employer_id, "amt": float(amount), "cur": "INR",
+                     "pt": payment_type, "gw": "RAZORPAY", "o": order_id,
+                     "st": "PAYMENT_PENDING", "md": json.dumps(metadata or {}, default=str),
+                     "d": description})
+                await (trans.commit() if commit else trans.rollback())
+            except Exception:
+                await trans.rollback()
+                raise
+        SQL_LATENCY.labels(op="payment_create").observe(time.perf_counter() - start)
+        return {"created": commit, "id": pid}
+
+    @staticmethod
+    async def get_context(order_id: str | None) -> dict[str, Any] | None:
+        """The staged order context (metadata, employer_id, amount, status) for
+        reconciliation when Redis lost the order. None on miss / read error."""
+        if not order_id:
+            return None
+        try:
+            async with session_scope() as session:
+                r = (await session.execute(text(
+                    'SELECT metadata, "employerId", amount, status::text AS status '
+                    'FROM private_payments WHERE "razorpayOrderId" = :o LIMIT 1'),
+                    {"o": order_id})).first()
+        except Exception as exc:  # noqa: BLE001 — a read miss must not break verify
+            log.warning("payment_context_failed", error=str(exc)[:200])
+            return None
+        if not r:
+            return None
+        m = r._mapping
+        md = m["metadata"]
+        if isinstance(md, str):                       # asyncpg may hand back jsonb as str
+            try:
+                md = json.loads(md)
+            except json.JSONDecodeError:
+                md = {}
+        return {
+            "metadata": md or {}, "employer_id": m["employerId"],
+            "amount": float(m["amount"]) if m["amount"] is not None else None,
+            "status": m["status"],
+        }
+
+    @staticmethod
+    async def id_for_order(order_id: str | None) -> str | None:
+        """The ``private_payments.id`` for a Razorpay order — used as the FK that
+        ``subscriptions.paymentId`` references. None on miss."""
+        if not order_id:
+            return None
+        try:
+            async with session_scope() as session:
+                return (await session.execute(text(
+                    'SELECT id FROM private_payments WHERE "razorpayOrderId" = :o LIMIT 1'),
+                    {"o": order_id})).scalar()
+        except Exception as exc:  # noqa: BLE001 — a read miss must not break verify
+            log.warning("payment_id_for_order_failed", error=str(exc)[:200])
+            return None
+
+    @staticmethod
+    async def mark_success(
+        *, order_id: str, payment_id: str, signature: str = "", commit: bool = True,
+    ) -> dict[str, Any]:
+        """Transition PAYMENT_PENDING → SUCCESS for this order. Idempotent: a
+        replayed verify finds no pending row and reports ``already=True`` (so the
+        caller can skip double-granting). ``commit=False`` is a DRY RUN."""
+        if not order_id:
+            return {"updated": False, "already": False}
+        async with get_engine().connect() as conn:
+            trans = await conn.begin()
+            try:
+                res = await conn.execute(text(
+                    'UPDATE private_payments SET status = CAST(:st AS "PaymentStatus"), '
+                    '"razorpayPaymentId" = :pid, "razorpaySignature" = :sig, '
+                    '"paidAt" = now(), "updatedAt" = now() '
+                    'WHERE "razorpayOrderId" = :o '
+                    'AND status = CAST(:pend AS "PaymentStatus")'),
+                    {"st": "SUCCESS", "pid": payment_id or None, "sig": signature or None,
+                     "o": order_id, "pend": "PAYMENT_PENDING"})
+                updated = (res.rowcount or 0) > 0
+                await (trans.commit() if (commit and updated) else trans.rollback())
+            except Exception:
+                await trans.rollback()
+                raise
+        return {"updated": bool(updated and commit), "already": not updated}
+
+
+class SubscriptionRepository:
+    """Durable employer subscription records in ``subscriptions`` + mirror of the
+    plan's monthly credit grant.
+
+    On activation, in ONE transaction: supersede the employer's prior ACTIVE
+    subscription (one active at a time), INSERT the new ACTIVE row (``endDate`` =
+    now + plan validity, ``paymentId`` → the ``private_payments`` row), then mirror
+    the plan's monthly credits to ``credit_wallets`` (SET unlock/boost to the Redis
+    post-grant balances) + a ``CREDIT_PLAN`` ``credit_ledger`` row. Idempotent: on
+    ``payment_row_id`` when paid, else on one ACTIVE row per employer+plan (free).
+    ``commit=False`` is a DRY RUN.
+    """
+
+    @staticmethod
+    async def get_entitlement(employer_id: str | None) -> dict[str, Any]:
+        """The employer's CURRENT plan entitlement, with LAZY EXPIRY: if the active
+        subscription's ``endDate`` has passed it is flipped to EXPIRED and treated
+        as inactive (no scheduler needed). Returns ``{active, plan_id, sub_id,
+        max_active_jobs, max_locations_per_job, end_date}``; ``active=False`` (all
+        zeros) when there's no live subscription. Fails safe to inactive on error
+        (so a DB blip charges credits rather than wrongly granting a free post)."""
+        inactive = {"active": False, "plan_id": None, "plan_name": None, "sub_id": None,
+                    "max_active_jobs": 0, "max_locations_per_job": 0,
+                    "daily_apply_cap": None, "end_date": None, "just_expired": False}
+        if not employer_id:
+            return inactive
+        try:
+            async with get_engine().connect() as conn:
+                trans = await conn.begin()
+                try:
+                    row = (await conn.execute(text(
+                        'SELECT s.id, s."planId", s."maxActiveJobs", s."maxLocationsPerJob", '
+                        's."dailyApplyCap", s."endDate", (s."endDate" < now()) AS expired, '
+                        'p.name AS plan_name '
+                        'FROM subscriptions s LEFT JOIN subscription_plans p ON p.id = s."planId" '
+                        'WHERE s."employerId" = :e '
+                        'AND s.status = CAST(:st AS "SubscriptionStatus") '
+                        'ORDER BY s."endDate" DESC LIMIT 1'),
+                        {"e": employer_id, "st": "ACTIVE"})).first()
+                    if not row:
+                        await trans.rollback()
+                        return inactive
+                    m = row._mapping
+                    if m["expired"]:
+                        # Lazy expiry — flip to EXPIRED. The status-guarded UPDATE makes
+                        # the "just expired" signal fire EXACTLY ONCE (a concurrent caller
+                        # finds it already EXPIRED and gets no row), so an expiry
+                        # notification is sent only once.
+                        flipped = (await conn.execute(text(
+                            'UPDATE subscriptions SET status = CAST(:ex AS "SubscriptionStatus"), '
+                            '"updatedAt" = now() WHERE id = :i '
+                            'AND status = CAST(:ac AS "SubscriptionStatus") RETURNING id'),
+                            {"ex": "EXPIRED", "ac": "ACTIVE", "i": m["id"]})).first()
+                        await trans.commit()
+                        return {**inactive, "plan_name": m["plan_name"],
+                                "just_expired": bool(flipped)}
+                    await trans.rollback()
+                    return {
+                        "active": True, "plan_id": m["planId"], "plan_name": m["plan_name"],
+                        "sub_id": m["id"],
+                        "max_active_jobs": int(m["maxActiveJobs"] or 0),
+                        "max_locations_per_job": int(m["maxLocationsPerJob"] or 0),
+                        "daily_apply_cap": (int(m["dailyApplyCap"]) if m["dailyApplyCap"] is not None else None),
+                        "end_date": m["endDate"], "just_expired": False,
+                    }
+                except Exception:
+                    await trans.rollback()
+                    raise
+        except Exception as exc:  # noqa: BLE001 — fail safe: no entitlement on error
+            log.warning("get_entitlement_failed", error=str(exc)[:200])
+            return inactive
+
+    @staticmethod
+    async def cancel(employer_id: str | None, *, commit: bool = True) -> dict[str, Any]:
+        """Cancel the employer's ACTIVE subscription (status → CANCELLED, autoRenew
+        off). Benefits stop immediately; get_entitlement / claim_due_renewal only
+        target ACTIVE subs, so no further free posts or monthly re-grants. Idempotent
+        (no ACTIVE sub → nothing cancelled). Returns ``{cancelled, plan_name}``."""
+        if not employer_id:
+            return {"cancelled": False, "reason": "no_employer"}
+        async with get_engine().connect() as conn:
+            trans = await conn.begin()
+            try:
+                row = (await conn.execute(text(
+                    'UPDATE subscriptions s SET status = CAST(:c AS "SubscriptionStatus"), '
+                    '"autoRenew" = false, "updatedAt" = now() '
+                    'FROM subscription_plans p '
+                    'WHERE p.id = s."planId" AND s."employerId" = :e '
+                    'AND s.status = CAST(:ac AS "SubscriptionStatus") '
+                    'RETURNING p.name AS plan_name'),
+                    {"c": "CANCELLED", "ac": "ACTIVE", "e": employer_id})).first()
+                await (trans.commit() if (commit and row) else trans.rollback())
+                if not row:
+                    return {"cancelled": False, "reason": "no_active_subscription"}
+                return {"cancelled": bool(commit), "plan_name": row._mapping["plan_name"]}
+            except Exception:
+                await trans.rollback()
+                raise
+
+    @staticmethod
+    async def activate(
+        *, employer_id: str | None, plan: dict[str, Any], days: int,
+        monthly_credits: int, monthly_boosts: int,
+        payment_row_id: str | None = None, commit: bool = True,
+    ) -> dict[str, Any]:
+        if not (employer_id and plan and plan.get("id")):
+            return {"created": False, "reason": "missing_employer_or_plan"}
+        plan_id = plan["id"]
+        start = time.perf_counter()
+        async with get_engine().connect() as conn:
+            trans = await conn.begin()
+            try:
+                # Idempotency: a paid sub is keyed on its payment row; a free sub on
+                # an existing ACTIVE row for the same employer+plan.
+                if payment_row_id:
+                    dup = (await conn.execute(text(
+                        'SELECT id FROM subscriptions WHERE "paymentId" = :p LIMIT 1'),
+                        {"p": payment_row_id})).scalar()
+                else:
+                    dup = (await conn.execute(text(
+                        'SELECT id FROM subscriptions WHERE "employerId" = :e AND "planId" = :pl '
+                        'AND status = CAST(:st AS "SubscriptionStatus") LIMIT 1'),
+                        {"e": employer_id, "pl": plan_id, "st": "ACTIVE"})).scalar()
+                if dup:
+                    await trans.rollback()
+                    return {"created": False, "reason": "already_active", "id": dup}
+                # One active subscription per employer — retire any prior ACTIVE one.
+                await conn.execute(text(
+                    'UPDATE subscriptions SET status = CAST(:ex AS "SubscriptionStatus"), '
+                    '"updatedAt" = now() WHERE "employerId" = :e '
+                    'AND status = CAST(:ac AS "SubscriptionStatus")'),
+                    {"ex": "EXPIRED", "ac": "ACTIVE", "e": employer_id})
+                sub_id = "c" + uuid.uuid4().hex[:24]
+                await conn.execute(text(
+                    'INSERT INTO subscriptions (id, "employerId", "planId", status, '
+                    '"startDate", "endDate", "maxActiveJobs", "maxLocationsPerJob", '
+                    '"dailyApplyCap", "paymentId", "autoRenew", "lastCreditGrantDate", '
+                    '"creditsGrantedThisMonth", "boostsGrantedThisMonth", "createdAt", "updatedAt") '
+                    'VALUES (:id, :e, :pl, CAST(:st AS "SubscriptionStatus"), now(), '
+                    'now() + make_interval(days => :days), :maj, :mlp, :cap, :pid, false, now(), '
+                    ':cg, :bg, now(), now())'),
+                    {"id": sub_id, "e": employer_id, "pl": plan_id, "st": "ACTIVE",
+                     "days": int(days), "maj": int(plan.get("maxActiveJobs") or 0),
+                     "mlp": int(plan.get("maxLocationsPerJob") or 0),
+                     "cap": plan.get("dailyApplyCap"), "pid": payment_row_id,
+                     "cg": int(monthly_credits), "bg": int(monthly_boosts)})
+                # Atomically grant the plan's monthly credits to the live wallet + ledger.
+                wid, nb = await CreditWalletRepository._apply_delta(
+                    conn, employer_id, {"unlock": int(monthly_credits), "boost": int(monthly_boosts)})
+                ref = payment_row_id or f"sub_{sub_id}"
+                plan_name = plan.get("name") or "Plan"
+                for amount, ctype, bal in (
+                    (int(monthly_credits), "UNLOCK", nb["unlock"]),
+                    (int(monthly_boosts), "BOOST", nb["boost"]),
+                ):
+                    if amount > 0:
+                        await conn.execute(text(
+                            'INSERT INTO credit_ledger (id, "walletId", "creditType", action, '
+                            'amount, balance, "referenceType", "referenceId", description, "createdAt") '
+                            'VALUES (:id, :w, CAST(:ct AS "CreditType"), CAST(:ac AS "LedgerAction"), '
+                            ':amt, :bal, :rt, :rid, :d, now())'),
+                            {"id": uuid.uuid4().hex, "w": wid, "ct": ctype, "ac": "CREDIT_PLAN",
+                             "amt": amount, "bal": bal, "rt": "subscription", "rid": ref,
+                             "d": f"{plan_name} plan — monthly {ctype.lower()} credits"})
+                await (trans.commit() if commit else trans.rollback())
+            except Exception:
+                await trans.rollback()
+                raise
+        SQL_LATENCY.labels(op="subscription_activate").observe(time.perf_counter() - start)
+        return {"created": commit, "id": sub_id}
+
+    @staticmethod
+    async def claim_due_renewal(employer_id: str | None, *, cycle_days: int = 30) -> dict[str, Any] | None:
+        """ATOMICALLY claim a monthly re-grant for the employer's active subscription
+        if a full ``cycle_days`` has elapsed since ``lastCreditGrantDate`` (and the
+        sub is ACTIVE + not past ``endDate``). The single guarded UPDATE is the lock:
+        a concurrent caller sees the just-bumped date and the guard fails, so credits
+        are never granted twice in a cycle. Returns ``{sub_id, monthly_credits,
+        monthly_boosts}`` to grant, or None when nothing is due. The caller then
+        grants to Redis + mirrors via ``record_renewal_grant``."""
+        if not employer_id:
+            return None
+        async with get_engine().connect() as conn:
+            trans = await conn.begin()
+            try:
+                row = (await conn.execute(text(
+                    'UPDATE subscriptions s SET "lastCreditGrantDate" = now(), '
+                    '"creditsGrantedThisMonth" = s."creditsGrantedThisMonth" + p."monthlyCredits", '
+                    '"boostsGrantedThisMonth" = s."boostsGrantedThisMonth" + p."monthlyBoosts", '
+                    '"updatedAt" = now() '
+                    'FROM subscription_plans p '
+                    'WHERE s."planId" = p.id AND s."employerId" = :e '
+                    'AND s.status = CAST(:ac AS "SubscriptionStatus") AND s."endDate" > now() '
+                    'AND s."lastCreditGrantDate" <= now() - make_interval(days => :cd) '
+                    'RETURNING s.id AS sub_id, p."monthlyCredits" AS mc, p."monthlyBoosts" AS mb'),
+                    {"e": employer_id, "ac": "ACTIVE", "cd": int(cycle_days)})).first()
+                await (trans.commit() if row else trans.rollback())
+            except Exception:
+                await trans.rollback()
+                raise
+        if not row:
+            return None
+        m = row._mapping
+        return {"sub_id": m["sub_id"], "monthly_credits": int(m["mc"] or 0),
+                "monthly_boosts": int(m["mb"] or 0)}
+
+    @staticmethod
+    async def record_renewal_grant(
+        *, employer_id: str, sub_id: str, monthly_credits: int, monthly_boosts: int,
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        """Mirror a claimed monthly re-grant to the live wallet by ATOMICALLY
+        incrementing unlock/boost + a ``CREDIT_PLAN`` ``credit_ledger`` row."""
+        async with get_engine().connect() as conn:
+            trans = await conn.begin()
+            try:
+                wid, nb = await CreditWalletRepository._apply_delta(
+                    conn, employer_id, {"unlock": int(monthly_credits), "boost": int(monthly_boosts)})
+                ref = f"sub_renew_{sub_id}"
+                for amount, ctype, bal in (
+                    (int(monthly_credits), "UNLOCK", nb["unlock"]),
+                    (int(monthly_boosts), "BOOST", nb["boost"]),
+                ):
+                    if amount > 0:
+                        await conn.execute(text(
+                            'INSERT INTO credit_ledger (id, "walletId", "creditType", action, '
+                            'amount, balance, "referenceType", "referenceId", description, "createdAt") '
+                            'VALUES (:id, :w, CAST(:ct AS "CreditType"), CAST(:ac AS "LedgerAction"), '
+                            ':amt, :bal, :rt, :rid, :d, now())'),
+                            {"id": uuid.uuid4().hex, "w": wid, "ct": ctype, "ac": "CREDIT_PLAN",
+                             "amt": amount, "bal": bal, "rt": "subscription_renewal", "rid": ref,
+                             "d": f"Plan monthly {ctype.lower()} credits (renewal)"})
+                await (trans.commit() if commit else trans.rollback())
+            except Exception:
+                await trans.rollback()
+                raise
+        return {"recorded": commit}
+
+
+class SavedJobRepository:
+    """Durable seeker bookmarks in ``private_saved_jobs`` — so a saved job survives a
+    Redis loss and syncs with the main app's saved list. Idempotent on
+    (jobSeekerId, jobId): re-saving the same job is a no-op (the table has no unique
+    constraint, so the check is explicit). ``commit=False`` is a DRY RUN."""
+
+    @staticmethod
+    async def create(
+        *, job_seeker_id: str | None, job_id: str | None, commit: bool = True,
+    ) -> dict[str, Any]:
+        if not (job_seeker_id and job_id):
+            return {"created": False, "reason": "missing_ids"}
+        async with get_engine().connect() as conn:
+            trans = await conn.begin()
+            try:
+                dup = (await conn.execute(text(
+                    'SELECT id FROM private_saved_jobs '
+                    'WHERE "jobSeekerId" = :s AND "jobId" = :j LIMIT 1'),
+                    {"s": job_seeker_id, "j": job_id})).scalar()
+                if dup:
+                    await trans.rollback()
+                    return {"created": False, "reason": "already_saved", "id": dup}
+                sid = "c" + uuid.uuid4().hex[:24]
+                await conn.execute(text(
+                    'INSERT INTO private_saved_jobs (id, "jobSeekerId", "jobId", "savedAt") '
+                    'VALUES (:id, :s, :j, now())'),
+                    {"id": sid, "s": job_seeker_id, "j": job_id})
+                await (trans.commit() if commit else trans.rollback())
+            except Exception:
+                await trans.rollback()
+                raise
+        return {"created": commit, "id": sid}

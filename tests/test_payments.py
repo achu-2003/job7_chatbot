@@ -165,9 +165,9 @@ async def test_buy_credits_records_live_purchase_when_flag_on(monkeypatch):
 
     calls = []
 
-    async def fake_record(*, employer_id, grants, balances_after, price, payment_id, bundle=None, commit=True):
+    async def fake_record(*, employer_id, grants, price, payment_id, bundle=None, commit=True):
         calls.append({"employer_id": employer_id, "grants": grants, "bundle": bundle, "price": price})
-        return {"committed": True, "granted": grants}
+        return {"committed": True, "granted": grants, "balances": grants}
     monkeypatch.setattr(emp.CreditWalletRepository, "record_purchase", staticmethod(fake_record))
 
     mem = _StubMem(employer_id="emp1", pending={
@@ -239,3 +239,177 @@ async def test_activate_subscription_grants_credits():
     # a second grant stacks
     rec = await m.activate_subscription("919876543210", sub, grant_unlock=60, grant_boost=2, tenant_id="t1")
     assert rec["walletUnlockCredits"] == 120 and rec["walletBoostCredits"] == 4
+
+
+# --- durable payment-order persistence (private_payments) -------------------
+
+async def test_payment_order_reconciles_from_db_when_redis_lost(monkeypatch):
+    """If Redis lost the staged order, _load_pending_order rebuilds the context
+    from private_payments (status PENDING) so a paid order isn't stranded."""
+    import app.api.routes.employer as emp
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "payments_in_db", True)
+    ctx = {"kind": "buy_credits", "phone": "919000000000", "grant": {"unlock": 10}, "token": "t"}
+
+    async def fake_ctx(oid):
+        return {"metadata": ctx, "employer_id": "e1", "amount": 392.0, "status": "PAYMENT_PENDING"}
+    monkeypatch.setattr(emp.PaymentRepository, "get_context", staticmethod(fake_ctx))
+
+    class _M:                       # Redis lost the order
+        async def get_payment_order(self, oid):
+            return None
+    got = await emp._load_pending_order(_M(), "order_1", kind="buy_credits")
+    assert got == ctx
+
+
+async def test_payment_order_not_replayed_when_already_success(monkeypatch):
+    """A reconciled order that is already SUCCESS must NOT be replayed (returns
+    None) — otherwise a re-verify would double-grant."""
+    import app.api.routes.employer as emp
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "payments_in_db", True)
+
+    async def fake_ctx(oid):
+        return {"metadata": {"kind": "buy_credits"}, "employer_id": "e1",
+                "amount": 1.0, "status": "SUCCESS"}
+    monkeypatch.setattr(emp.PaymentRepository, "get_context", staticmethod(fake_ctx))
+
+    class _M:
+        async def get_payment_order(self, oid):
+            return None
+    assert await emp._load_pending_order(_M(), "order_1", kind="buy_credits") is None
+
+
+async def test_persist_and_mark_are_noops_when_flag_off(monkeypatch):
+    """With PAYMENTS_IN_DB off, persist/mark never touch the repository."""
+    import app.api.routes.employer as emp
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "payments_in_db", False)
+    called = []
+
+    async def boom(**k):
+        called.append(k)
+        return {}
+    monkeypatch.setattr(emp.PaymentRepository, "create_order", staticmethod(boom))
+    monkeypatch.setattr(emp.PaymentRepository, "mark_success", staticmethod(boom))
+    await emp._persist_payment_order("e1", 100.0, "CREDIT_PURCHASE", "o1", {"k": "v"}, "d")
+    await emp._mark_payment_success("o1", "pay1", "sig1")
+    assert called == []
+
+
+async def test_persist_and_mark_call_repo_when_flag_on(monkeypatch):
+    """With PAYMENTS_IN_DB on, an order creates a PENDING row and verify marks it
+    SUCCESS, with the right args."""
+    import app.api.routes.employer as emp
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "payments_in_db", True)
+    calls = []
+
+    async def fake_create(**k):
+        calls.append(("create", k)); return {"created": True}
+
+    async def fake_mark(**k):
+        calls.append(("mark", k)); return {"updated": True}
+    monkeypatch.setattr(emp.PaymentRepository, "create_order", staticmethod(fake_create))
+    monkeypatch.setattr(emp.PaymentRepository, "mark_success", staticmethod(fake_mark))
+    await emp._persist_payment_order("e1", 392.0, "CREDIT_PURCHASE", "o1",
+                                     {"kind": "buy_credits"}, "Buy credits")
+    await emp._mark_payment_success("o1", "pay1", "sig1")
+    assert calls[0][0] == "create"
+    assert calls[0][1]["order_id"] == "o1" and calls[0][1]["amount"] == 392.0
+    assert calls[0][1]["payment_type"] == "CREDIT_PURCHASE"
+    assert calls[1][0] == "mark"
+    assert calls[1][1]["order_id"] == "o1" and calls[1][1]["payment_id"] == "pay1"
+
+
+# --- durable subscription persistence (subscriptions table) -----------------
+
+class _SubMem:
+    def __init__(self, employer_id):
+        self._eid = employer_id
+
+    async def activate_subscription(self, phone, sub, *, grant_unlock=0, grant_boost=0, tenant_id=None):
+        return {}
+
+    async def get_employer(self, phone, *, tenant_id=None):
+        return {"private_employers": {"id": self._eid}}
+
+    async def wallet_balances(self, phone, *, tenant_id=None):
+        return {"job": 1, "unlock": grant_total(60), "boost": 2}
+
+
+def grant_total(n):
+    return n
+
+
+_PLAN = {"id": "p_growth", "name": "Growth", "type": "GROWTH", "billingCycle": "DAYS_30",
+         "maxActiveJobs": 2, "maxLocationsPerJob": 1, "dailyApplyCap": 50,
+         "monthlyCredits": 60, "monthlyBoosts": 2, "price": 1999.0}
+
+
+async def test_subscription_persisted_with_payment_fk_when_flag_on(monkeypatch):
+    """With SUBSCRIPTIONS_IN_DB on, activation calls SubscriptionRepository.activate
+    with the plan + the private_payments row id resolved from the order (the FK
+    subscriptions.paymentId references)."""
+    import app.api.routes.employer as emp
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "subscriptions_in_db", True)
+
+    async def _noop(*a, **k):
+        return None
+    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop)
+
+    async def fake_id(oid):
+        return "pmrow_1" if oid else None
+    monkeypatch.setattr(emp.PaymentRepository, "id_for_order", staticmethod(fake_id))
+
+    calls = []
+
+    async def fake_activate(**k):
+        calls.append(k); return {"created": True, "id": "sub1"}
+    monkeypatch.setattr(emp.SubscriptionRepository, "activate", staticmethod(fake_activate))
+
+    await emp._activate_subscription(_SubMem("emp1"), "919876543210", "t1", _PLAN,
+                                     payment_id="pay_X", order_id="order_1")
+    assert len(calls) == 1
+    c = calls[0]
+    assert c["employer_id"] == "emp1" and c["days"] == 30
+    assert c["monthly_credits"] == 60 and c["monthly_boosts"] == 2
+    assert c["payment_row_id"] == "pmrow_1"          # FK resolved from the order
+    assert c["plan"]["id"] == "p_growth"
+
+
+async def test_free_subscription_persisted_with_null_payment(monkeypatch):
+    """A free plan (no order) persists with payment_row_id=None."""
+    import app.api.routes.employer as emp
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "subscriptions_in_db", True)
+
+    async def _noop(*a, **k):
+        return None
+    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop)
+    calls = []
+
+    async def fake_activate(**k):
+        calls.append(k); return {"created": True, "id": "sub_free"}
+    monkeypatch.setattr(emp.SubscriptionRepository, "activate", staticmethod(fake_activate))
+    free = {**_PLAN, "id": "p_free", "monthlyCredits": 0, "monthlyBoosts": 0, "price": 0.0}
+    await emp._activate_subscription(_SubMem("emp1"), "919876543210", "t1", free)
+    assert len(calls) == 1 and calls[0]["payment_row_id"] is None
+
+
+async def test_subscription_not_persisted_when_flag_off(monkeypatch):
+    import app.api.routes.employer as emp
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "subscriptions_in_db", False)
+
+    async def _noop(*a, **k):
+        return None
+    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop)
+    called = []
+
+    async def boom(**k):
+        called.append(k); return {}
+    monkeypatch.setattr(emp.SubscriptionRepository, "activate", staticmethod(boom))
+    await emp._activate_subscription(_SubMem("emp1"), "919876543210", "t1", _PLAN)
+    assert called == []
