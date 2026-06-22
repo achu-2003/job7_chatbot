@@ -79,7 +79,8 @@ _EMP_MENU_ROWS = (
     {"id": "emp:myjobs", "title": "My Jobs", "description": "Your posted jobs"},
     {"id": "emp:wallet", "title": "🪪 Credits & Wallet", "description": "Manage your credits"},
     {"id": "emp:buy", "title": "💳 Buy Credits", "description": "View pricing and bundles"},
-    {"id": "emp:plans", "title": "💎 Upgrade Plan", "description": "Plans with included job posts"},
+    # "💎 Upgrade Plan" (emp:plans) intentionally hidden from the menu for now —
+    # subscription pages still reachable by typing "upgrade"/"plans"/"subscribe".
 )
 
 
@@ -1943,7 +1944,19 @@ def _wallet_html(token: str, *, balance: dict[str, int], ledger: list[dict[str, 
             f'<span class="txbal">Bal: {int(tx.get("balance", 0))}</span></div></div>'
         )
     empty = '<p class="sub" id="txEmpty" style="text-align:center;margin-top:24px">No transactions yet.</p>'
-    inner = f"""{_plan_card_html(token, plan)}
+    # Wallet-only layout (scoped to this page): the card fills the viewport as a
+    # flex column so the header + balance card + filters stay fixed and ONLY the
+    # transaction list scrolls, with "Add Credits" pinned at the bottom.
+    inner = f"""<style>
+  html,body{{height:100%}}
+  body{{margin:0;padding:0;align-items:stretch}}
+  .card{{height:100vh;height:100dvh;max-height:100dvh;width:100%;max-width:480px;
+        border-radius:0;display:flex;flex-direction:column;overflow:hidden}}
+  #txlist{{flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;
+        margin-right:-6px;padding-right:6px}}
+  .btn{{flex:0 0 auto;margin-top:12px}}
+</style>
+{_plan_card_html(token, plan)}
 <div class="wallethdr">
   <div class="wrow"><span class="wlbl">🪪 Credit Wallet</span>
     <a class="recharge" href="/employer/buy-credits?token={_esc(token)}">＋ Recharge</a></div>

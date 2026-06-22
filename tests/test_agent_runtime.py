@@ -626,7 +626,7 @@ async def test_registered_employer_goes_straight_to_menu():
     interactive = out["whatsapp_interactive"]["interactive"]
     assert interactive["type"] == "list"
     ids = [r["id"] for r in interactive["action"]["sections"][0]["rows"]]
-    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy", "emp:plans"]
+    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy"]
 
 
 async def test_verified_employer_sees_menu():
@@ -641,7 +641,7 @@ async def test_verified_employer_sees_menu():
     rows = interactive["action"]["sections"][0]["rows"]
     ids = [r["id"] for r in rows]
     # core three + Credits & Wallet + Buy Credits (no Upgrade Plan)
-    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy", "emp:plans"]
+    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy"]
     assert "acme" in out["response"].lower()
 
 
@@ -772,14 +772,32 @@ def test_employer_typed_intent_routing():
 
 def test_is_searchable_role_guard():
     """Only role/skill text is a searchable query — lane labels, menu words,
-    filler and non-wordy input are rejected (so we never search for 'Employer')."""
+    filler, non-wordy input, and question/statement phrasing are rejected (so we
+    never search for 'Employer' or 'i want to check my balance')."""
     from app.agent import runtime as r
     for ok in ("welder", "python developer", "sales executive", "data entry",
-               "credit analyst", "hr manager", "java"):
+               "credit analyst", "hr manager", "java",
+               # imperative search verbs stay searchable
+               "show welders", "find python developers", "need accountants"):
         assert r._is_searchable_role(ok), ok
     for bad in ("Employer", "employer", "Job Seeker", "switch", "menu", "back",
-                "hi", "ok", "thanks", "please", "123", "?", "a", "", "   "):
+                "hi", "ok", "thanks", "please", "123", "?", "a", "", "   ",
+                # question / first-person statements → not a role search
+                "i want to check my balance", "how do i unlock candidates",
+                "what is this", "can you help", "is there anyone", "tell me about it"):
         assert not r._is_searchable_role(bad), bad
+
+
+def test_employer_credit_balance_phrasing_routes_to_wallet():
+    """Natural 'check credit balance' phrasings (incl. the 'balence' typo) route to
+    the Credits & Wallet page — not a bogus candidate search."""
+    from app.agent import runtime as r
+    for q in ("i want to check credit balence", "check credit balance",
+              "check my balance", "credit balance", "balence", "my credits",
+              "how many credits", "remaining credits"):
+        assert r._EMP_WALLET_RX.search(q), q
+    # a real role that merely contains 'credit' is NOT swallowed by the wallet matcher
+    assert not r._EMP_WALLET_RX.search("credit analyst")
 
 
 async def test_employer_lane_word_shows_menu_not_search():
@@ -924,7 +942,7 @@ async def test_employer_search_no_match_nudges_to_menu():
     interactive = out["whatsapp_interactive"]["interactive"]
     assert interactive["type"] == "list"
     ids = [r["id"] for r in interactive["action"]["sections"][0]["rows"]]
-    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy", "emp:plans"]
+    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy"]
 
 
 async def test_registered_employer_can_view_candidates():
@@ -1233,9 +1251,10 @@ async def test_tap_category_lists_roles_as_buttons():
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
-async def test_tap_role_shows_job_cards_directly():
-    """Tapping a role goes STRAIGHT to the detail cards (no location step) — all
-    postings of that role, each with Apply/Save/Share."""
+async def test_tap_role_shows_only_the_tapped_job():
+    """Tapping a job row goes STRAIGHT to that ONE job's detail card (no location
+    step). Even when several postings share a title, a tap drills into exactly the
+    one tapped — NOT every same-titled opening."""
     rt = _runtime()
     _stub_memory(
         rt,
@@ -1246,23 +1265,23 @@ async def test_tap_role_shows_job_cards_directly():
     out = await _handle(rt, "Python Developer", interactive_id="job:r1")
     assert out.get("whatsapp_interactive") is None               # no location list
     cards = out["whatsapp_messages"]
-    assert len(cards) == 2                                        # both Python Developer postings
+    assert len(cards) == 1                                        # ONLY the tapped job (r1, Chennai)
     ids = [b["reply"]["id"] for b in cards[0]["interactive"]["action"]["buttons"]]
     assert ids == ["apply:r1", "save:r1", "share:r1"]
-    assert "Python Developer openings" in out["response"]
+    assert "Python Developer" in out["response"] and "Chennai" in out["response"]
+    assert "Bengaluru" not in out["response"]                    # the OTHER Python Developer (r2) is NOT shown
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 
-async def test_tap_role_shows_all_matching_openings():
-    """A role with 3 open postings → 3 cards (the user's 'backend developer' case);
-    other roles in the category are NOT mixed in."""
+async def test_tap_one_of_several_same_title_jobs_isolates_it():
+    """Two jobs share the title 'Backend Developer' (different location/salary).
+    Tapping b1 shows only b1 — not b3, not the senior/frontend/QA roles."""
     jobs = [
         {"job_ref": "b1", "title": "Backend Developer", "location": "Chennai",
          "salary_min": 30000, "salary_max": 60000, "employment_type": "full_time"},
-        {"job_ref": "b2", "title": "Senior Backend Developer", "location": "Bengaluru"},
-        {"job_ref": "b3", "title": "Backend Developer", "location": "Remote (India)"},
+        {"job_ref": "b3", "title": "Backend Developer", "location": "Remote (India)",
+         "salary_min": 80000, "salary_max": 90000, "employment_type": "full_time"},
         {"job_ref": "f1", "title": "Frontend Developer", "location": "Chennai"},
-        {"job_ref": "q1", "title": "QA Engineer", "location": "Pune"},
     ]
     rt = _runtime()
     _stub_memory(
@@ -1272,9 +1291,12 @@ async def test_tap_role_shows_all_matching_openings():
     )
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "Backend Developer", interactive_id="job:b1")
-    assert len(out["whatsapp_messages"]) == 3                     # 3 backend roles, not frontend/QA
-    assert "3 Backend Developer openings" in out["response"]
-    assert "₹30,000–60,000/month" in out["response"]             # monthly salary, not LPA
+    cards = out["whatsapp_messages"]
+    assert len(cards) == 1                                        # only the tapped posting
+    assert [b["reply"]["id"] for b in cards[0]["interactive"]["action"]["buttons"]] == \
+        ["apply:b1", "save:b1", "share:b1"]
+    assert "Chennai" in out["response"] and "Remote" not in out["response"]
+    assert "₹30,000–60,000/month" in out["response"]
 
 
 async def test_tap_apply_records_interest():

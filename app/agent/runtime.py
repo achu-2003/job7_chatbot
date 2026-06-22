@@ -174,16 +174,33 @@ _NOT_A_SEARCH_RX = re.compile(
 )
 
 
+# Free text that READS as a question/statement (first-person or question-word
+# opener) rather than a role/skill to search by — e.g. "i want to check my
+# balance", "how many do i have", "what is this", "can you help". These fall to
+# the guidance nudge instead of a literal candidate search. (Imperative search
+# verbs like "show/find/get/need welders" are NOT here — they stay searchable.)
+_ACCOUNT_QUESTION_RX = re.compile(
+    r"^\s*(i|i'?m|i'?ve|we|my|how|what|where|why|when|which|who|whose|"
+    r"can|could|would|should|do|does|did|is|are|was|were|will|tell)\b",
+    re.IGNORECASE,
+)
+
+
 def _is_searchable_role(text: str) -> bool:
     """True only when free text looks like a ROLE/SKILL worth searching candidates
-    by. Rejects lane labels, menu words, filler, and non-wordy input so we never
-    run (and then apologise for) a literal search for "Employer"/"hi"/"123"."""
+    by. Rejects lane labels, menu words, filler, non-wordy input, and question/
+    statement phrasing — so we never run (and then apologise for) a literal search
+    for "Employer"/"hi"/"123"/"i want to check my balance"."""
     t = (text or "").strip()
     if len(t) < 2:                       # single char / empty — nothing to match
         return False
     if not re.search(r"[A-Za-z]", t):    # digits/punctuation only — not a role
         return False
-    return not _NOT_A_SEARCH_RX.match(t)
+    if _NOT_A_SEARCH_RX.match(t):        # lane labels / menu words / bare filler
+        return False
+    if _ACCOUNT_QUESTION_RX.match(t):    # a question/statement, not a role search
+        return False
+    return True
 
 
 # ---- employer (job-poster) flow --------------------------------------
@@ -203,7 +220,9 @@ _EMP_MENU_ROWS = (
     {"id": "emp:myjobs", "title": "My Jobs", "description": "Your posted jobs"},
     {"id": "emp:wallet", "title": "🪪 Credits & Wallet", "description": "Manage your credits"},
     {"id": "emp:buy", "title": "💳 Buy Credits", "description": "View pricing and bundles"},
-    {"id": "emp:plans", "title": "💎 Upgrade Plan", "description": "Plans with included job posts"},
+    # NOTE: "💎 Upgrade Plan" (emp:plans) is intentionally hidden from the menu for
+    # now — the subscription flow still works if the employer TYPES "upgrade" /
+    # "plans" / "subscribe" (_EMP_PLANS_RX) and via the emp:plans action.
 )
 
 
@@ -258,9 +277,11 @@ _EMP_BUY_RX = re.compile(
 )
 # Credits & Wallet — check balance / history (NOT bare "credits" → avoids "credit analyst").
 _EMP_WALLET_RX = re.compile(
-    r"\b(wallet|balance)\b|\b(credit|transaction)\s*history\b|\bmy\s+credits?\b"
+    # ``bal[ae]nce`` tolerates the common "balence" misspelling; "check … credit/
+    # balance/wallet" covers natural phrasings like "i want to check credit balance".
+    r"\b(wallet|bal[ae]nce)\b|\b(credit|transaction)\s*history\b|\bmy\s+credits?\b"
     r"|\b(remaining|available|left|current)\s+credits?\b|\bhow\s+many\s+credits?\b"
-    r"|\bcheck\s+(my\s+)?balance\b|\bcredits?\s*(&|and)\s*wallet\b",
+    r"|\bcheck\b.*\b(credits?|bal[ae]nce|wallet)\b|\bcredits?\s*(&|and)\s*wallet\b",
     re.IGNORECASE,
 )
 # JOB-SEEKER intents typed while in the EMPLOYER lane (e.g. "apply job",
@@ -566,19 +587,17 @@ class AgentRuntime:
         if role is None:
             return {}                          # unknown ref → fall through
 
+        # Show ONLY the specific job the user tapped — even when several postings
+        # share the same title, each list row is its own job, so a tap drills into
+        # exactly that one (not every same-titled opening).
         title = role.get("title") or "this role"
-        matches = [j for j in jobs if jobflow.same_role_family(title, j.get("title"))]
-        if not matches:
-            matches = [role]
-
-        cards, text = jobflow.job_cards(matches, limit=8)
-        plural = "opening" if len(matches) == 1 else "openings"
-        header = f"{len(matches)} {title} {plural}:"
+        cards, text = jobflow.job_cards([role], limit=1)
+        header = f"Here are the details for *{title}*:"
         await self._save_browse(state, {"stage": "results", "category": category, "role_title": title})
         return {
             "intent": "browse", "did_browse": True, "used_llm": False, "single_bubble": True,
             "draft_response": f"{header}\n\n{text}", "whatsapp_messages": cards,
-            "catalog_hits": matches,
+            "catalog_hits": [role],
         }
 
     async def _browse_one(self, state: AgentState, ref: str) -> dict[str, Any]:
