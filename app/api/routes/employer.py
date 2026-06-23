@@ -64,7 +64,7 @@ from app.employer import (
     build_job_record,
 )
 from app.validation import validate_employer, validate_job_post
-from app.whatsapp import delivery as wa_delivery
+from app.whatsapp import localize as wa_localize
 
 router = APIRouter()
 log = get_logger("employer")
@@ -272,7 +272,7 @@ async def register_submit(request: Request) -> HTMLResponse:
             "What would you like to do today?"
         )
         try:
-            await wa_delivery.send_message(settings, digits, _emp_menu_list(body))
+            await wa_localize.send(settings, digits, _emp_menu_list(body), tenant_id=tenant_id)
         except Exception as exc:  # noqa: BLE001 — proactive push is best-effort
             log.warning("employer_register_push_failed", error=str(exc)[:200])
 
@@ -415,14 +415,14 @@ def _clean_validity(value: str) -> str:
     return value if value in {str(d) for d, _ in VALIDITY_OPTIONS} else str(VALIDITY_OPTIONS[0][0])
 
 
-async def _notify_subscription(phone: str, body: str) -> None:
-    """Push a subscription WhatsApp nudge (renewal / expiry) + the employer menu.
-    Best-effort — a delivery failure never blocks the turn."""
+async def _notify_subscription(phone: str, body: str, *, tenant_id: str | None = None) -> None:
+    """Push a subscription WhatsApp nudge (renewal / expiry) + the employer menu,
+    localized to the recipient's language. Best-effort — never blocks the turn."""
     digits = re.sub(r"\D", "", phone or "")
     if not digits:
         return
     try:
-        await wa_delivery.send_message(get_settings(), digits, _emp_menu_list(body))
+        await wa_localize.send(get_settings(), digits, _emp_menu_list(body), tenant_id=tenant_id)
     except Exception as exc:  # noqa: BLE001
         log.warning("subscription_notify_failed", error=str(exc)[:200])
 
@@ -454,7 +454,8 @@ async def _apply_due_renewal(memory, phone: str, tenant_id: str) -> None:
         parts = ([f"{mc} unlock credit{'s' if mc != 1 else ''}"] if mc else []) + \
                 ([f"{mb} boost{'s' if mb != 1 else ''}"] if mb else [])
         await _notify_subscription(
-            phone, "🔄 *Plan renewed* — " + " and ".join(parts) + " added to your wallet for this month. 🎉")
+            phone, "🔄 *Plan renewed* — " + " and ".join(parts) + " added to your wallet for this month. 🎉",
+            tenant_id=tenant_id)
     except Exception as exc:  # noqa: BLE001 — a renewal hiccup must never block the turn
         log.error("subscription_renewal_failed", error=str(exc)[:300])
 
@@ -471,7 +472,8 @@ async def _resolve_entitlement(memory, phone: str, tenant_id: str) -> tuple[dict
     if ent.get("just_expired"):
         await _notify_subscription(
             phone, f"⏳ Your *{ent.get('plan_name') or 'subscription'}* plan has expired. "
-            "Renew anytime to keep included job posts and monthly credits — tap *Upgrade Plan*.")
+            "Renew anytime to keep included job posts and monthly credits — tap *Upgrade Plan*.",
+            tenant_id=tenant_id)
     return ent, employer_id
 
 
@@ -584,7 +586,7 @@ async def _finalize_job(memory, phone: str, tenant_id: str, token: str, validity
             "What next?"
         )
         try:
-            await wa_delivery.send_message(settings, digits, _emp_menu_list(body))
+            await wa_localize.send(settings, digits, _emp_menu_list(body), tenant_id=tenant_id)
         except Exception as exc:  # noqa: BLE001
             log.warning("employer_postjob_push_failed", error=str(exc)[:200])
     return summary
@@ -899,7 +901,7 @@ async def _activate_subscription(memory, phone: str, tenant_id: str, plan: dict[
             f"✅ *{plan.get('name')}* plan activated ({label}).{extra}\n\nWhat next?"
         )
         try:
-            await wa_delivery.send_message(settings, digits, _emp_menu_list(body))
+            await wa_localize.send(settings, digits, _emp_menu_list(body), tenant_id=tenant_id)
         except Exception as exc:  # noqa: BLE001
             log.warning("subscribe_push_failed", error=str(exc)[:200])
 
@@ -1060,7 +1062,7 @@ async def buy_credits_verify(request: Request) -> JSONResponse:
             f"💳 Balance — 💼 {bal['job']} job · 🔓 {bal['unlock']} unlock · 🚀 {bal['boost']} boost. What next?"
         )
         try:
-            await wa_delivery.send_message(settings, digits, _emp_menu_list(body))
+            await wa_localize.send(settings, digits, _emp_menu_list(body), tenant_id=tenant_id)
         except Exception as exc:  # noqa: BLE001
             log.warning("buy_credits_push_failed", error=str(exc)[:200])
     # Send the buyer back to the chat (success page with a 'Back to chat' button).
@@ -1170,7 +1172,7 @@ async def subscribe_cancel_do(request: Request) -> HTMLResponse:
         await memory.update_employer(phone, {"subscription": None}, tenant_id=tenant_id)   # clear cache
         await _notify_subscription(
             phone, f"Your *{res.get('plan_name') or 'plan'}* has been cancelled. "
-            "You can re-subscribe anytime — tap *Upgrade Plan*.")
+            "You can re-subscribe anytime — tap *Upgrade Plan*.", tenant_id=tenant_id)
     number = re.sub(r"\D", "", get_settings().whatsapp_business_number or "")
     return HTMLResponse(_success_html(
         "Plan cancelled", "Your subscription has been cancelled. Head back to WhatsApp to continue.",

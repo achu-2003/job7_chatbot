@@ -51,8 +51,10 @@ from app.db.repositories import (
     CandidateRepository,
     JobPostRepository,
     JobSeekerRepository,
+    LookupRepository,
     SavedJobRepository,
 )
+from app import i18n
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.core.metrics import AGENT_LOOPS
@@ -501,7 +503,37 @@ class AgentRuntime:
         return (
             await self._browse_category(state, text, offset=0)
             or await self._browse_role_search(state, text)
+            # Last resort for a NON-ENGLISH turn whose translated phrase is a
+            # category SYNONYM ("transport" → Logistics, "production" →
+            # Manufacturing) that matched no category name and no job title.
+            or await self._browse_category_classified(state, text)
         )
+
+    async def _browse_category_classified(self, state: AgentState, text: str) -> dict[str, Any]:
+        """Map a typed phrase to a known job category for a NON-ENGLISH turn, then
+        browse it. Uses the user's ORIGINAL (untranslated) word so we don't inherit
+        an inbound-translation mistake. Two steps: (1) reverse-match against the
+        bot's own translations of the category names — exact + consistent (e.g.
+        "தயாரிப்பு" → "Manufacturing"); (2) else an LLM classify for free phrasing /
+        synonyms. English keeps the deterministic name/title match. {} on miss."""
+        lang = state.get("inbound_lang") or "en"
+        if lang == "en":
+            return {}
+        raw = state.get("inbound_raw") or text          # the original-language word
+        try:
+            cats = [c["name"] for c in await LookupRepository.options("categories")]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("classify_categories_load_failed", error=str(exc)[:200])
+            return {}
+        # 1) reverse-translation match (deterministic, consistent with what was shown)
+        category = await i18n.category_from_translation(self.llm, raw, cats, lang)
+        # 2) LLM classify on the ORIGINAL word (avoids the English mistranslation)
+        if not category:
+            category = await i18n.classify_category(self.llm, raw, cats)
+        if not category:
+            return {}
+        log.info("category_classified", text=raw[:40], category=category)
+        return await self._browse_category(state, category, offset=0)
 
     async def _browse_role_search(self, state: AgentState, text: str) -> dict[str, Any]:
         """A typed specific role (not a category) → the matching job cards,
@@ -1965,6 +1997,32 @@ class AgentRuntime:
 
     # ---- public entry ------------------------------------------------
 
+    async def _localize_outputs(self, final: dict[str, Any], lang: str) -> None:
+        """Translate ALL user-visible text of a turn into ``lang`` in ONE batched
+        call: the reply, the paced delivery bubbles, AND every interactive label
+        (job-card bodies, role/category list rows + titles, button labels, cta
+        text). Interactive IDs / URLs are preserved so taps still route. Best-effort
+        — any failure keeps the original English."""
+        texts, setters = i18n.collect_localizable(final)
+        if not texts:
+            return
+        translated = await i18n.translate_many(self.llm, texts, to_lang=lang)
+        for setter, tr in zip(setters, translated):
+            setter(tr)
+
+    async def _persist_lang(self, phone: str | None, tenant_id: str, lang: str) -> None:
+        """Remember the user's language (from their last typed message) so a later
+        button-tap turn — which has no text to detect — still replies in it."""
+        if not phone:
+            return
+        try:
+            await self.gateway.semantic.remember_fact(
+                tenant_id=tenant_id, customer_id=phone, key="lang", value=lang,
+                confidence=1.0, source="chat",
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, never block the turn
+            log.warning("lang_persist_failed", error=str(exc)[:200])
+
     async def handle(
         self,
         *,
@@ -1979,11 +2037,22 @@ class AgentRuntime:
     ) -> dict[str, Any]:
         tid = tenant_id or get_current_tenant_id()
         conv_id = conversation_id or f"conv_{uuid.uuid4().hex[:12]}"
+        # Multilingual (translate-pivot): a typed Tamil/Hindi message is detected by
+        # script and translated to English so the existing English routing/search
+        # works; the user's language is carried to the outbound side below. Button
+        # taps carry a structured (English) id, so they're never translated inbound.
+        user_lang = "en"
+        routed_query = customer_query
+        if get_settings().multilang_enabled and not interactive_id:
+            user_lang = i18n.detect_lang(customer_query)
+            if user_lang != "en":
+                routed_query = await i18n.to_english(self.llm, customer_query, source_lang=user_lang)
         initial: AgentState = {
             "tenant_id": tid,
             "conversation_id": conv_id,
             "customer_id": customer_external_id or "",
-            "inbound_text": customer_query,
+            "inbound_text": routed_query,
+            "inbound_raw": customer_query,          # original, pre-translation
             "inbound_kind": "document" if attachment else ("button" if interactive_id else "text"),
             # structured id of a tapped row/button (job:<ref>, loc:<x>, apply:<ref>…)
             "button_id": interactive_id,
@@ -1991,6 +2060,9 @@ class AgentRuntime:
             "attachment": attachment,
             "request_id": request_id,
             "received_at": time.time(),
+            # the user's detected language this turn (drives the synonym/category
+            # classify fallback — only non-English turns need it)
+            "inbound_lang": user_lang,
             # reasoning-loop budget (Phase 0 Budget semantics, tracked on state)
             "loop_count": 0,
             "deadline": time.monotonic() + get_settings().agent_deadline_seconds,
@@ -2005,6 +2077,20 @@ class AgentRuntime:
             used_llm=final.get("used_llm"),
             latency_ms=final.get("latency_ms"),
         )
+        # Multilingual outbound: reply in the user's CURRENT language. A typed turn
+        # uses the language detected from this message; a button tap (no text to
+        # detect) uses the language remembered from the last typed message. Persist
+        # on EVERY typed turn — including English — so switching back to English
+        # resets the stored language and later button taps follow it (no sticky lang).
+        if get_settings().multilang_enabled:
+            if interactive_id:
+                user_lang = ((final.get("customer_facts") or {}).get("lang")) or "en"
+            if i18n.is_supported(user_lang) and user_lang != "en":
+                await self._localize_outputs(final, user_lang)
+            if not interactive_id and i18n.is_supported(user_lang):
+                stored = ((final.get("customer_facts") or {}).get("lang")) or "en"
+                if user_lang != stored:          # only write when it actually changes
+                    await self._persist_lang(customer_external_id, tid, user_lang)
         return {
             # ChatResponse-compatible (HTTP chat endpoint)
             "request_id": request_id,

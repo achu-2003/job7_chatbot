@@ -50,8 +50,10 @@ class AgentState(TypedDict, total=False):
     conversation_id: str
     session_id: str
     request_id: str
-    inbound_text: str
+    inbound_text: str           # routing text (translated to English when multilang)
+    inbound_raw: str            # the user's ORIGINAL text, before any translation
     inbound_kind: str           # text | button | list | image | document
+    inbound_lang: str           # detected user language this turn: en | ta | hi
     button_id: str | None       # structured id of a tapped list row / button (e.g. "job:<ref>")
     attachment: dict[str, Any] | None  # an uploaded file (e.g. a resume document): {kind, media_id, filename}
     received_at: float

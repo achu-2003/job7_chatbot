@@ -37,7 +37,7 @@ from app.db.repositories import (
 )
 from app.onboarding import build_application_record, prepare_registration
 from app.validation import MAX_RESUME_BYTES, valid_resume_filename, validate_registration
-from app.whatsapp import delivery as wa_delivery
+from app.whatsapp import localize as wa_localize
 
 # The /onboard form is the SEEKER lane (the employer side has its own form), so
 # after a submission we push the seeker hub directly — the conversation just
@@ -348,7 +348,8 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
             "help you with — just tap an option below."
         )
         try:
-            await wa_delivery.send_message(settings, phone, wa.buttons_message(body, _SEEKER_HUB_BUTTONS))
+            await wa_localize.send(settings, phone, wa.buttons_message(body, _SEEKER_HUB_BUTTONS),
+                                   tenant_id=identity["tenant_id"])
             await memory.mark_onboarding_welcomed(
                 identity["conversation_id"], tenant_id=identity["tenant_id"]
             )
@@ -433,7 +434,7 @@ async def resume_submit(request: Request) -> HTMLResponse:
     phone = re.sub(r"\D", "", conv)          # conv id is wa_<number>
     if phone:
         try:
-            await wa_delivery.send_message(settings, phone, wa.text_message(push_body))
+            await wa_localize.send(settings, phone, wa.text_message(push_body), tenant_id=tid)
         except Exception as exc:  # noqa: BLE001 — push is best-effort
             log.warning("apply_resume_push_failed", error=str(exc)[:200])
 

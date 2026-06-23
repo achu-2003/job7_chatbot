@@ -227,6 +227,11 @@ class Settings(BaseSettings):
     # verify — so a Redis loss can't strand a paid order (verify reconciles the
     # order context from the DB). Idempotent on razorpayOrderId. PAYMENTS_IN_DB=true.
     payments_in_db: bool = False
+    # When True, the bot serves Tamil / Hindi users via translate-pivot: the inbound
+    # message is translated to English for routing/search and the conversational
+    # text reply is translated back to the user's language (LLM-backed, best-effort).
+    # Default False keeps the English-only flow. MULTILANG_ENABLED=true.
+    multilang_enabled: bool = False
     # When True, a seeker's "Save" tap is ALSO written to the live ``private_saved_jobs``
     # table (so the bookmark survives a Redis loss and syncs with the main app).
     # Idempotent on (jobSeekerId, jobId); needs the seeker in the DB (REGISTER_IN_DB).

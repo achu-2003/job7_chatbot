@@ -210,7 +210,7 @@ async def test_register_double_submit_is_idempotent(monkeypatch):
 
     async def _push(*a, **k):
         pushes.append(1)
-    monkeypatch.setattr(emp.wa_delivery, "send_message", _push)
+    monkeypatch.setattr("app.whatsapp.delivery.send_message", _push)
 
     mem = _FakeRegMemory()
     # First submit → creates + pushes.
@@ -244,7 +244,7 @@ async def test_register_writes_to_live_db_when_flag_on(monkeypatch):
 
     async def _noop_push(*a, **k):
         return None
-    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop_push)
+    monkeypatch.setattr("app.whatsapp.delivery.send_message", _noop_push)
 
     created = []
 

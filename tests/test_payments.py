@@ -157,7 +157,7 @@ async def test_buy_credits_records_live_purchase_when_flag_on(monkeypatch):
 
     async def _noop(*a, **k):
         return None
-    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop)
+    monkeypatch.setattr("app.whatsapp.delivery.send_message", _noop)
 
     async def fake_get_bundle(bid):
         return {"id": bid, "name": "Growth", "validityDays": 30}
@@ -357,7 +357,7 @@ async def test_subscription_persisted_with_payment_fk_when_flag_on(monkeypatch):
 
     async def _noop(*a, **k):
         return None
-    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop)
+    monkeypatch.setattr("app.whatsapp.delivery.send_message", _noop)
 
     async def fake_id(oid):
         return "pmrow_1" if oid else None
@@ -387,7 +387,7 @@ async def test_free_subscription_persisted_with_null_payment(monkeypatch):
 
     async def _noop(*a, **k):
         return None
-    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop)
+    monkeypatch.setattr("app.whatsapp.delivery.send_message", _noop)
     calls = []
 
     async def fake_activate(**k):
@@ -405,7 +405,7 @@ async def test_subscription_not_persisted_when_flag_off(monkeypatch):
 
     async def _noop(*a, **k):
         return None
-    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop)
+    monkeypatch.setattr("app.whatsapp.delivery.send_message", _noop)
     called = []
 
     async def boom(**k):

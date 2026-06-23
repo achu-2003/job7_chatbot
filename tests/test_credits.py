@@ -122,7 +122,7 @@ async def test_finalize_job_debits_and_posts(monkeypatch):
 
     async def _noop(*a, **k):
         return None
-    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop)
+    monkeypatch.setattr("app.whatsapp.delivery.send_message", _noop)
 
     mem = await _mem_with_employer()
     await mem.ensure_job_credits("919042177457", tenant_id="t1", seed=2)
@@ -151,7 +151,7 @@ async def test_finalize_job_writes_live_billing_when_flag_on(monkeypatch):
 
     async def _noop(*a, **k):
         return None
-    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop)
+    monkeypatch.setattr("app.whatsapp.delivery.send_message", _noop)
 
     calls = []
 
@@ -225,7 +225,7 @@ async def test_finalize_job_free_when_plan_covers(monkeypatch):
 
     async def _noop(*a, **k):
         return None
-    monkeypatch.setattr(emp.wa_delivery, "send_message", _noop)
+    monkeypatch.setattr("app.whatsapp.delivery.send_message", _noop)
 
     async def covered(*a, **k):
         return True
@@ -285,7 +285,7 @@ async def test_apply_due_renewal_grants_when_due(monkeypatch):
     monkeypatch.setattr(emp.SubscriptionRepository, "record_renewal_grant", staticmethod(fake_record))
     notes = []
 
-    async def fake_notify(phone, body):
+    async def fake_notify(phone, body, **kw):
         notes.append(body)
     monkeypatch.setattr(emp, "_notify_subscription", fake_notify)
 
@@ -360,7 +360,7 @@ async def test_resolve_entitlement_notifies_once_on_expiry(monkeypatch):
     monkeypatch.setattr(emp.SubscriptionRepository, "get_entitlement", staticmethod(expired))
     notes = []
 
-    async def fake_notify(phone, body):
+    async def fake_notify(phone, body, **kw):
         notes.append(body)
     monkeypatch.setattr(emp, "_notify_subscription", fake_notify)
     ent, eid = await emp._resolve_entitlement(_M(), "919", "t1")
@@ -380,7 +380,7 @@ async def test_subscribe_cancel_confirm_endpoint(monkeypatch):
     monkeypatch.setattr(emp.SubscriptionRepository, "cancel", staticmethod(fake_cancel))
     notes, cache = [], []
 
-    async def fake_notify(phone, body):
+    async def fake_notify(phone, body, **kw):
         notes.append(body)
     monkeypatch.setattr(emp, "_notify_subscription", fake_notify)
 

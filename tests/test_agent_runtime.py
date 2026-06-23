@@ -1620,3 +1620,63 @@ async def test_document_outside_apply_is_nudged():
     )
     assert "apply" in out["response"].lower()
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
+
+
+# ---- multilingual translate-pivot (outbound localization) -------------------
+
+async def test_localize_outputs_translates_reply_and_bubbles():
+    """_localize_outputs translates the draft_response + each delivery bubble to the
+    user's language (one batched call); interactive payloads are left untouched."""
+    import json as _json
+
+    class _TLLM:
+        def __init__(self): self.calls = 0
+        async def chat(self, *, purpose, messages, **kw):
+            self.calls += 1
+            payload = _json.loads(messages[-1]["content"])
+            return _json.dumps({k: "த:" + v for k, v in payload.items()}), {}
+
+    rt = _runtime()
+    rt.llm = _TLLM()                                  # type: ignore[assignment]
+    final = {
+        "draft_response": "Welcome back! What would you like to do?",
+        "delivery_plan": [{"text": "Tap a job to apply."}, {"text": "Anything else?"}],
+        "whatsapp_interactive": {"interactive": {"type": "list"}},   # must stay untouched
+    }
+    await rt._localize_outputs(final, "ta")
+    assert final["draft_response"].startswith("த:")
+    assert all(b["text"].startswith("த:") for b in final["delivery_plan"])
+    assert final["whatsapp_interactive"] == {"interactive": {"type": "list"}}  # unchanged
+    assert rt.llm.calls == 1                          # single batched translation call
+
+
+async def test_typing_english_resets_sticky_language(monkeypatch):
+    """Reply in the CURRENT language: a seeker whose stored language is Tamil who
+    then TYPES English gets an English reply AND has the stored language reset to
+    'en' — so the next button tap follows it (fixes the sticky-language bug where a
+    button tap after an English message still replied in Tamil)."""
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "multilang_enabled", True)
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Asha", "lane": "seeker", "lang": "ta"})
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "hi")                     # typed English
+    # English reply (seeker hub, NOT translated to Tamil)
+    titles = [b["reply"]["title"] for b in out["whatsapp_interactive"]["interactive"]["action"]["buttons"]]
+    assert titles == ["Job Search", "Application Status", "Recommended Jobs"]
+    # stored language was reset ta -> en (so later button taps reply in English)
+    assert any(c.get("key") == "lang" and c.get("value") == "en"
+               for c in rt._test_facts)               # type: ignore[attr-defined]
+
+
+async def test_typing_tamil_sets_language(monkeypatch):
+    """Typing Tamil sets the stored language to 'ta' (so subsequent button taps
+    reply in Tamil)."""
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "multilang_enabled", True)
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Asha", "lane": "seeker"})   # no lang yet -> 'en'
+    rt.llm = _FakeLLM(plans=[], reply="ok")
+    await _handle(rt, "ஆய்")                          # typed Tamil
+    assert any(c.get("key") == "lang" and c.get("value") == "ta"
+               for c in rt._test_facts)               # type: ignore[attr-defined]
