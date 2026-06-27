@@ -64,7 +64,16 @@ from app.employer import (
     build_job_record,
 )
 from app.validation import validate_employer, validate_job_post
+from app import i18n
 from app.whatsapp import localize as wa_localize
+
+
+async def _form_lang(identity: dict[str, Any] | None) -> str:
+    """The form opener's language (from their stored ``lang`` fact), or English —
+    so a Tamil/Hindi user gets a localized form. Gated on the multilang flag."""
+    if not (identity and get_settings().multilang_enabled):
+        return "en"
+    return await wa_localize.user_lang(identity.get("tenant_id"), identity.get("customer_id"))
 
 router = APIRouter()
 log = get_logger("employer")
@@ -173,7 +182,8 @@ async def register_form(request: Request, token: str = Query(default="")) -> HTM
     if not identity:
         return HTMLResponse(_expired_html(), status_code=404)
     opts = await _reg_options()
-    return HTMLResponse(_register_html(token, identity.get("customer_id") or "", opts))
+    html = _register_html(token, identity.get("customer_id") or "", opts)
+    return HTMLResponse(i18n.inject_form_i18n(html, await _form_lang(identity)))
 
 
 @router.post("/register/submit", response_class=HTMLResponse)
@@ -288,10 +298,11 @@ async def post_job_form(request: Request, token: str = Query(default="")) -> HTM
     opts = await _job_options()
     employer = await memory.get_employer(identity.get("customer_id") or "", tenant_id=identity["tenant_id"])
     pe = (employer or {}).get("private_employers") or {}
-    return HTMLResponse(_post_job_html(
+    html = _post_job_html(
         token, opts, company_address=_company_address(employer),
         company_district_id=pe.get("districtId") or "",
-    ))
+    )
+    return HTMLResponse(i18n.inject_form_i18n(html, await _form_lang(identity)))
 
 
 def _company_address(employer: dict[str, Any] | None) -> str:
@@ -691,8 +702,13 @@ async def post_job_credits_verify(request: Request) -> JSONResponse:
         return (raw.get(k) or [""])[0].strip()
 
     order_id, payment_id, signature = one("razorpay_order_id"), one("razorpay_payment_id"), one("razorpay_signature")
-    if not rzp.verify_payment_signature(order_id=order_id, payment_id=payment_id, signature=signature):
-        return JSONResponse({"error": "bad_signature"}, status_code=400)
+    # Full check: genuine signature AND the payment actually succeeded on Razorpay
+    # (status captured/authorized — a failed/abandoned attempt is rejected here, so
+    # we never grant credits or post a job for a payment that didn't go through).
+    ok, reason = await rzp.verify_payment(
+        order_id=order_id, payment_id=payment_id, signature=signature)
+    if not ok:
+        return JSONResponse({"error": reason}, status_code=402 if reason == "not_captured" else 400)
     memory = get_memory(request)
     pending = await _load_pending_order(memory, order_id, kind="job_credits")
     if not pending:
@@ -824,8 +840,13 @@ async def subscribe_verify(request: Request) -> JSONResponse:
         return (raw.get(k) or [""])[0].strip()
 
     order_id, payment_id, signature = one("razorpay_order_id"), one("razorpay_payment_id"), one("razorpay_signature")
-    if not rzp.verify_payment_signature(order_id=order_id, payment_id=payment_id, signature=signature):
-        return JSONResponse({"error": "bad_signature"}, status_code=400)
+    # Full check: genuine signature AND the payment actually succeeded on Razorpay
+    # (status captured/authorized — a failed/abandoned attempt is rejected here, so
+    # we never grant credits or post a job for a payment that didn't go through).
+    ok, reason = await rzp.verify_payment(
+        order_id=order_id, payment_id=payment_id, signature=signature)
+    if not ok:
+        return JSONResponse({"error": reason}, status_code=402 if reason == "not_captured" else 400)
     memory = get_memory(request)
     pending = await _load_pending_order(memory, order_id)   # reconciles from DB if Redis lost it
     if not pending:
@@ -1020,8 +1041,13 @@ async def buy_credits_verify(request: Request) -> JSONResponse:
         return (raw.get(k) or [""])[0].strip()
 
     order_id, payment_id, signature = one("razorpay_order_id"), one("razorpay_payment_id"), one("razorpay_signature")
-    if not rzp.verify_payment_signature(order_id=order_id, payment_id=payment_id, signature=signature):
-        return JSONResponse({"error": "bad_signature"}, status_code=400)
+    # Full check: genuine signature AND the payment actually succeeded on Razorpay
+    # (status captured/authorized — a failed/abandoned attempt is rejected here, so
+    # we never grant credits or post a job for a payment that didn't go through).
+    ok, reason = await rzp.verify_payment(
+        order_id=order_id, payment_id=payment_id, signature=signature)
+    if not ok:
+        return JSONResponse({"error": reason}, status_code=402 if reason == "not_captured" else 400)
     memory = get_memory(request)
     pending = await _load_pending_order(memory, order_id, kind="buy_credits")
     if not pending:
@@ -1482,10 +1508,6 @@ def _register_html(
   <input type="hidden" name="token" value="{_esc(token)}">
   <label>Company name <span class="req">*</span></label>
   <input name="company_name" required placeholder="e.g. Acme Technologies">
-  <label>Work email</label>
-  <input type="email" name="email" placeholder="hr@company.com">
-  <label>Phone</label>
-  <input name="primary_phone" value="{_esc(phone)}" readonly>
 
   <div class="acc open" id="addrAcc">
     <button type="button" class="acc-hd" id="addrHd">📍 Address &amp; Location <span class="acc-ar">▾</span></button>
@@ -1505,8 +1527,6 @@ def _register_html(
     </div>
   </div>
 
-  <label>About the company</label>
-  <textarea name="description" placeholder="What your company does (optional)"></textarea>
   <button class="btn" type="submit">Create profile</button>
 </form>
 <script>
@@ -1594,8 +1614,8 @@ def _post_job_html(
     <label>Salary Range <span class="req">*</span></label>
     {_radios("salary_period", SALARY_PERIODS)}
     <div class="row">
-      <div><label>Min (₹) <span class="req">*</span></label><input name="salary_min" data-req="1" data-fmt="num" inputmode="numeric" placeholder="Min"></div>
-      <div><label>Max (₹) <span class="req">*</span></label><input name="salary_max" data-req="1" data-fmt="num" inputmode="numeric" placeholder="Max"></div>
+      <div><label>Min (₹) <span class="req">*</span></label><input name="salary_min" data-req="1" data-fmt="int" inputmode="numeric" placeholder="Min"></div>
+      <div><label>Max (₹) <span class="req">*</span></label><input name="salary_max" data-req="1" data-fmt="int" inputmode="numeric" placeholder="Max"></div>
     </div>
   </div>
 
@@ -1788,6 +1808,15 @@ function valid(){{
 }}
 next.onclick = function(){{ if(valid()){{ cur=Math.min(cur+1,steps.length-1); render(); }} }};
 back.onclick = function(){{ cur=Math.max(cur-1,0); render(); }};
+
+// Whole-number fields (e.g. Vacancies): accept digits only — strip anything else
+// (decimal points, letters, signs) the moment it's typed or pasted.
+[].forEach.call(document.querySelectorAll('[data-fmt=int]'), function(el){{
+  el.addEventListener('input', function(){{
+    var d = el.value.replace(/[^0-9]/g, '');
+    if(d !== el.value) el.value = d;
+  }});
+}});
 
 // --- Experience & Salary conditional fields ---
 function picked(name){{ var el=document.querySelector('input[name="'+name+'"]:checked'); return el?el.value:''; }}

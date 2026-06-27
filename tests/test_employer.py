@@ -64,7 +64,9 @@ def test_register_form_renders_company_fields():
     assert 'name="token" value="tok123"' in out
     assert 'action="/employer/register/submit"' in out
     assert 'name="company_name"' in out
-    assert 'value="919876543210" readonly' in out
+    # email / phone / about-company removed (phone is taken from the WhatsApp identity)
+    assert 'name="email"' not in out and 'name="primary_phone"' not in out
+    assert 'name="description"' not in out
     assert "var DISTRICTS =" in out                          # cascade JS
     # address fields live in a collapsible accordion (expanded by default)
     assert 'class="acc open" id="addrAcc"' in out and 'id="addrHd"' in out

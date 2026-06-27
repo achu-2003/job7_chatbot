@@ -260,9 +260,9 @@ class Settings(BaseSettings):
     # link (as a tappable "Open in Jobs7" WhatsApp button); an https URL is
     # required for the button (Meta rejects http/localhost), else it's inline text.
     jobs7_app_url: str = "https://play.google.com/store/apps/details?id=com.jobs7"
-    # Employer web portal — where an employer goes to unlock full candidate
+    # Jobs7 Employer app — where an employer goes to unlock full candidate
     # details (payment/subscription handled there, not in chat).
-    employer_portal_url: str = "https://employer.jobs7.in/"
+    employer_portal_url: str = "https://play.google.com/store/apps/details?id=in.jobs7.employer"
 
     # ---- razorpay (employer subscription / credit payments) ----
     # TEST keys start with "rzp_test_" (no real money — pay with Razorpay test

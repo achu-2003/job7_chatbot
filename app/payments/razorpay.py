@@ -76,3 +76,55 @@ def verify_payment_signature(
         hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
+
+
+async def fetch_payment(payment_id: str) -> dict[str, Any]:
+    """Fetch a payment object from Razorpay (status, amount, order_id, …)."""
+    if not payment_id:
+        raise RazorpayError("Missing payment id.")
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(f"{_API}/payments/{payment_id}", auth=_auth())
+    except httpx.HTTPError as exc:
+        raise RazorpayError(f"Razorpay request failed: {exc}") from exc
+    if resp.status_code != 200:
+        log.warning("razorpay_fetch_failed", status=resp.status_code, body=resp.text[:300])
+        raise RazorpayError(f"Razorpay payment fetch failed ({resp.status_code}).")
+    return resp.json()
+
+
+# A payment is only "good" once the money is actually held/taken — NOT 'failed',
+# 'created', or 'refunded'. (Orders here are auto-captured, so success → 'captured';
+# 'authorized' is accepted for manual-capture accounts where the money is held.)
+_PAID_STATUSES = {"captured", "authorized"}
+
+
+async def verify_payment(
+    *, order_id: str, payment_id: str, signature: str,
+    expected_amount_paise: int | None = None,
+) -> tuple[bool, str]:
+    """Full server-side payment check to run BEFORE granting anything. Returns
+    ``(ok, reason)``. Confirms, in order: (1) the signature is genuine, (2) the
+    payment ACTUALLY succeeded on Razorpay (status captured/authorized — not a
+    failed/abandoned attempt), (3) it belongs to this order, and (4) the amount
+    matches. Fails closed — if Razorpay can't be reached, we do NOT grant."""
+    if not verify_payment_signature(order_id=order_id, payment_id=payment_id, signature=signature):
+        return False, "bad_signature"
+    try:
+        pay = await fetch_payment(payment_id)
+    except RazorpayError as exc:
+        log.error("payment_verify_fetch_failed", payment_id=payment_id, error=str(exc)[:200])
+        return False, "fetch_failed"
+    status = pay.get("status")
+    if status not in _PAID_STATUSES:
+        log.warning("payment_not_captured", payment_id=payment_id, status=status)
+        return False, "not_captured"
+    if pay.get("order_id") and pay.get("order_id") != order_id:
+        log.warning("payment_order_mismatch", payment_id=payment_id,
+                    expected=order_id, got=pay.get("order_id"))
+        return False, "order_mismatch"
+    if expected_amount_paise is not None and int(pay.get("amount", -1)) != int(expected_amount_paise):
+        log.warning("payment_amount_mismatch", payment_id=payment_id,
+                    expected=expected_amount_paise, got=pay.get("amount"))
+        return False, "amount_mismatch"
+    return True, "ok"

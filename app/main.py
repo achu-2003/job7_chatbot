@@ -1,12 +1,14 @@
 """FastAPI entrypoint."""
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.responses import Response
 
+from app import i18n
 from app.api.routes import admin, chat, employer, health, onboard, whatsapp
 from app.config import get_settings
 from app.core.logging import configure_logging, get_logger
@@ -71,6 +73,13 @@ async def lifespan(app: FastAPI):
             vector=app.state.vector, memory=app.state.memory,
         )
         log.info("serving_with", engine="chat_graph_runner")
+
+    # Pre-translate fixed UI strings (menu labels, lane hints, guidance) into every
+    # supported language so non-English users reliably get them in their language —
+    # in the background, best-effort, never blocks startup.
+    if settings.multilang_enabled and getattr(app.state.graph_runner, "llm", None):
+        app.state.warm_task = asyncio.create_task(
+            i18n.warm_cache(app.state.graph_runner.llm))
 
     app.state.worker = None
     app.state.worker_task = None

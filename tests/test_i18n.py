@@ -48,12 +48,14 @@ async def test_translate_many_unsupported_lang_noop():
 async def test_translate_many_translates_skips_nonwordy_and_caches():
     i18n._CACHE.clear()
     llm = _FakeLLM()
-    out = await i18n.translate_many(llm, ["Post a Job", "12345", "Buy Credits"], to_lang="ta")
-    assert out == ["TA::Post a Job", "12345", "TA::Buy Credits"]   # digits-only skipped
+    # non-glossary strings, so they exercise the LLM batch path (glossary terms would
+    # short-circuit before the LLM — covered by test_glossary_covers_menu_labels)
+    out = await i18n.translate_many(llm, ["Welcome back", "12345", "Anything else?"], to_lang="ta")
+    assert out == ["TA::Welcome back", "12345", "TA::Anything else?"]   # digits-only skipped
     assert llm.calls == ["translate_out"]        # ONE batched call for the two strings
     # a repeat is served from cache — no new LLM call
     llm2 = _FakeLLM()
-    assert await i18n.translate_many(llm2, ["Post a Job"], to_lang="ta") == ["TA::Post a Job"]
+    assert await i18n.translate_many(llm2, ["Welcome back"], to_lang="ta") == ["TA::Welcome back"]
     assert llm2.calls == []
 
 
@@ -207,3 +209,128 @@ async def test_glossary_overrides_llm_for_category_names():
     # reverse round-trip works off the glossary (no LLM)
     assert await i18n.category_from_translation(_NoLLM(), "விருந்தோம்பல் & சுற்றுலா", cats, "ta") \
         == "Hospitality & Tourism"
+
+
+async def test_glossary_covers_menu_labels():
+    """Fixed menu/button labels translate via the glossary (correct + reliable, no
+    LLM) — fixes 'Application Status' → garbage and untranslated buttons."""
+    class _NoLLM:
+        async def chat(self, **kw):
+            raise AssertionError("menu labels must not call the LLM")
+
+    i18n._CACHE.clear()
+    out = await i18n.translate_many(
+        _NoLLM(), ["Job Search", "Application Status", "Recommended Jobs",
+                   "View Candidates", "🪪 Credits & Wallet"], to_lang="ta")
+    assert out == ["வேலை தேடல்", "விண்ணப்ப நிலை", "பரிந்துரைக்கப்பட்ட வேலைகள்",
+                   "வேட்பாளர்களைப் பார்", "🪪 கிரெடிட்கள் & வாலெட்"]
+    assert (await i18n.translate_many(_NoLLM(), ["Application Status"], to_lang="hi"))[0] == "आवेदन स्थिति"
+
+
+async def test_warm_cache_pretranslates_registered_strings():
+    """Registered fixed strings are pre-translated into every language at startup,
+    so later turns serve them from cache (no per-turn LLM) — even if the LLM later
+    fails. Guards against an occasional English body for a non-English user."""
+    import json as _json
+
+    class _LLM:
+        def __init__(self): self.calls = 0
+        async def chat(self, *, purpose, messages, **kw):
+            self.calls += 1
+            payload = _json.loads(messages[-1]["content"])
+            return _json.dumps({k: "X::" + v for k, v in payload.items()}), {}
+
+    i18n._CACHE.clear()
+    i18n._WARM_STRINGS.clear()
+    i18n.register_warm_strings(["You're on the Job Seeker side.", "12345", ""])  # junk skipped
+    assert i18n._WARM_STRINGS == {"You're on the Job Seeker side."}
+
+    llm = _LLM()
+    assert await i18n.warm_cache(llm, pace_s=0) == 2   # 1 string × ta + hi cached
+    # after warming, a translation is a cache hit — the LLM must NOT be called again
+    class _NoLLM:
+        async def chat(self, **k):
+            raise AssertionError("should be served from the warmed cache")
+    out = await i18n.translate_many(_NoLLM(), ["You're on the Job Seeker side."], to_lang="ta")
+    assert out == ["X::You're on the Job Seeker side."]
+
+
+async def test_to_english_reverse_maps_localized_labels():
+    """Typing a LOCALIZED menu/category label reverse-maps to its canonical English
+    (no LLM), so it routes exactly like tapping the button. Fixes 'tap Post-a-Job
+    works but typing வேலை இடுகையிடு does a candidate search'."""
+    class _NoLLM:
+        async def chat(self, **k):
+            raise AssertionError("glossary reverse-map must not call the LLM")
+
+    assert i18n.from_glossary("வேலை இடுகையிடு", "ta") == "post a job"
+    assert i18n.from_glossary("उम्मीदवार देखें", "hi") == "view candidates"
+    assert i18n.from_glossary("not a label", "ta") is None           # unknown phrase
+    assert i18n.from_glossary("anything", "en") is None              # English: no-op
+    # to_english uses the reverse-map (no LLM) for a known label
+    assert await i18n.to_english(_NoLLM(), "வேட்பாளர்களைப் பார்", source_lang="ta") == "view candidates"
+    # an unknown phrase falls through to the LLM (here stubbed to raise → best-effort original)
+    assert await i18n.to_english(_NoLLM(), "சும்மா ஒரு வாக்கியம்", source_lang="ta") == "சும்மா ஒரு வாக்கியம்"
+
+
+async def test_people_nouns_reverse_map_to_clean_english():
+    """'applicant'/'candidate'/'job seeker' typed in Tamil/Hindi reverse-map to clean
+    English (no LLM), so an employer typing 'விண்ணப்பதாரர்' reaches View Candidates
+    instead of a junk-translated failed search."""
+    assert i18n.from_glossary("விண்ணப்பதாரர்", "ta") == "applicant"
+    assert i18n.from_glossary("வேட்பாளர்", "ta") == "candidate"
+    assert i18n.from_glossary("वेலை தேடுபவர்", "ta") in (None, "job seeker")  # tolerant
+    assert i18n.from_glossary("वेलै தேடுபவர்", "ta") in (None, "job seeker")
+    assert i18n.from_glossary("வேலை தேடுபவர்", "ta") == "job seeker"
+    assert i18n.from_glossary("आवेदक", "hi") in ("applicant", "applicants")
+    assert i18n.from_glossary("उम्मीदवार", "hi") in ("candidate", "candidates")
+
+
+def test_t_deterministic_glossary_translation():
+    """i18n.t() translates fixed strings via the glossary with NO LLM — the basis for
+    rendering the candidate card reliably (no flaky English) in the user's language."""
+    assert i18n.t("*Candidates available* 👥", "ta") == "*கிடைக்கும் வேட்பாளர்கள்* 👥"
+    assert i18n.t("Experience not specified", "ta") == "அனுபவம் குறிப்பிடப்படவில்லை"
+    assert i18n.t("Freshers", "hi") == "फ्रेशर्स"
+    assert i18n.t("years", "ta") == "ஆண்டுகள்"
+    assert i18n.t("Some Unknown Phrase", "ta") == "Some Unknown Phrase"   # not in glossary → original
+    assert i18n.t("anything", "en") == "anything"                        # English → no-op
+
+
+def test_inject_form_i18n_builds_translator_map():
+    """inject_form_i18n adds a client-side translator + a map of fixed form labels
+    (from the glossary/warmed cache) before </body>; English / unsupported is a no-op;
+    only catalog strings are mapped (user data is never touched)."""
+    i18n._cache_put(("Company name", "ta"), "நிறுவனப் பெயர்")
+    i18n._cache_put(("Email", "ta"), "மின்னஞ்சல்")
+    html = "<html><body><form><label>Company name</label></form></body></html>"
+    out = i18n.inject_form_i18n(html, "ta")
+    assert "__FORMI18N__" in out and "நிறுவனப் பெயர்" in out
+    assert out.endswith("</body></html>")                    # injected before </body>
+    # the catalog is registered for warming, and English / unknown lang are no-ops
+    assert "Company name" in i18n._FORM_STRINGS
+    assert i18n.inject_form_i18n(html, "en") == html
+    assert i18n.inject_form_i18n(html, "fr") == html
+
+
+async def test_translate_many_no_perstring_storm_on_api_error():
+    """An API error (e.g. a 429 rate limit) on the batch must NOT trigger a per-string
+    fallback storm (that only multiplies the rate-limit hits). One batch attempt,
+    zero per-string calls, originals kept. (A malformed-JSON batch still falls back —
+    test_translate_many_falls_back_per_string_on_bad_batch.)"""
+    class _RateLimited:
+        def __init__(self): self.batch = 0; self.singles = 0
+        async def chat(self, *, purpose, messages, **kw):
+            if purpose == "translate_out":
+                self.batch += 1
+                raise RuntimeError("429 Too Many Requests")
+            self.singles += 1
+            raise RuntimeError("429")
+
+    i18n._CACHE.clear()
+    llm = _RateLimited()
+    # non-glossary strings so the LLM batch path is exercised (glossary terms skip it)
+    texts = ["Welcome to the team", "How can I help you today", "See you soon"]
+    out = await i18n.translate_many(llm, texts, to_lang="ta")
+    assert out == texts                                  # originals kept
+    assert llm.batch == 1 and llm.singles == 0           # no per-string amplification

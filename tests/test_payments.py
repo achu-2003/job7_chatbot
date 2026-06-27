@@ -32,6 +32,42 @@ def test_verify_signature_good_and_bad(monkeypatch):
     assert not rzp.verify_payment_signature(order_id="order_1", payment_id="pay_1", signature="")
 
 
+async def test_verify_payment_requires_captured_status(monkeypatch):
+    """verify_payment confirms the payment actually succeeded — a valid signature is
+    NOT enough. captured/authorized pass; failed/created and order/amount mismatch
+    are rejected; an unreachable Razorpay fails closed."""
+    monkeypatch.setattr(get_settings(), "razorpay_key_id", "rzp_test_x")
+    monkeypatch.setattr(get_settings(), "razorpay_key_secret", "shhh-secret")
+    sig = hmac.new(b"shhh-secret", b"order_1|pay_1", hashlib.sha256).hexdigest()
+
+    def _fetch(returns=None, boom=False):
+        async def _f(pid):
+            if boom:
+                raise rzp.RazorpayError("down")
+            return returns
+        return _f
+
+    async def ok(status, **extra):
+        monkeypatch.setattr(rzp, "fetch_payment",
+                            _fetch({"status": status, "order_id": "order_1", "amount": 99900, **extra}))
+        return await rzp.verify_payment(order_id="order_1", payment_id="pay_1", signature=sig,
+                                        expected_amount_paise=99900)
+
+    assert (await ok("captured")) == (True, "ok")
+    assert (await ok("authorized")) == (True, "ok")
+    assert (await ok("failed")) == (False, "not_captured")
+    assert (await ok("created")) == (False, "not_captured")
+    assert (await ok("captured", order_id="order_OTHER")) == (False, "order_mismatch")
+    assert (await ok("captured", amount=100)) == (False, "amount_mismatch")
+    # bad signature is rejected before any fetch
+    assert (await rzp.verify_payment(order_id="order_1", payment_id="pay_1",
+                                     signature="nope")) == (False, "bad_signature")
+    # Razorpay unreachable → fail closed (do NOT grant)
+    monkeypatch.setattr(rzp, "fetch_payment", _fetch(boom=True))
+    assert (await rzp.verify_payment(order_id="order_1", payment_id="pay_1",
+                                     signature=sig)) == (False, "fetch_failed")
+
+
 def test_subscribe_page_renders_plans_and_checkout():
     out = _subscribe_html("tok123", _PLANS, key_id="rzp_test_x", test_mode=True,
                           prefill_name="Asha", prefill_phone="919876543210", current_type="FREE")
@@ -153,7 +189,10 @@ async def test_buy_credits_records_live_purchase_when_flag_on(monkeypatch):
     from app.config import get_settings
     import types
     monkeypatch.setattr(get_settings(), "credits_purchase_in_db", True)
-    monkeypatch.setattr(emp.rzp, "verify_payment_signature", lambda **k: True)
+
+    async def _ok_verify(**k):
+        return True, "ok"
+    monkeypatch.setattr(emp.rzp, "verify_payment", _ok_verify)
 
     async def _noop(*a, **k):
         return None
@@ -182,6 +221,43 @@ async def test_buy_credits_records_live_purchase_when_flag_on(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["employer_id"] == "emp1" and calls[0]["bundle"]["id"] == "b1"
     assert calls[0]["grants"] == {"job": 2, "unlock": 60, "boost": 2} and calls[0]["price"] == 1999.0
+
+
+async def test_failed_payment_grants_no_credits(monkeypatch):
+    """A payment that didn't actually succeed on Razorpay (status not captured) is
+    rejected by verify — NO credits granted, NO purchase recorded. Guards against
+    'payment failed but chatbot shows credits purchased'."""
+    import app.api.routes.employer as emp
+    import json as _j
+
+    async def _not_captured(**k):
+        return False, "not_captured"
+    monkeypatch.setattr(emp.rzp, "verify_payment", _not_captured)
+
+    granted = []
+
+    async def fake_grant(*a, **k):
+        granted.append((a, k))
+        return {"job": 99, "unlock": 99, "boost": 99}
+    recorded = []
+
+    async def fake_record(**k):
+        recorded.append(k)
+        return {"committed": True}
+
+    mem = _StubMem(employer_id="emp1", pending={
+        "kind": "buy_credits", "token": "t", "phone": "919876543210", "tenant_id": "t1",
+        "grant": {"job": 2}, "label": "Growth", "item": "bundle:b1", "price": 1999.0,
+        "employer_id": "emp1"})
+    monkeypatch.setattr(mem, "grant_credits", fake_grant, raising=False)
+    monkeypatch.setattr(emp.CreditWalletRepository, "record_purchase", staticmethod(fake_record))
+
+    req = _ReqJSON({"razorpay_order_id": "order_1", "razorpay_payment_id": "pay_failed",
+                    "razorpay_signature": "sig"}, mem)
+    out = await emp.buy_credits_verify(req)
+    assert out.status_code == 402                       # not completed
+    assert _j.loads(out.body)["error"] == "not_captured"
+    assert granted == [] and recorded == []             # nothing granted / recorded
 
 
 async def test_wallet_ledger_records_transactions():

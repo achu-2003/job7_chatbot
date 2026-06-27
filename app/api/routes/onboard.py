@@ -37,6 +37,7 @@ from app.db.repositories import (
 )
 from app.onboarding import build_application_record, prepare_registration
 from app.validation import MAX_RESUME_BYTES, valid_resume_filename, validate_registration
+from app import i18n
 from app.whatsapp import localize as wa_localize
 
 # The /onboard form is the SEEKER lane (the employer side has its own form), so
@@ -187,9 +188,11 @@ async def onboarding_form(request: Request, token: str = Query(default="")) -> H
     if not identity:
         return HTMLResponse(_expired_html(), status_code=404)
     opts = await _load_options()
-    return HTMLResponse(
-        _form_html(token, identity.get("name") or "", identity.get("customer_id") or "", opts)
-    )
+    html = _form_html(token, identity.get("name") or "", identity.get("customer_id") or "", opts)
+    lang = "en"
+    if get_settings().multilang_enabled:
+        lang = await wa_localize.user_lang(identity.get("tenant_id"), identity.get("customer_id"))
+    return HTMLResponse(i18n.inject_form_i18n(html, lang))
 
 
 @router.post("/submit", response_class=HTMLResponse)

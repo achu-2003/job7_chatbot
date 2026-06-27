@@ -82,9 +82,17 @@ _ORDER_HINT_RX = re.compile(
     r"my\s+app|app[-_]?\w*|interview\w*|offer)\b",
     re.IGNORECASE,
 )
-# Pure greeting → fixed reply, 0 LLM.
+# Pure greeting → fixed reply, 0 LLM. Tolerates repeated letters ("hiii", "helloo"),
+# common variants ("wassup", "hiya", "namaskaram", "vanakkam"), AND a single trailing
+# address word ("hi there", "hello sir", "good morning team") — but NOT a greeting
+# followed by a real request ("hi i need a welder"), which stays a normal message.
 _GREETING_RX = re.compile(
-    r"^\s*(hi+|hello+|hey+|yo|namaste|good\s*(morning|afternoon|evening))[\s!.?]*$",
+    r"^\s*(hi+|hello+|helo+|hey+|hiya+|yo+|sup|wass?up|what'?s\s*up|"
+    r"namaste|namaskar(am)?|vanakkam|greetings?|"
+    r"good\s*(morning|afternoon|evening|day|noon))"
+    r"(\s+(there|sir|sirs|madam|ma'?am|maam|team|all|guys|bro|buddy|mate|"
+    r"friend|frnd|everyone|folks|dear|jobs7))?"
+    r"[\s!.?,]*$",
     re.IGNORECASE,
 )
 # Farewell / "that's all" → fixed reply + reset the session memory.
@@ -135,12 +143,39 @@ _MENU_STATUS_RX = re.compile(
 # legit job search like "post office jobs" or "pricing analyst".
 _SEEKER_EMPLOYER_INTENT_RX = re.compile(
     r"\b(post|create|publish|advertise)\s+(a\s+|an\s+|new\s+|the\s+)?(jobs?|vacanc(y|ies)|openings?|positions?)\b"
-    r"|\b(view|see|find|browse|show|unlock)\b[\w\s]*\bcandidates?\b"
+    r"|\b(view|see|find|browse|show|unlock|list|get)\b[\w\s]*\b(candidates?|applicants?)\b"
+    # bare "candidates"/"applicants" — a seeker asking to view candidates/applicants
+    # is employer intent (it's never a job a seeker searches for) → lane-switch hint.
+    r"|^\s*(candidates?|applicants?)\s*[!.?]*$"
     r"|\bbuy\b[\w\s]*\bcredits?\b|\bcredits?\s+(plan|pack|bundle)s?\b|\bcredits?\s*(&|and)?\s*wallet\b"
     r"|\b(my\s+)?posted\s+jobs?\b|\bmanage\s+(my\s+)?jobs?\b|\bemployer\s+(login|side|mode|account)\b"
     r"|\bi\s*(a?m|'?m)\s+(an?\s+)?(employer|recruiter)\b|^\s*(employer|recruiter)\s*[!.?]*$",
     re.IGNORECASE,
 )
+
+
+# Fixed lane-hint / guidance bodies. Defined as constants (not inline) so they can
+# be REGISTERED for startup translation-warming — pre-translated into every language
+# so a non-English user reliably gets them in their language (see i18n.warm_cache),
+# instead of an occasional English body when a per-turn translation hiccups.
+_LANE_HINT_SEEKER = (
+    "🙋 You're on the *Job Seeker* side — this is for finding and applying "
+    "to jobs.\n\n"
+    "Want to *post jobs* or *hire* candidates? Type *switch* to move to the "
+    "Employer side.\n\nOr pick a job-seeker option below."
+)
+_LANE_HINT_EMPLOYER = (
+    "🙋 You're on the *Employer* side — this is for posting jobs and "
+    "viewing candidates.\n\n"
+    "Looking for a job *yourself*? Type *switch* to move to the Job Seeker "
+    "side.\n\nOr pick an employer option below."
+)
+_EMP_SEARCH_GUIDANCE = (
+    "🔎 I search candidates by *role* or *skill* — for example "
+    "“welder”, “sales executive”, “python developer” or “data entry”.\n\n"
+    "What role are you hiring for? Or pick an option below."
+)
+i18n.register_warm_strings([_LANE_HINT_SEEKER, _LANE_HINT_EMPLOYER, _EMP_SEARCH_GUIDANCE])
 
 
 def _menu_buttons_message(body: str) -> dict[str, Any]:
@@ -242,7 +277,10 @@ _EMP_MENU_RX = re.compile(r"^\s*(menu|back|go\s*back|home|main(\s*menu)?|options
 # View Candidates — words about candidates/applicants/seekers (NOT bare role words,
 # so a skill search like "application developer" / "talent acquisition" stays a search).
 _EMP_VIEW_RX = re.compile(
-    r"\b(view|see|show|browse|find|get|all|list|search|display|check)\b.*"
+    # an intent verb (incl. "want/need/looking for" — an employer asking for talent)
+    # + a candidate noun → View Candidates.
+    r"\b(view|see|show|browse|find|get|all|list|search|display|check|want|need|"
+    r"require|give|send|fetch|looking\s+for)\b.*"
     r"\b(candidates?|applicants?|job\s*seekers?|seekers?|profiles?|applications?)\b"
     r"|^\s*(candidates?|applicants?|job\s*seekers?|seekers?)\s*$"
     r"|\bwho\s+(applied|has\s+applied)\b",
@@ -281,24 +319,30 @@ _EMP_BUY_RX = re.compile(
 _EMP_WALLET_RX = re.compile(
     # ``bal[ae]nce`` tolerates the common "balence" misspelling; "check … credit/
     # balance/wallet" covers natural phrasings like "i want to check credit balance".
-    r"\b(wallet|bal[ae]nce)\b|\b(credit|transaction)\s*history\b|\bmy\s+credits?\b"
+    # ``recharge`` is included because the "Credits & Wallet" menu label translates
+    # to / back from "Credits and Recharge" in other languages — typing it must reach
+    # the wallet, not a candidate search. (Bare "recharge" → Buy, matched earlier.)
+    r"\b(wallets?|bal[ae]nce|recharge)\b|\b(credit|transaction)\s*history\b|\bmy\s+credits?\b"
     r"|\b(remaining|available|left|current)\s+credits?\b|\bhow\s+many\s+credits?\b"
-    r"|\bcheck\b.*\b(credits?|bal[ae]nce|wallet)\b|\bcredits?\s*(&|and)\s*wallet\b",
+    r"|\bcheck\b.*\b(credits?|bal[ae]nce|wallets?)\b|\bcredits?\s*(&|and)\s*(wallets?|recharge)\b",
     re.IGNORECASE,
 )
 # JOB-SEEKER intents typed while in the EMPLOYER lane (e.g. "apply job",
 # "search for a job", "application status") — these aren't candidate searches, so
 # we explain the lane and offer to switch instead of returning empty results.
 _EMP_SEEKER_INTENT_RX = re.compile(
+    # The trailing ``(?!\s*seekers?\b)`` means "job(s)" followed by "seeker(s)" is
+    # NOT a seeker intent — "i want job seekers" is the EMPLOYER asking for
+    # candidates (→ View Candidates), not a job search.
     r"\bapply\b"
-    r"|\b(search|searching|find|finding|want|need|looking|get|browse)\b.*\bjobs?\b"
+    r"|\b(search|searching|find|finding|want|need|looking|get|browse)\b.*\bjobs?\b(?!\s*seekers?\b)"
     # "show me jobs" / "view jobs" — but NOT "show MY jobs" (the employer's own
     # listings; strict spacing means 'my'/'posted' won't match) and NOT "view job
     # SEEKERS" (that's the employer asking for candidates → View Candidates).
     r"|\b(show|see|view)\s+(me\s+|the\s+|any\s+|some\s+|available\s+)?jobs?\b(?!\s*seekers?\b)"
     r"|\bjobs?\s+for\s+me\b|\bjob\s*search\b|\b(find|looking\s+for)\s+work\b"
     r"|\bapplication\s*status\b|\bmy\s+applications?\b|\brecommend(ed)?\s+jobs?\b"
-    r"|\b(i\s+am|i'?m)\s+a\s+(job\s*)?seeker\b|\bi\s+want\s+(a\s+)?jobs?\b",
+    r"|\b(i\s+am|i'?m)\s+a\s+(job\s*)?seeker\b|\bi\s+want\s+(a\s+)?jobs?\b(?!\s*seekers?\b)",
     re.IGNORECASE,
 )
 
@@ -922,12 +966,17 @@ class AgentRuntime:
         Everything else (incl. "Application Status") returns ``{}`` to fall
         through to the browse → planner pipeline that already handles it.
         """
+        # A TAP carries its language-independent button id — route on that first so it
+        # works in any language (the tapped TITLE arrives untranslated, e.g. the Tamil
+        # "வேலை தேடல்", which the English text matchers below would miss). Typed text
+        # still falls through to the regex matchers.
+        bid = state.get("button_id") or ""
         text = state.get("inbound_text", "") or ""
-        if _MENU_SEARCH_RX.match(text):
+        if bid == "menu_search" or _MENU_SEARCH_RX.match(text):
             return await self._category_menu(state)
-        if _MENU_RECOMMEND_RX.match(text):
+        if bid == "menu_recommend" or _MENU_RECOMMEND_RX.match(text):
             return await self._recommend_menu(state)
-        if _MENU_STATUS_RX.search(text):
+        if bid == "menu_status" or _MENU_STATUS_RX.search(text):
             handled = await self._status_menu(state)
             if handled:
                 return handled
@@ -939,12 +988,7 @@ class AgentRuntime:
         """The user is on the JOB-SEEKER side but typed an employer request (e.g.
         'post job' / 'credits plan' / 'view candidates'). Explain the lane + how
         to switch."""
-        body = (
-            "🙋 You're on the *Job Seeker* side — this is for finding and applying "
-            "to jobs.\n\n"
-            "Want to *post jobs* or *hire* candidates? Type *switch* to move to the "
-            "Employer side.\n\nOr pick a job-seeker option below."
-        )
+        body = _LANE_HINT_SEEKER
         return {
             "intent": "lane_hint", "did_menu": True, "used_llm": False,
             "single_bubble": True, "draft_response": body,
@@ -1361,11 +1405,7 @@ class AgentRuntime:
         # anything else (filler, junk) gets a guidance nudge instead of a literal
         # "No candidates found matching <word>" search.
         if not _is_searchable_role(q):
-            body = (
-                "🔎 I search candidates by *role* or *skill* — for example "
-                "“welder”, “sales executive”, “python developer” or “data entry”.\n\n"
-                "What role are you hiring for? Or pick an option below."
-            )
+            body = _EMP_SEARCH_GUIDANCE
             return self._creator_reply(body, interactive=_emp_menu(body))
         return await self._employer_search_candidates(state, emp, q)
 
@@ -1374,12 +1414,7 @@ class AgentRuntime:
     ) -> dict[str, Any]:
         """The user is on the EMPLOYER side but typed a job-seeker request (e.g.
         'apply job' / 'search for a job'). Explain the lane + how to switch."""
-        body = (
-            "🙋 You're on the *Employer* side — this is for posting jobs and "
-            "viewing candidates.\n\n"
-            "Looking for a job *yourself*? Type *switch* to move to the Job Seeker "
-            "side.\n\nOr pick an employer option below."
-        )
+        body = _LANE_HINT_EMPLOYER
         return self._creator_reply(body, interactive=_emp_menu(body))
 
     async def _employer_action(
@@ -1455,20 +1490,48 @@ class AgentRuntime:
         return (c.get("experience_level") or "Experience not specified")
 
     @staticmethod
+    def _resolved_lang(state: AgentState) -> str:
+        """The user's language for THIS turn: detected from the message, else the
+        remembered language (for a button tap whose label had no script)."""
+        lang = state.get("inbound_lang") or "en"
+        if lang == "en":
+            lang = ((state.get("customer_facts") or {}).get("lang")) or "en"
+        return lang
+
+    @staticmethod
+    def _localize_experience(exp: str, lang: str) -> str:
+        """Localize an experience value deterministically: whole-value glossary
+        ('Freshers' / 'Experience not specified'), else just the time-unit words
+        ('1-2 Years' → '1-2 ஆண்டுகள்') so the numbers are preserved."""
+        if lang == "en" or not exp:
+            return exp
+        whole = i18n.t(exp, lang)
+        if whole != exp:
+            return whole
+        return re.sub(r"(?i)\b(years?|months?)\b",
+                      lambda m: i18n.t(m.group(0).lower(), lang), exp)
+
+    @staticmethod
     def _fmt_list(values: Any, n: int) -> str:
         items = [str(v).strip() for v in (values or []) if str(v).strip()]
         return ", ".join(items[:n])
 
     def _render_candidates(
         self, emp: dict[str, Any], cands: list[dict[str, Any]], *,
-        header_masked: str, header_full: str,
+        header_masked: str, header_full: str, lang: str = "en",
     ) -> dict[str, Any]:
         """Tiered candidate render. Role + skills are shown in BOTH tiers (they're
         not contact data). Tier 1 (verified, not paid) stops there + an Unlock
         button; Tier 2 (paid) also reveals phone / email / location. Masking
-        happens HERE so locked fields never leave the server."""
+        happens HERE so locked fields never leave the server.
+
+        The fixed scaffolding (header, experience labels, lock footer, unlock button)
+        is localized DETERMINISTICALLY from the glossary here — names/roles/skills
+        stay as-is — and the result is flagged ``localized`` so the outbound LLM pass
+        skips it. This makes a Tamil/Hindi candidate list reliable (no flaky English),
+        which a per-turn wholesale translation of this big mixed block can't be."""
         paid = bool(emp.get("paid"))
-        lines = [header_full if paid else header_masked, ""]
+        lines = [header_full if paid else header_masked, ""]   # callers pass them localized
         # Each field is flush-left (no leading-space indent): WhatsApp doesn't keep
         # a hanging indent, so an indented long list wraps back to the margin and
         # looks ragged. A thin divider separates candidates for a clean, scannable
@@ -1476,7 +1539,8 @@ class AgentRuntime:
         divider = "──────────────"
         total = len(cands)
         for i, c in enumerate(cands, 1):
-            lines.append(f"*{i}. {c.get('full_name')}*  ·  {self._candidate_experience(c)}")
+            exp = self._localize_experience(self._candidate_experience(c), lang)
+            lines.append(f"*{i}. {c.get('full_name')}*  ·  {exp}")
             roles = self._fmt_list(c.get("roles"), 3)
             if roles:
                 lines.append(f"💼 {roles}")
@@ -1494,23 +1558,27 @@ class AgentRuntime:
             if i < total:                       # divider between cards, not after the last
                 lines.append(divider)
         if paid:
-            return self._creator_reply("\n".join(lines).rstrip())
+            out = self._creator_reply("\n".join(lines).rstrip())
+            out["localized"] = True                 # scaffolding already in the user's language
+            return out
         lines.append("")
         # Tier 1 — role/skills shown, but contact + resume locked. Unlocking is
         # handled on the Jobs7 employer portal (not an in-chat payment), so the
         # button opens that site directly.
-        lines += [
+        lines += [i18n.t(
             "🔒 Contact details and resume are locked. Unlock the full profiles — "
-            "phone, email & resume — on the Jobs7 employer portal.",
-        ]
+            "phone, email & resume — on the Jobs7 Employer app.", lang)]
         body = "\n".join(lines)
-        interactive = self._unlock_interactive(body)
+        interactive = self._unlock_interactive(body, lang=lang)
         if interactive:
-            return self._creator_reply(body, interactive=interactive)
-        portal = get_settings().employer_portal_url
-        return self._creator_reply(f"{body}\n\n🔓 Unlock here: {portal}")
+            out = self._creator_reply(body, interactive=interactive)
+        else:
+            portal = get_settings().employer_portal_url
+            out = self._creator_reply(f"{body}\n\n🔓 Unlock here: {portal}")
+        out["localized"] = True
+        return out
 
-    def _unlock_interactive(self, body: str) -> dict[str, Any] | None:
+    def _unlock_interactive(self, body: str, *, lang: str = "en") -> dict[str, Any] | None:
         """A CTA-URL button that opens the employer portal to unlock full
         candidate details. Returns None for a non-https portal (Meta rejects
         cta_url with http/localhost) so callers fall back to an inline link."""
@@ -1518,7 +1586,7 @@ class AgentRuntime:
         if not portal.startswith("https://"):
             return None
         return wa.cta_url_message(
-            body=body, display_text="🔓 Unlock details", url=portal,
+            body=body, display_text=i18n.t("🔓 Unlock details", lang), url=portal,
         )
 
     async def _employer_view_candidates(
@@ -1531,10 +1599,11 @@ class AgentRuntime:
                 "No candidates are available right now — I'll have fresh profiles for "
                 "you soon. 👍"
             )
+        lang = self._resolved_lang(state)
         return self._render_candidates(
-            emp, cands,
-            header_masked="*Candidates available* 👥",
-            header_full="*Candidates — full details unlocked* 🔓",
+            emp, cands, lang=lang,
+            header_masked=i18n.t("*Candidates available* 👥", lang),
+            header_full=i18n.t("*Candidates — full details unlocked* 🔓", lang),
         )
 
     async def _employer_search_candidates(
@@ -1543,16 +1612,18 @@ class AgentRuntime:
         """Stage 5 — candidate search by skill / role / category. Same tiered
         masking as the full list; an empty result nudges back to the menu."""
         cands = await self._search_candidates(query=query, limit=8)
+        lang = self._resolved_lang(state)
         if not cands:
             body = (
                 f"No candidates found matching *{query}*. Try another skill or role "
                 "(e.g. “welder”, “sales”, “python”), or tap Menu."
             )
             return self._creator_reply(body, interactive=_emp_menu(body))
+        m = i18n.t("candidates matching", lang)        # glossary-localized prefix + raw query
         return self._render_candidates(
-            emp, cands,
-            header_masked=f"*Candidates matching “{query}”* 👥",
-            header_full=f"*Candidates matching “{query}” — full details* 🔓",
+            emp, cands, lang=lang,
+            header_masked=f'*{m}: “{query}”* 👥',
+            header_full=f'*{m}: “{query}”* 🔓',
         )
 
     async def _employer_unlock(self, state: AgentState, emp: dict[str, Any]) -> dict[str, Any]:
@@ -1563,8 +1634,8 @@ class AgentRuntime:
             return await self._employer_view_candidates(state, emp)
         body = (
             "🔓 *Unlock full candidate details*\n\n"
-            "View contact info, resumes and complete profiles on the Jobs7 employer "
-            "portal."
+            "View contact info, resumes and complete profiles on the Jobs7 Employer "
+            "app."
         )
         interactive = self._unlock_interactive(body)
         if interactive:
@@ -2011,8 +2082,9 @@ class AgentRuntime:
             setter(tr)
 
     async def _persist_lang(self, phone: str | None, tenant_id: str, lang: str) -> None:
-        """Remember the user's language (from their last typed message) so a later
-        button-tap turn — which has no text to detect — still replies in it."""
+        """Remember the user's language (from their last typed message OR a tapped
+        button whose label revealed it) so a later turn with no language to detect —
+        e.g. an emoji/id-only tap — still replies in it."""
         if not phone:
             return
         try:
@@ -2077,20 +2149,26 @@ class AgentRuntime:
             used_llm=final.get("used_llm"),
             latency_ms=final.get("latency_ms"),
         )
-        # Multilingual outbound: reply in the user's CURRENT language. A typed turn
-        # uses the language detected from this message; a button tap (no text to
-        # detect) uses the language remembered from the last typed message. Persist
-        # on EVERY typed turn — including English — so switching back to English
-        # resets the stored language and later button taps follow it (no sticky lang).
+        # Multilingual outbound: reply in the language of the user's CURRENT action.
+        # A typed turn uses the language detected from this message. For a button TAP
+        # the tapped label arrives as ``customer_query`` — if it carries a language
+        # (e.g. a Tamil-labelled button), reply in THAT language, matching what the
+        # user just tapped; only fall back to the remembered language when the label
+        # has none (emoji/id-only). Then persist whenever the resolved language differs
+        # from what's stored — so the conversation follows the most recent action and a
+        # switch back to English (typed or tapped) resets it (no sticky language).
         if get_settings().multilang_enabled:
+            stored = ((final.get("customer_facts") or {}).get("lang")) or "en"
             if interactive_id:
-                user_lang = ((final.get("customer_facts") or {}).get("lang")) or "en"
-            if i18n.is_supported(user_lang) and user_lang != "en":
+                tapped_lang = i18n.detect_lang(customer_query)
+                user_lang = tapped_lang if tapped_lang != "en" else stored
+            # Skip the wholesale LLM pass for a response already localized
+            # deterministically (e.g. the candidate card) — re-translating it would
+            # only risk flaking it back toward English.
+            if i18n.is_supported(user_lang) and user_lang != "en" and not final.get("localized"):
                 await self._localize_outputs(final, user_lang)
-            if not interactive_id and i18n.is_supported(user_lang):
-                stored = ((final.get("customer_facts") or {}).get("lang")) or "en"
-                if user_lang != stored:          # only write when it actually changes
-                    await self._persist_lang(customer_external_id, tid, user_lang)
+            if i18n.is_supported(user_lang) and user_lang != stored:
+                await self._persist_lang(customer_external_id, tid, user_lang)
         return {
             # ChatResponse-compatible (HTTP chat endpoint)
             "request_id": request_id,

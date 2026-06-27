@@ -683,11 +683,15 @@ def test_seeker_employer_intent_matches():
     from app.agent import runtime as r
     for q in ("post job", "post a job", "create a job", "credits plan", "buy credits",
               "view candidates", "find candidates", "list my posted jobs", "my posted jobs",
-              "manage my jobs", "employer", "i am an employer", "i am a recruiter"):
+              "manage my jobs", "employer", "i am an employer", "i am a recruiter",
+              # bare applicant/candidate — employer terms, not a seeker job search
+              "applicant", "applicants", "candidate", "candidates", "show me applicants"):
         assert r._SEEKER_EMPLOYER_INTENT_RX.search(q), q
     for q in ("job search", "find jobs", "post office jobs", "postman jobs", "pricing analyst",
               "application status", "recommended jobs", "i want to apply for a job", "hi",
-              "data entry jobs", "jobs in chennai", "python developer"):
+              "data entry jobs", "jobs in chennai", "python developer",
+              # roles that merely CONTAIN applicant/candidate must NOT be hijacked
+              "applicant tracking system admin", "candidate experience manager"):
         assert not r._SEEKER_EMPLOYER_INTENT_RX.search(q), q
 
 
@@ -748,7 +752,11 @@ def test_employer_typed_intent_routing():
               "recharge", "top up", "credit packs"):
         assert route(q) == "buy", q
     for q in ("wallet", "balance", "my credits", "credit history", "how many credits",
-              "remaining credits", "check my balance"):
+              "remaining credits", "check my balance",
+              # the "Credits & Wallet" menu label translates to/from "Credits and
+              # Recharge" in other languages — typing it must reach the wallet, not search
+              "credits and recharge", "Credits and Recharge", "credits & wallet",
+              "credits and wallet"):
         assert route(q) == "wallet", q
     for q in ("upgrade plan", "plans", "subscribe", "membership"):
         assert route(q) == "plans", q
@@ -788,16 +796,37 @@ def test_is_searchable_role_guard():
         assert not r._is_searchable_role(bad), bad
 
 
+def test_greeting_rx_tolerates_variants():
+    """Greetings are recognized despite repeated letters ("hiii"), common variants
+    ("wassup", "hiya"), and a trailing address word ("hi there", "hello sir") — so
+    they open the menu, NOT a candidate search. But a greeting followed by a real
+    request ("hi i need a welder") is NOT a bare greeting."""
+    from app.agent import runtime as r
+    for g in ("hi", "hiii", "hello", "helloo", "hey", "heyy", "yo", "hiya", "sup",
+              "wassup", "what's up", "greetings", "namaste", "vanakkam",
+              "hi there", "hii there", "hello sir", "hey bro", "good morning team",
+              "good evening", "HELLO!", "hii."):
+        assert r._GREETING_RX.match(g), g
+    # must NOT swallow real messages that merely start with / contain a greeting word
+    for ng in ("hi i need a welder", "hello i want to post a job", "your company",
+               "good developers", "sales executive", "yoga instructor"):
+        assert not r._GREETING_RX.match(ng), ng
+
+
 def test_employer_credit_balance_phrasing_routes_to_wallet():
     """Natural 'check credit balance' phrasings (incl. the 'balence' typo) route to
     the Credits & Wallet page — not a bogus candidate search."""
     from app.agent import runtime as r
     for q in ("i want to check credit balence", "check credit balance",
               "check my balance", "credit balance", "balence", "my credits",
-              "how many credits", "remaining credits"):
+              "how many credits", "remaining credits",
+              # "credits & wallet" + the "and"/recharge/plural variants a (mis)translation
+              # of the Tamil label can produce — must still reach the wallet, not search
+              "credits and wallet", "credits & wallets", "credits and recharge", "wallets"):
         assert r._EMP_WALLET_RX.search(q), q
-    # a real role that merely contains 'credit' is NOT swallowed by the wallet matcher
+    # real roles that merely contain 'credit'/'wall' are NOT swallowed by the matcher
     assert not r._EMP_WALLET_RX.search("credit analyst")
+    assert not r._EMP_WALLET_RX.search("wall painter")
 
 
 async def test_employer_lane_word_shows_menu_not_search():
@@ -854,7 +883,27 @@ async def test_view_candidates_masked_until_paid():
     # Unlock is a CTA-URL button that opens the employer portal (not in-chat pay)
     action = out["whatsapp_interactive"]["interactive"]["action"]
     assert "Unlock" in action["parameters"]["display_text"]
-    assert action["parameters"]["url"] == "https://employer.jobs7.in/"
+    assert action["parameters"]["url"] == "https://play.google.com/store/apps/details?id=in.jobs7.employer"
+
+
+async def test_typed_want_job_seeker_routes_to_candidates():
+    """An employer TYPING a talent-intent phrase ("i want job seeker", "applicant",
+    "i need candidates") opens View Candidates — NOT the seeker-lane switch hint
+    (the 'want…job' inside 'job seeker' must not be read as a job search)."""
+    for phrase in ["i want job seeker", "i want job seekers", "applicant",
+                   "i need candidates", "looking for candidates"]:
+        rt = _runtime()
+        _stub_memory(
+            rt, facts={"lane": "creator"}, onboarded=False, employer=_employer(paid=False),
+            candidates=[{"full_name": "Rahul", "experience_level": "2-3 years",
+                         "phone": "9990001111", "email": "rahul@x.com", "city": "Chennai"}],
+        )
+        rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+        out = await _handle(rt, phrase)
+        body = out["response"]
+        assert "Rahul" in body, f"{phrase!r} did not open candidates: {body[:80]}"
+        assert "switch" not in body.lower(), f"{phrase!r} wrongly showed the lane hint"
+        assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
 
 
 async def test_payment_unlocks_full_candidate_details():
@@ -910,7 +959,7 @@ async def test_employer_text_search_by_skill_masked():
     # Unlock → CTA-URL button opening the employer portal
     action = out["whatsapp_interactive"]["interactive"]["action"]
     assert "Unlock" in action["parameters"]["display_text"]
-    assert action["parameters"]["url"] == "https://employer.jobs7.in/"
+    assert action["parameters"]["url"] == "https://play.google.com/store/apps/details?id=in.jobs7.employer"
 
 
 async def test_employer_text_search_full_when_paid():
@@ -991,6 +1040,28 @@ async def test_job_search_button_shows_category_list():
     assert "69 open jobs" in out["response"]                # text fallback
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []   # 0 LLM
     assert len(out["delivery_plan"]) == 1                   # single bubble
+
+
+async def test_menu_search_tap_routes_by_id_in_any_language():
+    """Tapping 'Job Search' routes by its language-independent id (menu_search), so a
+    Tamil-labelled tap ('வேலை தேடல்', which arrives untranslated) still reaches the
+    category list — not a wrong fallback. Fixes 'tap Job Search in Tamil → wrong
+    response, but typing it works'."""
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Asha", "lane": "seeker"}, overview={
+        "total_open_jobs": 20,
+        "categories": [{"category": "Information Technology", "count": 3},
+                       {"category": "Administration", "count": 2}],
+    })
+    rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
+    out = await _handle(rt, "வேலை தேடல்", interactive_id="menu_search")
+    interactive = out["whatsapp_interactive"]["interactive"]
+    assert interactive["type"] == "list"                     # the category list, not a search
+    rows = interactive["action"]["sections"][0]["rows"]
+    # row IDs are language-independent (titles may be localized) — reached category_menu
+    assert [r["id"] for r in rows] == [
+        "category:Information Technology", "category:Administration"]
+    assert rt.llm.json_calls == []                            # routing is 0-LLM (deterministic)
 
 
 async def test_recommended_jobs_button_lists_profile_matches():
@@ -1678,5 +1749,21 @@ async def test_typing_tamil_sets_language(monkeypatch):
     _stub_memory(rt, facts={"full_name": "Asha", "lane": "seeker"})   # no lang yet -> 'en'
     rt.llm = _FakeLLM(plans=[], reply="ok")
     await _handle(rt, "ஆய்")                          # typed Tamil
+    assert any(c.get("key") == "lang" and c.get("value") == "ta"
+               for c in rt._test_facts)               # type: ignore[attr-defined]
+
+
+async def test_tapping_localized_button_replies_in_its_language(monkeypatch):
+    """Tapping a button whose LABEL is in the user's language (the tapped title
+    arrives as the message text) replies in THAT language and updates the stored
+    language — even when stored was English. Fixes 'tapped a Tamil button after an
+    English message but got an English reply'."""
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "multilang_enabled", True)
+    rt = _runtime()
+    _stub_memory(rt, facts={"full_name": "Asha", "lane": "seeker", "lang": "en"})  # stored English
+    rt.llm = _FakeLLM(plans=[], reply="ok")
+    # tap the Tamil-labelled "Job Search" button (id routes; title reveals Tamil)
+    await _handle(rt, "வேலை தேடல்", interactive_id="menu_search")
     assert any(c.get("key") == "lang" and c.get("value") == "ta"
                for c in rt._test_facts)               # type: ignore[attr-defined]

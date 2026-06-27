@@ -95,6 +95,7 @@ class AgentState(TypedDict, total=False):
     draft_response: str
     message_chunks: list[str]
     single_bubble: bool                   # deliver the reply whole (e.g. a full category listing)
+    localized: bool                       # reply already in the user's language → skip the LLM pass
     delivery_plan: list[dict[str, Any]]   # [{text, typing_ms, delay_ms, image_url?}]
     # A fully-formed WhatsApp Cloud API interactive payload (e.g. the onboarding
     # cta_url "Open form" button). When set, the WhatsApp route sends THIS instead
