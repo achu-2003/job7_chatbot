@@ -178,10 +178,14 @@ _EMP_SEARCH_GUIDANCE = (
 i18n.register_warm_strings([_LANE_HINT_SEEKER, _LANE_HINT_EMPLOYER, _EMP_SEARCH_GUIDANCE])
 
 
-def _menu_buttons_message(body: str) -> dict[str, Any]:
-    """The greeting/onboarding quick-reply buttons wrapped as a WhatsApp
-    interactive payload (text ``body`` doubles as the web/fallback reply)."""
-    return wa.buttons_message(body, _MENU_BUTTONS)
+def _menu_buttons_message(body: str, *, lang: str = "en") -> dict[str, Any]:
+    """The greeting/onboarding quick-reply buttons wrapped as a WhatsApp interactive
+    payload (text ``body`` doubles as the web/fallback reply). Button labels are
+    localized deterministically from the glossary when ``lang`` is set (the caller
+    then flags the reply ``localized``); callers leaving lang='en' get the English
+    labels translated later by the outbound localizer."""
+    btns = [(bid, i18n.t(title, lang)) for bid, title in _MENU_BUTTONS]
+    return wa.buttons_message(body, btns)
 
 
 # ---- lane selection (job seeker vs job creator) -------------------------
@@ -263,10 +267,16 @@ _EMP_MENU_ROWS = (
 )
 
 
-def _emp_menu(body: str) -> dict[str, Any]:
-    """The verified-employer hub as a WhatsApp list (all options reachable)."""
-    return wa.list_message(body=body, button_text="Menu",
-                           rows=list(_EMP_MENU_ROWS), section_title="Employer menu")
+def _emp_menu(body: str, *, lang: str = "en") -> dict[str, Any]:
+    """The verified-employer hub as a WhatsApp list (all options reachable). Row
+    labels / button are localized DETERMINISTICALLY from the glossary when ``lang``
+    is set (the caller then flags the reply ``localized`` to skip the LLM pass);
+    callers that leave lang='en' get the English rows translated later by the
+    outbound localizer."""
+    rows = [{"id": r["id"], "title": i18n.t(r["title"], lang),
+             "description": i18n.t(r["description"], lang)} for r in _EMP_MENU_ROWS]
+    return wa.list_message(body=body, button_text=i18n.t("Menu", lang),
+                           rows=rows, section_title=i18n.t("Employer menu", lang))
 # Typed (not tapped) employer commands → the same actions as the menu buttons.
 # These match ANYWHERE in the message (re.search) and tolerate natural phrasings
 # like "list my jobs" / "i want to view my jobs", but stay specific enough not to
@@ -347,10 +357,12 @@ _EMP_SEEKER_INTENT_RX = re.compile(
 )
 
 
-def _role_choice_message(body: str) -> dict[str, Any]:
-    """The Job Seeker / Job Creator quick-reply buttons wrapped as a WhatsApp
-    interactive payload (``body`` doubles as the web/fallback reply)."""
-    return wa.buttons_message(body, _ROLE_BUTTONS)
+def _role_choice_message(body: str, *, lang: str = "en") -> dict[str, Any]:
+    """The Job Seeker / Employer quick-reply buttons wrapped as a WhatsApp interactive
+    payload (``body`` doubles as the web/fallback reply). Button labels localized
+    deterministically from the glossary when ``lang`` is set."""
+    btns = [(bid, i18n.t(title, lang)) for bid, title in _ROLE_BUTTONS]
+    return wa.buttons_message(body, btns)
 
 
 def _role_selection(state: AgentState) -> str | None:
@@ -397,26 +409,29 @@ def _apply_prompt(msg: str) -> dict[str, Any]:
     return out
 
 
-def _onboard_ask_form(name: str | None, link: str) -> str:
+# Fixed onboarding sentences — translated DETERMINISTICALLY from the glossary so the
+# form-handover reads cleanly (the LLM garbled these, e.g. doubling words).
+_ONB_ASK_P1 = ("One quick step to finish setting up your profile — please fill this "
+               "short form (email, experience, preferred role/location):")
+_ONB_DONE = "Once you've submitted it, message me here and we'll find you some roles."
+_ONB_CTA = ("One quick step to finish setting up your profile — tap below to fill a "
+            "short form (email, experience, preferred role/location). Once you're done, "
+            "message me here and we'll find you some roles.")
+
+
+def _onboard_ask_form(name: str | None, link: str, lang: str = "en") -> str:
     """Text version (with the raw link inline) — used for web and as the
     fallback if WhatsApp rejects the cta_url button."""
     who = f", {_first_name(name)}" if name else ""
-    return (
-        f"Thanks{who}! One quick step to finish setting up your profile — please "
-        f"fill this short form (email, experience, preferred role/location):\n{link}"
-        "\n\nOnce you've submitted it, message me here and we'll find you some roles."
-    )
+    return (f"{i18n.t('Thanks', lang)}{who}! {i18n.t(_ONB_ASK_P1, lang)}\n{link}"
+            f"\n\n{i18n.t(_ONB_DONE, lang)}")
 
 
-def _onboard_form_cta_body(name: str | None) -> str:
+def _onboard_form_cta_body(name: str | None, lang: str = "en") -> str:
     """Body text for the WhatsApp cta_url button (the URL lives on the button, so
     it's omitted here)."""
     who = f", {_first_name(name)}" if name else ""
-    return (
-        f"Thanks{who}! One quick step to finish setting up your profile — tap "
-        "below to fill a short form (email, experience, preferred role/location). "
-        "Once you're done, message me here and we'll find you some roles."
-    )
+    return f"{i18n.t('Thanks', lang)}{who}! {i18n.t(_ONB_CTA, lang)}"
 
 
 
@@ -640,10 +655,12 @@ class AgentRuntime:
         category, jobs = await self._category_jobs(state, category_text)
         if not jobs:
             return {}  # not a known category → fall through to the planner
-        payload, fallback = jobflow.role_list_message(jobs, category=category, offset=offset)
+        lang = self._resolved_lang(state)
+        payload, fallback = jobflow.role_list_message(jobs, category=category, offset=offset, lang=lang)
         await self._save_browse(state, {"stage": "roles", "category": category, "offset": offset})
         return {
             "intent": "browse", "did_browse": True, "used_llm": False, "single_bubble": True,
+            "localized": True,                 # list rendered deterministically in the user's lang
             "draft_response": fallback, "whatsapp_interactive": payload, "catalog_hits": jobs,
         }
 
@@ -1218,17 +1235,20 @@ class AgentRuntime:
             conversation_id=state["conversation_id"], name=name,
         )
         link = f"{get_settings().public_base_url.rstrip('/')}/onboard/form?token={token}"
+        lang = self._resolved_lang(state)
         out: dict[str, Any] = {
             "is_known": False,
             # text-with-link kept as the web reply + WhatsApp fallback
-            "onboarding_prompt": _onboard_ask_form(name, link),
+            "onboarding_prompt": _onboard_ask_form(name, link, lang),
+            "localized": True,                 # rendered deterministically in the user's lang
         }
         # Send a tappable "Open form" cta_url button on WhatsApp — but only for an
         # https link (Meta rejects cta_url with http/localhost). For a non-https
         # base URL we fall back to the inline-link text above.
         if link.startswith("https://"):
             out["whatsapp_interactive"] = wa.cta_url_message(
-                body=_onboard_form_cta_body(name), display_text="Open form", url=link,
+                body=_onboard_form_cta_body(name, lang),
+                display_text=i18n.t("Open form", lang), url=link,
             )
         return out
 
@@ -1270,13 +1290,16 @@ class AgentRuntime:
                 "used_llm": False,
                 "end_session": True,
             }
-        hi = f"Hi {first}! What are you looking for today?" if first else "Hi! What are you looking for today?"
+        lang = self._resolved_lang(state)
+        greet, ask = i18n.t("Hi", lang), i18n.t("What are you looking for today?", lang)
+        hi = f"{greet}, {first}! {ask}" if first else f"{greet}! {ask}"
         return {
             "intent": "greeting",
             "draft_response": hi,
             "used_llm": False,
+            "localized": True,                 # greeting + buttons already localized
             # Offer the quick-reply menu so the candidate can tap instead of type.
-            "whatsapp_interactive": _menu_buttons_message(hi),
+            "whatsapp_interactive": _menu_buttons_message(hi, lang=lang),
         }
 
     async def _role_select(self, state: AgentState) -> dict[str, Any]:
@@ -1285,17 +1308,20 @@ class AgentRuntime:
         Creator → a stub until the recruiter side lands)."""
         first = _first_name((state.get("customer_facts") or {}).get("full_name"))
         who = f" {first}" if first else ""
+        lang = self._resolved_lang(state)
+        tap_line = 'Tap an option below (or reply "Job Seeker" / "Employer").'
         body = (
-            f"Hi{who}! Welcome to Jobs7. 👋\n\n"
-            "Are you here to find a job, or to hire as an employer?\n\n"
-            'Tap an option below (or reply "Job Seeker" / "Employer").'
+            f"{i18n.t('Hi', lang)}{who}! {i18n.t('Welcome to Jobs7.', lang)} 👋\n\n"
+            f"{i18n.t('Are you here to find a job, or to hire as an employer?', lang)}\n\n"
+            f"{i18n.t(tap_line, lang)}"
         )
         return {
             "intent": "role_select",
             "draft_response": body,
             "used_llm": False,
             "single_bubble": True,
-            "whatsapp_interactive": _role_choice_message(body),
+            "localized": True,                 # body + buttons already localized
+            "whatsapp_interactive": _role_choice_message(body, lang=lang),
         }
 
     # ---- employer (job-poster) lane: Stages 1-5 -----------------------
@@ -1479,11 +1505,14 @@ class AgentRuntime:
         company = (emp.get("private_employers") or {}).get("companyName") or "your company"
         first = _first_name((state.get("customer_facts") or {}).get("full_name"))
         who = f", {first}" if first else ""
+        lang = self._resolved_lang(state)
         body = (
-            f"👋 Welcome back{who} — *{company}*\n\n"
-            "What would you like to do today?"
+            f"👋 {i18n.t('Welcome back', lang)}{who} — *{company}*\n\n"
+            f"{i18n.t('What would you like to do today?', lang)}"
         )
-        return self._creator_reply(body, interactive=_emp_menu(body))
+        out = self._creator_reply(body, interactive=_emp_menu(body, lang=lang))
+        out["localized"] = True                 # greeting + rows already localized
+        return out
 
     @staticmethod
     def _candidate_experience(c: dict[str, Any]) -> str:
@@ -1491,12 +1520,16 @@ class AgentRuntime:
 
     @staticmethod
     def _resolved_lang(state: AgentState) -> str:
-        """The user's language for THIS turn: detected from the message, else the
-        remembered language (for a button tap whose label had no script)."""
-        lang = state.get("inbound_lang") or "en"
-        if lang == "en":
-            lang = ((state.get("customer_facts") or {}).get("lang")) or "en"
-        return lang
+        """The user's language for THIS turn — same rule as the outbound localizer.
+        A TYPED turn uses the language detected from the message (so typed English
+        stays English even if Tamil is remembered). A button TAP uses the language of
+        the tapped label, else the remembered language."""
+        if state.get("button_id"):
+            tapped = i18n.detect_lang(state.get("inbound_raw") or "")
+            if tapped != "en":
+                return tapped
+            return ((state.get("customer_facts") or {}).get("lang")) or "en"
+        return state.get("inbound_lang") or "en"
 
     @staticmethod
     def _localize_experience(exp: str, lang: str) -> str:
@@ -1672,17 +1705,23 @@ class AgentRuntime:
                 log.warning("employer_my_jobs_db_failed", error=str(exc)[:200])
         if not jobs:
             jobs = emp.get("jobs") or []                      # Redis fallback
+        lang = self._resolved_lang(state)
         if not jobs:
-            body = "You haven't posted any jobs yet. Tap below to post your first one."
-            return self._creator_reply(
-                body, interactive=wa.buttons_message(body, [("emp:post", "Post a Job")])
+            body = i18n.t(
+                "You haven't posted any jobs yet. Tap below to post your first one.", lang)
+            out = self._creator_reply(
+                body, interactive=wa.buttons_message(body, [("emp:post", i18n.t("Post a Job", lang))])
             )
-        cards = [self._job_card(j) for j in jobs[:10]]
-        body = f"*Your posted jobs ({len(jobs)})*\n\n" + "\n\n".join(cards)
+            out["localized"] = True
+            return out
+        cards = [self._job_card(j, lang) for j in jobs[:10]]
+        body = f"*{i18n.t('Your posted jobs', lang)} ({len(jobs)})*\n\n" + "\n\n".join(cards)
         if len(jobs) > 10:
-            body += f"\n\n…and {len(jobs) - 10} more."
+            body += f"\n\n… +{len(jobs) - 10}"
         # Just the job list — no Menu (type "menu" any time to bring it back).
-        return self._creator_reply(body)
+        out = self._creator_reply(body)
+        out["localized"] = True                 # rendered deterministically in the user's lang
+        return out
 
     @staticmethod
     def _live_job_to_card_shape(row: dict[str, Any]) -> dict[str, Any]:
@@ -1702,9 +1741,12 @@ class AgentRuntime:
                 "validityDays": days, "private_jobs": row}
 
     @staticmethod
-    def _job_card(j: dict[str, Any]) -> str:
-        """A full, human-readable detail block for one staged job."""
+    def _job_card(j: dict[str, Any], lang: str = "en") -> str:
+        """A full, human-readable detail block for one staged job. Fixed labels are
+        localized DETERMINISTICALLY from the glossary (``lang``); the dynamic data
+        (title, ref, salary numbers, counts) is kept as-is."""
         pj = j.get("private_jobs") or {}
+        T = lambda s: i18n.t(s, lang)            # noqa: E731 — terse glossary helper
 
         def money(v: Any) -> str | None:
             try:
@@ -1721,49 +1763,49 @@ class AgentRuntime:
         title = pj.get("title") or j.get("title") or "Untitled role"
         ref = j.get("ref") or "—"
         status = pj.get("status") or j.get("status") or "PENDING"
-        L = [f"• *{title}*  ({ref})", f"   📌 Status: {status}"]
+        L = [f"• *{title}*  ({ref})", f"   📌 {T('Status:')} {T(status)}"]
 
         jt = {"FULL_TIME": "Full-time", "PART_TIME": "Part-time"}.get(pj.get("jobType"), pj.get("jobType"))
         wm = {"OFFICE": "On-site", "REMOTE": "Remote", "HYBRID": "Hybrid"}.get(pj.get("workMode"), pj.get("workMode"))
-        tw = " · ".join(x for x in (f"💼 {jt}" if jt else "", f"🏢 {wm}" if wm else "") if x)
+        tw = " · ".join(x for x in (f"💼 {T(jt)}" if jt else "", f"🏢 {T(wm)}" if wm else "") if x)
         if tw:
             L.append(f"   {tw}")
 
         loc = "Remote" if pj.get("jobLocationType") == "REMOTE" else (pj.get("locationDetails") or "")
         if loc:
-            L.append(f"   📍 {loc}")
+            L.append(f"   📍 {T('Remote') if loc == 'Remote' else loc}")
 
         lo, hi = money(pj.get("salaryMin")), money(pj.get("salaryMax"))
         if lo or hi:
             per = {"MONTHLY": "month", "YEARLY": "year"}.get(pj.get("salaryPeriod"), "month")
-            L.append(f"   💰 {lo or '—'} – {hi or '—'} / {per}")
+            L.append(f"   💰 {lo or '—'} – {hi or '—'} / {T(per)}")
 
         et = pj.get("experienceType")
         if et == "EXPERIENCED":
             mn, mx = as_int(pj.get("experienceMin")), as_int(pj.get("experienceMax"))
-            yrs = f" ({mn}–{mx} yrs)" if mn is not None and mx is not None else ""
-            L.append(f"   🎯 Experienced{yrs}")
+            yrs = f" ({mn}–{mx} {T('yrs')})" if mn is not None and mx is not None else ""
+            L.append(f"   🎯 {T('Experienced')}{yrs}")
         elif et == "INTERN":
             stip = money(pj.get("internStipend")) or money(pj.get("trainingFee"))
-            L.append("   🎯 Intern" + (f" · {stip}" if stip else ""))
+            L.append(f"   🎯 {T('Intern')}" + (f" · {stip}" if stip else ""))
         elif et in ("FRESHER", "ANY"):
-            L.append(f"   🎯 {et.title()}")
+            L.append(f"   🎯 {T(et.title())}")
 
         bits = []
         vac = as_int(pj.get("vacancies"))
         if vac:
-            bits.append(f"👥 {vac} vacanc" + ("y" if vac == 1 else "ies"))
+            bits.append(f"👥 {vac} " + T("vacancy" if vac == 1 else "vacancies"))
         val = as_int(j.get("validityDays") or pj.get("validityDays"))
         if val:
-            bits.append(f"⏳ {val} days")
+            bits.append(f"⏳ {val} {T('days')}")
         if bits:
             L.append("   " + " · ".join(bits))
 
         modes = pj.get("applyModes") or []
         mp = {"APPLY": "In-App", "CALL": "Phone", "WHATSAPP": "WhatsApp"}
-        am = [mp.get(m, m) for m in modes]
+        am = [T(mp.get(m, m)) for m in modes]
         if am:
-            L.append(f"   📲 Apply: {', '.join(am)}")
+            L.append(f"   📲 {T('Apply:')} {', '.join(am)}")
 
         return "\n".join(L)
 

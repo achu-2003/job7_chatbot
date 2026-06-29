@@ -5,24 +5,23 @@ from app import credits as c
 from app.api.routes.employer import _activate_job_html
 
 
-@pytest.mark.parametrize("days,mult", [(15, 1), (30, 2), (45, 3), (99, 1)])
+# Single fixed validity now: 30 days at 1 credit/district (everything else → 1×).
+@pytest.mark.parametrize("days,mult", [(30, 1), (15, 1), (45, 1), (99, 1)])
 def test_validity_multiplier(days, mult):
     assert c.validity_multiplier(days) == mult
 
 
-@pytest.mark.parametrize("districts,days,need", [
-    (3, 15, 3), (3, 30, 6), (3, 45, 9),       # the 3-district example
-    (1, 15, 1), (1, 30, 2), (1, 45, 3),       # single district
-    (37, 15, 37), (37, 30, 74), (37, 45, 111),  # the 37-district example
+@pytest.mark.parametrize("districts,need", [
+    (1, 1), (3, 3), (37, 37),                 # 1 credit per district @ 30 days
 ])
-def test_credits_required(districts, days, need):
-    assert c.credits_required(districts, days) == need
+def test_credits_required(districts, need):
+    assert c.credits_required(districts, 30) == need
 
 
 def test_credits_required_floors_at_one_district():
     # zero/garbage districts still charge for at least one
-    assert c.credits_required(0, 15) == 1
-    assert c.credits_required(None, 30) == 2
+    assert c.credits_required(0, 30) == 1
+    assert c.credits_required(None, 30) == 1
 
 
 def test_credit_quote_matches_screenshots():
@@ -96,9 +95,10 @@ def test_activate_page_renders_validity_and_credits():
     assert 'action="/employer/post-job/activate"' in out
     assert 'name="token" value="tok123"' in out
     assert 'name="validity_days"' in out
-    # validity pills 15/30/45 with multipliers
-    for days in (15, 30, 45):
-        assert f'data-days="{days}"' in out
+    # single fixed validity: 30 days only (15/45 removed)
+    assert 'data-days="30"' in out
+    assert 'data-days="15"' not in out and 'data-days="45"' not in out
+    assert 'value="30"' in out                       # default validity_days
     # district chips + count + starting balance baked in
     assert "Tirupattur" in out and "Districts (3)" in out
     assert "var HAVE = 1;" in out and f"var PRICE = {c.JOB_CREDIT_PRICE};" in out

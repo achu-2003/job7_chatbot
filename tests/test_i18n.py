@@ -50,12 +50,12 @@ async def test_translate_many_translates_skips_nonwordy_and_caches():
     llm = _FakeLLM()
     # non-glossary strings, so they exercise the LLM batch path (glossary terms would
     # short-circuit before the LLM — covered by test_glossary_covers_menu_labels)
-    out = await i18n.translate_many(llm, ["Welcome back", "12345", "Anything else?"], to_lang="ta")
-    assert out == ["TA::Welcome back", "12345", "TA::Anything else?"]   # digits-only skipped
+    out = await i18n.translate_many(llm, ["Good to see you", "12345", "Tell me more"], to_lang="ta")
+    assert out == ["TA::Good to see you", "12345", "TA::Tell me more"]   # digits-only skipped
     assert llm.calls == ["translate_out"]        # ONE batched call for the two strings
     # a repeat is served from cache — no new LLM call
     llm2 = _FakeLLM()
-    assert await i18n.translate_many(llm2, ["Welcome back"], to_lang="ta") == ["TA::Welcome back"]
+    assert await i18n.translate_many(llm2, ["Good to see you"], to_lang="ta") == ["TA::Good to see you"]
     assert llm2.calls == []
 
 
@@ -69,12 +69,13 @@ async def test_to_english_noop_and_translate():
     llm = _FakeLLM()
     assert await i18n.to_english(llm, "hello", source_lang="en") == "hello"
     assert llm.calls == []                       # English in → no call
-    out = await i18n.to_english(llm, "வணக்கம்", source_lang="ta")
-    assert out == "EN[வணக்கம்]" and llm.calls == ["translate_in"]
+    # a non-glossary phrase → goes to the LLM (a glossary term would reverse-map)
+    out = await i18n.to_english(llm, "எனக்கு வேலை வேண்டும்", source_lang="ta")
+    assert out == "EN[எனக்கு வேலை வேண்டும்]" and llm.calls == ["translate_in"]
 
 
 async def test_to_english_best_effort_on_error():
-    assert await i18n.to_english(_BoomLLM(), "வணக்கம்", source_lang="ta") == "வணக்கம்"
+    assert await i18n.to_english(_BoomLLM(), "எனக்கு வேலை வேண்டும்", source_lang="ta") == "எனக்கு வேலை வேண்டும்"
 
 
 # --- interactive-label localization -----------------------------------------
@@ -223,7 +224,7 @@ async def test_glossary_covers_menu_labels():
         _NoLLM(), ["Job Search", "Application Status", "Recommended Jobs",
                    "View Candidates", "🪪 Credits & Wallet"], to_lang="ta")
     assert out == ["வேலை தேடல்", "விண்ணப்ப நிலை", "பரிந்துரைக்கப்பட்ட வேலைகள்",
-                   "வேட்பாளர்களைப் பார்", "🪪 கிரெடிட்கள் & வாலெட்"]
+                   "விண்ணப்பத்தார்களை பார்க்க", "🪪 கிரெடிட்கள் & வாலெட்"]
     assert (await i18n.translate_many(_NoLLM(), ["Application Status"], to_lang="hi"))[0] == "आवेदन स्थिति"
 
 
@@ -263,12 +264,12 @@ async def test_to_english_reverse_maps_localized_labels():
         async def chat(self, **k):
             raise AssertionError("glossary reverse-map must not call the LLM")
 
-    assert i18n.from_glossary("வேலை இடுகையிடு", "ta") == "post a job"
+    assert i18n.from_glossary("வேலை பதிவிடு", "ta") == "post a job"
     assert i18n.from_glossary("उम्मीदवार देखें", "hi") == "view candidates"
     assert i18n.from_glossary("not a label", "ta") is None           # unknown phrase
     assert i18n.from_glossary("anything", "en") is None              # English: no-op
     # to_english uses the reverse-map (no LLM) for a known label
-    assert await i18n.to_english(_NoLLM(), "வேட்பாளர்களைப் பார்", source_lang="ta") == "view candidates"
+    assert await i18n.to_english(_NoLLM(), "விண்ணப்பத்தார்களை பார்க்க", source_lang="ta") == "view candidates"
     # an unknown phrase falls through to the LLM (here stubbed to raise → best-effort original)
     assert await i18n.to_english(_NoLLM(), "சும்மா ஒரு வாக்கியம்", source_lang="ta") == "சும்மா ஒரு வாக்கியம்"
 

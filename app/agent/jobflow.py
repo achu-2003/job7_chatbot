@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app import i18n
 from app.chatbot import wa_format as wa
 
 # WhatsApp interactive list: max 10 rows. When a page overflows we keep 9 roles
@@ -235,10 +236,10 @@ def _num(idx: int | None) -> str:
     return _NUM_EMOJI[idx - 1] if 1 <= idx <= len(_NUM_EMOJI) else f"{idx}."
 
 
-def _role_row_desc(job: dict[str, Any]) -> str:
+def _role_row_desc(job: dict[str, Any], lang: str = "en") -> str:
     bits: list[str] = []
     loc = job.get("location")
-    bits.append("Work From Home" if infer_wfh(loc) else (loc or "—"))
+    bits.append(i18n.t("Work From Home", lang) if infer_wfh(loc) else (loc or "—"))
     pay = salary_display(job.get("salary_min"), job.get("salary_max"))
     if pay:
         bits.append(pay)
@@ -246,20 +247,23 @@ def _role_row_desc(job: dict[str, Any]) -> str:
 
 
 def role_list_message(
-    jobs: list[dict[str, Any]], *, category: str, offset: int = 0
+    jobs: list[dict[str, Any]], *, category: str, offset: int = 0, lang: str = "en"
 ) -> tuple[dict[str, Any], str]:
     """A tappable list of roles in a category, paged 10 at a time. Returns the
-    interactive payload + a text fallback (web / cta-rejected)."""
+    interactive payload + a text fallback (web / cta-rejected). Fixed labels are
+    localized DETERMINISTICALLY from the glossary (``lang``) — job titles/locations
+    stay as-is — and the caller flags the reply ``localized`` to skip the LLM pass."""
     total = len(jobs)
     has_more = total > offset + _PAGE
     take = (_PAGE - 1) if has_more else _PAGE
     window = jobs[offset:offset + take]
+    cat_t = i18n.t(category, lang)
 
     rows = [
         {
             "id": f"job:{_ref(j)}",
             "title": _trunc(j.get("title") or "Role", 24),
-            "description": _role_row_desc(j),
+            "description": _role_row_desc(j, lang),
         }
         for j in window
     ]
@@ -267,19 +271,19 @@ def role_list_message(
         nxt = offset + len(window)
         rows.append({
             "id": f"more:{category}:{nxt}",
-            "title": "More roles ▸",
-            "description": f"{total - nxt} more",
+            "title": i18n.t("More roles ▸", lang),
+            "description": f"{total - nxt} {i18n.t('more', lang)}",
         })
 
     shown_to = offset + len(window)
     body = (
-        f"{total} {category} roles. Tap one to see the openings"
-        + (f" (showing {offset + 1}–{shown_to})" if total > _PAGE else "")
+        f"{total} {cat_t} {i18n.t('roles. Tap one to see the openings', lang)}"
+        + (f" ({i18n.t('showing', lang)} {offset + 1}–{shown_to})" if total > _PAGE else "")
         + ":"
     )
     payload = wa.list_message(
-        body=body, button_text="View roles", rows=rows,
-        header=_trunc(category, 60), section_title="Roles",
+        body=body, button_text=i18n.t("View roles", lang), rows=rows,
+        header=_trunc(cat_t, 60), section_title=i18n.t("Roles", lang),
     )
     text_lines = [body, ""] + [
         f"• {j.get('title') or 'Role'}" + (f" — {j['location']}" if j.get("location") else "")

@@ -18,13 +18,14 @@ from typing import Any
 JOB_CREDIT_PRICE = 649                       # ₹ per job credit (live catalog)
 WELCOME_JOB_CREDITS = 1                      # the free credit a new employer gets
 # (validity in days, credit multiplier per district) — order = display order.
-VALIDITY_OPTIONS: tuple[tuple[int, int], ...] = ((15, 1), (30, 2), (45, 3))
+# Single fixed option: every job is 30 days at 1 credit/district.
+VALIDITY_OPTIONS: tuple[tuple[int, int], ...] = ((30, 1),)
 _MULTIPLIER = {days: mult for days, mult in VALIDITY_OPTIONS}
-DEFAULT_VALIDITY_DAYS = 15
+DEFAULT_VALIDITY_DAYS = 30
 
 
 def validity_multiplier(days: Any) -> int:
-    """Credits-per-district for a validity choice (15/30/45). Unknown → 1×."""
+    """Credits-per-district for a validity choice (30 days). Unknown → 1×."""
     try:
         return _MULTIPLIER.get(int(days), 1)
     except (TypeError, ValueError):

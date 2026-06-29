@@ -91,8 +91,53 @@ _GLOSSARY: dict[str, dict[str, str]] = {
         "job search": "வேலை தேடல்",
         "application status": "விண்ணப்ப நிலை",
         "recommended jobs": "பரிந்துரைக்கப்பட்ட வேலைகள்",
-        "post a job": "வேலை இடுகையிடு",
-        "view candidates": "வேட்பாளர்களைப் பார்",
+        "post a job": "வேலை பதிவிடு",
+        "view candidates": "விண்ணப்பத்தார்களை பார்க்க",
+        "menu": "பட்டியல்", "employer menu": "முதலாளர் பட்டியல்",
+        "welcome back": "மீண்டும் வருக", "hi": "வணக்கம்",
+        "what would you like to do today?": "இன்று நீங்கள் என்ன செய்ய விரும்புகிறீர்கள்?",
+        "what are you looking for today?": "இன்று நீங்கள் எதைத் தேடுகிறீர்கள்?",
+        "employer": "முதலாளர்", "welcome to jobs7.": "Jobs7-க்கு வரவேற்கிறோம்.",
+        "are you here to find a job, or to hire as an employer?":
+            "நீங்கள் வேலை தேட வந்தீர்களா, அல்லது முதலாளராக ஆட்களை நியமிக்க வந்தீர்களா?",
+        'tap an option below (or reply "job seeker" / "employer").':
+            'கீழே ஒரு விருப்பத்தைத் தட்டவும் (அல்லது "வேலை தேடுபவர்" / "முதலாளர்" எனப் பதிலளிக்கவும்).',
+        # --- seeker onboarding form handover (deterministic) ---
+        "thanks": "நன்றி", "open form": "படிவத்தைத் திற",
+        "one quick step to finish setting up your profile — please fill this short form "
+        "(email, experience, preferred role/location):":
+            "உங்கள் சுயவிவரத்தை அமைப்பதை முடிக்க ஒரு விரைவான படி — இந்தக் குறுகிய படிவத்தை "
+            "நிரப்பவும் (மின்னஞ்சல், அனுபவம், விருப்பமான பணி/இடம்):",
+        "once you've submitted it, message me here and we'll find you some roles.":
+            "சமர்ப்பித்த பிறகு, இங்கே எனக்குச் செய்தி அனுப்புங்கள், நாங்கள் உங்களுக்கு சில பணிகளைக் கண்டுபிடிப்போம்.",
+        "one quick step to finish setting up your profile — tap below to fill a short form "
+        "(email, experience, preferred role/location). once you're done, message me here "
+        "and we'll find you some roles.":
+            "உங்கள் சுயவிவரத்தை அமைப்பதை முடிக்க ஒரு விரைவான படி — கீழே ஒரு குறுகிய படிவத்தை "
+            "நிரப்பத் தட்டவும் (மின்னஞ்சல், அனுபவம், விருப்பமான பணி/இடம்). முடித்ததும், இங்கே "
+            "எனக்குச் செய்தி அனுப்புங்கள், நாங்கள் உங்களுக்கு சில பணிகளைக் கண்டுபிடிப்போம்.",
+        # --- My Jobs / job card (deterministic) ---
+        "your posted jobs": "நீங்கள் இடுகையிட்ட வேலைகள்",
+        "status:": "நிலை:", "pending": "நிலுவையில்", "live": "செயலில்",
+        "approved": "அங்கீகரிக்கப்பட்டது", "closed": "மூடப்பட்டது",
+        "expired": "காலாவதியானது", "draft": "வரைவு",
+        "full-time": "முழு நேரம்", "part-time": "பகுதி நேரம்", "on-site": "அலுவலகம்",
+        "apply:": "விண்ணப்பிக்க:", "in-app": "ஆப்-இல்", "phone": "தொலைபேசி",
+        "whatsapp": "வாட்ஸ்அப்", "vacancy": "காலியிடம்", "vacancies": "காலியிடங்கள்",
+        "days": "நாட்கள்", "yrs": "ஆண்டுகள்",
+        "you haven't posted any jobs yet. tap below to post your first one.":
+            "நீங்கள் இன்னும் எந்த வேலையையும் இடவில்லை. உங்கள் முதல் வேலையை இட கீழே தட்டவும்.",
+        # --- category role-list (deterministic) ---
+        "roles. tap one to see the openings": "பணிகள். ஒன்றைத் தேர்ந்து விவரங்களைப் பார்க்க",
+        "view roles": "பணிகளைப் பார்க்க", "roles": "பணிகள்",
+        "more roles ▸": "மேலும் பணிகள் ▸", "showing": "காட்டுகிறது", "more": "மேலும்",
+        "our team will review it and contact you shortly.":
+            "எங்கள் குழு அதை ஆய்வு செய்து, விரைவில் உங்களைத் தொடர்பு கொள்ளும்.",
+        "🗓 valid for 30 days": "🗓 30 நாட்களுக்கு பயன்படுத்தக்கூடியது",
+        "✅ *job submitted!*": "✅ *வேலை சமர்ப்பிக்கப்பட்டது!*", "what next?": "அடுத்தது என்ன?",
+        "covered by your plan · balance": "உங்கள் திட்டத்தில் சேர்க்கப்பட்டது · இருப்பு",
+        "job credits": "வேலை கிரெடிட்கள்", "credit": "கிரெடிட்", "credits": "கிரெடிட்கள்",
+        "used · balance": "பயன்படுத்தப்பட்டது · இருப்பு",
         "my jobs": "எனது வேலைகள்",
         "🪪 credits & wallet": "🪪 கிரெடிட்கள் & வாலெட்",
         "💳 buy credits": "💳 கிரெடிட்கள் வாங்கு",
@@ -191,6 +236,16 @@ _GLOSSARY: dict[str, dict[str, str]] = {
         "your full name": "உங்கள் முழு பெயர்",
         "role responsibilities, requirements…": "பணிப் பொறுப்புகள், தேவைகள்…",
         "enter city name": "நகரத்தின் பெயரை உள்ளிடவும்", "street, area, landmark": "தெரு, பகுதி, அடையாளம்",
+        # seeker-form options + dropdown placeholders
+        "day": "நாள்", "resume": "ரெஸ்யூமே",
+        "select state…": "மாநிலத்தைத் தேர்ந்தெடுக்கவும்…",
+        "select a state first…": "முதலில் மாநிலத்தைத் தேர்ந்தெடுக்கவும்…",
+        "select a course first…": "முதலில் படிப்பைத் தேர்ந்தெடுக்கவும்…",
+        "type a category...": "ஒரு பிரிவை உள்ளிடவும்...",
+        "contract": "ஒப்பந்தம்", "internship": "பயிற்சி", "freelance": "சுயதொழில்",
+        "temporary": "தற்காலிக", "work from home": "வீட்டிலிருந்து வேலை", "walk-in": "நேரடி வருகை",
+        "student": "மாணவர்", "fresher - first job": "புதியவர் - முதல் வேலை", "other": "மற்றவை",
+        "single": "திருமணமாகாதவர்", "basic": "அடிப்படை", "fluent": "சரளமான",
         # helper subtitles
         "a few details about your business so candidates know who's hiring.":
             "வேட்பாளர்கள் யார் பணியமர்த்துகிறார்கள் என அறிய உங்கள் வணிகம் பற்றிய சில விவரங்கள்.",
@@ -237,6 +292,50 @@ _GLOSSARY: dict[str, dict[str, str]] = {
         "recommended jobs": "अनुशंसित नौकरियां",
         "post a job": "नौकरी पोस्ट करें",
         "view candidates": "उम्मीदवार देखें",
+        "menu": "मेन्यू", "employer menu": "नियोक्ता मेन्यू",
+        "welcome back": "वापसी पर स्वागत है", "hi": "नमस्ते",
+        "what would you like to do today?": "आज आप क्या करना चाहेंगे?",
+        "what are you looking for today?": "आज आप क्या ढूंढ रहे हैं?",
+        "employer": "नियोक्ता", "welcome to jobs7.": "Jobs7 में आपका स्वागत है।",
+        "are you here to find a job, or to hire as an employer?":
+            "क्या आप नौकरी ढूंढने आए हैं, या नियोक्ता के रूप में भर्ती करने?",
+        'tap an option below (or reply "job seeker" / "employer").':
+            'नीचे एक विकल्प चुनें (या "नौकरी चाहने वाला" / "नियोक्ता" उत्तर दें)।',
+        # --- seeker onboarding form handover (deterministic) ---
+        "thanks": "धन्यवाद", "open form": "फ़ॉर्म खोलें",
+        "one quick step to finish setting up your profile — please fill this short form "
+        "(email, experience, preferred role/location):":
+            "आपकी प्रोफ़ाइल सेट करना पूरा करने के लिए एक त्वरित कदम — कृपया यह छोटा फ़ॉर्म भरें "
+            "(ईमेल, अनुभव, पसंदीदा भूमिका/स्थान):",
+        "once you've submitted it, message me here and we'll find you some roles.":
+            "इसे जमा करने के बाद, मुझे यहाँ संदेश करें और हम आपके लिए कुछ भूमिकाएँ ढूंढेंगे।",
+        "one quick step to finish setting up your profile — tap below to fill a short form "
+        "(email, experience, preferred role/location). once you're done, message me here "
+        "and we'll find you some roles.":
+            "आपकी प्रोफ़ाइल सेट करना पूरा करने के लिए एक त्वरित कदम — नीचे एक छोटा फ़ॉर्म भरने के "
+            "लिए टैप करें (ईमेल, अनुभव, पसंदीदा भूमिका/स्थान)। हो जाने पर, मुझे यहाँ संदेश करें "
+            "और हम आपके लिए कुछ भूमिकाएँ ढूंढेंगे।",
+        # --- My Jobs / job card (deterministic) ---
+        "your posted jobs": "आपकी पोस्ट की गई नौकरियां",
+        "status:": "स्थिति:", "pending": "लंबित", "live": "लाइव",
+        "approved": "स्वीकृत", "closed": "बंद", "expired": "समाप्त", "draft": "ड्राफ्ट",
+        "full-time": "पूर्णकालिक", "part-time": "अंशकालिक", "on-site": "कार्यालय",
+        "apply:": "आवेदन:", "in-app": "ऐप में", "phone": "फ़ोन",
+        "whatsapp": "व्हाट्सएप", "vacancy": "रिक्ति", "vacancies": "रिक्तियां",
+        "days": "दिन", "yrs": "वर्ष",
+        "you haven't posted any jobs yet. tap below to post your first one.":
+            "आपने अभी तक कोई नौकरी पोस्ट नहीं की है। अपनी पहली नौकरी पोस्ट करने के लिए नीचे टैप करें।",
+        # --- category role-list (deterministic) ---
+        "roles. tap one to see the openings": "भूमिकाएं। विवरण देखने के लिए एक चुनें",
+        "view roles": "भूमिकाएं देखें", "roles": "भूमिकाएं",
+        "more roles ▸": "और भूमिकाएं ▸", "showing": "दिखा रहे हैं", "more": "और",
+        "our team will review it and contact you shortly.":
+            "हमारी टीम इसकी समीक्षा करेगी और जल्द ही आपसे संपर्क करेगी।",
+        "🗓 valid for 30 days": "🗓 30 दिनों के लिए मान्य",
+        "✅ *job submitted!*": "✅ *नौकरी सबमिट हो गई!*", "what next?": "आगे क्या?",
+        "covered by your plan · balance": "आपकी योजना में शामिल · शेष",
+        "job credits": "नौकरी क्रेडिट", "credit": "क्रेडिट", "credits": "क्रेडिट",
+        "used · balance": "उपयोग किया गया · शेष",
         "my jobs": "मेरी नौकरियां",
         "🪪 credits & wallet": "🪪 क्रेडिट और वॉलेट",
         "💳 buy credits": "💳 क्रेडिट खरीदें",
@@ -328,6 +427,14 @@ _GLOSSARY: dict[str, dict[str, str]] = {
         "your full name": "आपका पूरा नाम",
         "role responsibilities, requirements…": "भूमिका ज़िम्मेदारियां, आवश्यकताएं…",
         "enter city name": "शहर का नाम दर्ज करें", "street, area, landmark": "सड़क, क्षेत्र, लैंडमार्क",
+        # seeker-form options + dropdown placeholders
+        "day": "दिन", "resume": "रिज्यूमे",
+        "select state…": "राज्य चुनें…", "select a state first…": "पहले राज्य चुनें…",
+        "select a course first…": "पहले कोर्स चुनें…", "type a category...": "एक श्रेणी टाइप करें...",
+        "contract": "अनुबंध", "internship": "इंटर्नशिप", "freelance": "फ्रीलांस",
+        "temporary": "अस्थायी", "work from home": "घर से काम", "walk-in": "वॉक-इन",
+        "student": "छात्र", "fresher - first job": "फ्रेशर - पहली नौकरी", "other": "अन्य",
+        "single": "अविवाहित", "basic": "बुनियादी", "fluent": "धाराप्रवाह",
         # helper subtitles
         "a few details about your business so candidates know who's hiring.":
             "कुछ विवरण आपके व्यवसाय के बारे में ताकि उम्मीदवार जानें कि कौन भर्ती कर रहा है।",
@@ -465,17 +572,23 @@ _FORM_I18N_JS = r"""
   var M=window.__FORMI18N__||{}; if(!Object.keys(M).length) return;
   function look(s){ if(s==null) return null; var k=String(s).trim().toLowerCase(); if(M[k]!=null) return M[k];
     var k2=k.replace(/\s*\*\s*$/,''); return M[k2]!=null?M[k2]:null; }
-  try{ var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null),n,a=[];
-    while(n=w.nextNode()) a.push(n);
-    a.forEach(function(node){ var raw=node.nodeValue,t=raw.trim(); if(!t) return;
-      var r=look(t); if(r!=null) node.nodeValue=raw.replace(t,r); });
-  }catch(e){}
-  document.querySelectorAll('[placeholder]').forEach(function(el){
-    var r=look(el.getAttribute('placeholder')); if(r!=null) el.setAttribute('placeholder',r); });
-  document.querySelectorAll('option').forEach(function(el){
-    if(!el.children.length){ var r=look(el.textContent); if(r!=null) el.textContent=r; } });
-  document.querySelectorAll('button,input[type=submit],input[type=button]').forEach(function(el){
-    if(el.value){ var r=look(el.value); if(r!=null) el.value=r; } });
+  function tr(root){
+    if(root.nodeType===3){ var t=(root.nodeValue||'').trim(); if(t){ var r=look(t); if(r!=null) root.nodeValue=root.nodeValue.replace(t,r); } return; }
+    if(root.nodeType!==1) return;
+    try{ var w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,null),n,a=[];
+      while(n=w.nextNode()) a.push(n);
+      a.forEach(function(node){ var raw=node.nodeValue,t=raw.trim(); if(!t) return; var r=look(t); if(r!=null) node.nodeValue=raw.replace(t,r); });
+    }catch(e){}
+    root.querySelectorAll('[placeholder]').forEach(function(el){ var r=look(el.getAttribute('placeholder')); if(r!=null) el.setAttribute('placeholder',r); });
+    root.querySelectorAll('option').forEach(function(el){ if(!el.children.length){ var r=look(el.textContent); if(r!=null) el.textContent=r; } });
+    root.querySelectorAll('button,input[type=submit],input[type=button]').forEach(function(el){ if(el.value){ var r=look(el.value); if(r!=null) el.value=r; } });
+  }
+  tr(document.body);
+  // Re-translate nodes added later by the form's JS (chips, cascaded dropdowns) — the
+  // submit VALUES live in hidden inputs, so swapping the visible text is safe.
+  try{ new MutationObserver(function(muts){ muts.forEach(function(mu){
+        [].forEach.call(mu.addedNodes, function(nd){ tr(nd); }); }); })
+      .observe(document.body, {childList:true, subtree:true}); }catch(e){}
 })();
 """
 
@@ -656,6 +769,22 @@ async def translate_many(llm: "LLMClient", texts: list[str], *, to_lang: str) ->
                 else:
                     out[i] = s
     return [o if o is not None else texts[k] for k, o in enumerate(out)]
+
+
+async def translate_block(llm: "LLMClient", text: str, *, to_lang: str) -> str:
+    """Translate a MULTI-LINE block line-by-line, so FIXED lines hit the glossary
+    deterministically (e.g. 'Our team will review it and contact you shortly.') while
+    only the remaining lines need the LLM. Blank lines / structure preserved."""
+    if to_lang == "en" or to_lang not in SUPPORTED_LANGS or not text:
+        return text
+    lines = text.split("\n")
+    idx = [i for i, ln in enumerate(lines) if ln.strip()]
+    if not idx:
+        return text
+    translated = await translate_many(llm, [lines[i] for i in idx], to_lang=to_lang)
+    for i, tr in zip(idx, translated):
+        lines[i] = tr
+    return "\n".join(lines)
 
 
 # --- interactive-payload label localization ---------------------------------

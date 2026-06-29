@@ -93,9 +93,11 @@ _EMP_MENU_ROWS = (
 )
 
 
-def _emp_menu_list(body: str) -> dict[str, Any]:
-    return wa.list_message(body=body, button_text="Menu",
-                           rows=list(_EMP_MENU_ROWS), section_title="Employer menu")
+def _emp_menu_list(body: str, *, lang: str = "en") -> dict[str, Any]:
+    rows = [{"id": r["id"], "title": i18n.t(r["title"], lang),
+             "description": i18n.t(r["description"], lang)} for r in _EMP_MENU_ROWS]
+    return wa.list_message(body=body, button_text=i18n.t("Menu", lang),
+                           rows=rows, section_title=i18n.t("Employer menu", lang))
 
 
 def _esc(v: Any) -> str:
@@ -581,23 +583,30 @@ async def _finalize_job(memory, phone: str, tenant_id: str, token: str, validity
             log.error("job_post_db_write_failed", error=str(exc)[:300])
 
     if digits:
+        # Rendered DETERMINISTICALLY in the employer's language so the user-entered
+        # job TITLE (and ref) are shown verbatim — never machine-translated.
+        lang = await wa_localize.user_lang(tenant_id, phone) if get_settings().multilang_enabled else "en"
+
+        def T(s: str) -> str:
+            return i18n.t(s, lang)
+
         cost_line = (
-            "💳 Covered by your plan · "
-            f"balance {bal} job credit{'s' if bal != 1 else ''}"
+            f"💳 {T('Covered by your plan · balance')} {bal} {T('job credits')}"
             if covered else
-            f"💳 {need} credit{'s' if need != 1 else ''} used · balance {bal}"
+            f"💳 {need} {T('credit' if need == 1 else 'credits')} {T('used · balance')} {bal}"
         )
         body = (
-            f"✅ *Job submitted!*\n\n"
+            f"{T('✅ *Job submitted!*')}\n\n"
             f"📋 *{title}*\n"
             f"🔖 {job['ref']}\n"
-            f"🗓 Valid for {validity} days\n"
+            f"{T('🗓 Valid for 30 days')}\n"
             f"{cost_line}\n\n"
-            "Our team will review it and contact you shortly.\n"
-            "What next?"
+            f"{T('Our team will review it and contact you shortly.')}\n"
+            f"{T('What next?')}"
         )
         try:
-            await wa_localize.send(settings, digits, _emp_menu_list(body), tenant_id=tenant_id)
+            await wa_localize.send(settings, digits, _emp_menu_list(body, lang=lang),
+                                   tenant_id=tenant_id, localized=True)
         except Exception as exc:  # noqa: BLE001
             log.warning("employer_postjob_push_failed", error=str(exc)[:200])
     return summary
@@ -1663,7 +1672,7 @@ def _post_job_html(
   <select id="pref_add" autocomplete="off"><option value="">+ Add a district…</option></select>
   <div class="chips2" id="pref_chips"></div>
   <div id="pref_hidden"></div>
-  <div class="info" id="creditInfo">0 districts selected = 0 credits per 15 days</div>
+  <div class="info" id="creditInfo">0 districts selected = 0 credits per 30 days</div>
 </section>""",
         # 5 — Apply Methods (In-App default; Phone/WhatsApp reveal a contact input)
         f"""<section class="step"><h1>Apply Methods</h1>
@@ -1878,7 +1887,7 @@ function renderPref(){{
   prefHidden.innerHTML=prefSelected.map(function(id){{ return '<input type="hidden" name="preferred_district_ids" value="'+id+'">'; }}).join('');
   prefStateHidden.value=prefState.value;
   var nd=prefSelected.length;
-  creditInfo.textContent=nd+' district'+(nd===1?'':'s')+' selected = '+nd+' credit'+(nd===1?'':'s')+' per 15 days';
+  creditInfo.textContent=nd+' district'+(nd===1?'':'s')+' selected = '+nd+' credit'+(nd===1?'':'s')+' per 30 days';
   [].forEach.call(prefChips.querySelectorAll('b'), function(b){{ b.onclick=function(){{ var id=b.getAttribute('data-id'); prefSelected=prefSelected.filter(function(x){{return x!==id;}}); fillPrefAdd(); renderPref(); }}; }});
   fillPrefAdd();
 }}

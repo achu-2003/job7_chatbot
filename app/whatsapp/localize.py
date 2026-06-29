@@ -54,20 +54,30 @@ def _payload_slots(payload: dict) -> list[tuple[Callable[[str], None], str]]:
     return out
 
 
-async def send(settings: Any, phone: str, payload: dict, *, tenant_id: str | None) -> None:
+async def send(settings: Any, phone: str, payload: dict, *, tenant_id: str | None,
+               localized: bool = False) -> None:
     """Translate ``payload`` into the recipient's stored language (best-effort), then
-    send it. No-op localization for English / when multilang is off."""
-    if get_settings().multilang_enabled and phone:
+    send it. No-op localization for English / when multilang is off. Pass
+    ``localized=True`` when the caller already rendered the payload in the user's
+    language deterministically (e.g. a message with a user-entered job title that must
+    NOT be translated) — then nothing is re-translated, just delivered."""
+    if not localized and get_settings().multilang_enabled and phone:
         try:
             lang = await user_lang(tenant_id, phone)
             if lang != "en":
                 slots = _payload_slots(payload)
-                if slots:
-                    setters = [s for s, _ in slots]
-                    translated = await i18n.translate_many(
-                        _get_llm(), [t for _, t in slots], to_lang=lang)
-                    for setter, tr in zip(setters, translated):
-                        setter(tr)
+                # Single-line labels → one batched call. Multi-line BODIES → line-by-
+                # line so fixed sentences hit the glossary (deterministic), not a
+                # whole-body LLM translation that can mistranslate or flake.
+                single = [(s, t) for s, t in slots if "\n" not in t]
+                multi = [(s, t) for s, t in slots if "\n" in t]
+                if single:
+                    tr = await i18n.translate_many(
+                        _get_llm(), [t for _, t in single], to_lang=lang)
+                    for (setter, _), v in zip(single, tr):
+                        setter(v)
+                for setter, text in multi:
+                    setter(await i18n.translate_block(_get_llm(), text, to_lang=lang))
         except Exception as exc:  # noqa: BLE001 — never block the push on a translation error
             log.warning("push_localize_failed", error=str(exc)[:200])
     await wa_delivery.send_message(settings, phone, payload)
