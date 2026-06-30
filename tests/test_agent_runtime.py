@@ -623,26 +623,32 @@ async def test_registered_employer_goes_straight_to_menu():
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "hi")
     assert "verify" not in out["response"].lower()
-    interactive = out["whatsapp_interactive"]["interactive"]
-    assert interactive["type"] == "list"
-    ids = [r["id"] for r in interactive["action"]["sections"][0]["rows"]]
-    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy"]
+    # Hub = TWO bubbles: (1) Post a Job button, (2) a Menu list with the rest.
+    msgs = out["whatsapp_messages"]
+    assert msgs[0]["interactive"]["type"] == "button"
+    btn_ids = [b["reply"]["id"] for b in msgs[0]["interactive"]["action"]["buttons"]]
+    assert btn_ids == ["emp:post"]
+    assert msgs[1]["interactive"]["type"] == "list"
 
 
 async def test_verified_employer_sees_menu():
-    """A verified employer greeting gets the employer hub as a LIST menu (so
-    Buy Credits / Upgrade Plan fit alongside the core three)."""
+    """A verified employer greeting gets the employer hub as two bubbles: a Post a
+    Job button, then a Menu list with the remaining options (one tap shows them all)."""
     rt = _runtime()
     _stub_memory(rt, facts={"lane": "creator"}, employer=_employer())
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "hi")
-    interactive = out["whatsapp_interactive"]["interactive"]
-    assert interactive["type"] == "list"
-    rows = interactive["action"]["sections"][0]["rows"]
-    ids = [r["id"] for r in rows]
-    # core three + Credits & Wallet + Buy Credits (no Upgrade Plan)
-    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy"]
+    msgs = out["whatsapp_messages"]
+    # Bubble 1 — the Post a Job reply button only.
+    assert msgs[0]["interactive"]["type"] == "button"
+    btn_ids = [b["reply"]["id"] for b in msgs[0]["interactive"]["action"]["buttons"]]
+    assert btn_ids == ["emp:post"]
     assert "acme" in out["response"].lower()
+    # Bubble 2 — the Menu list with everything except Post a Job.
+    li = msgs[1]["interactive"]
+    assert li["type"] == "list"
+    row_ids = [r["id"] for r in li["action"]["sections"][0]["rows"]]
+    assert row_ids == ["emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy"]
 
 
 def test_application_status_intent_matches_phrasings():
@@ -839,8 +845,10 @@ async def test_employer_lane_word_shows_menu_not_search():
     out = await _handle(rt, "Employer")
     assert "welcome back" in out["response"].lower()
     assert "no candidates found" not in out["response"].lower()
-    # the employer hub list is attached
-    assert out["whatsapp_interactive"]["interactive"]["type"] == "list"
+    # the employer hub (Post a Job button bubble + Menu list bubble) is attached
+    msgs = out["whatsapp_messages"]
+    assert msgs[0]["interactive"]["type"] == "button"
+    assert msgs[1]["interactive"]["type"] == "list"
 
 
 async def test_employer_non_role_text_gets_guidance_not_empty_search():
@@ -987,11 +995,11 @@ async def test_employer_search_no_match_nudges_to_menu():
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "astronaut")
     assert "no candidates found" in out["response"].lower()
-    # nudges back to the FULL list menu (all options reachable)
-    interactive = out["whatsapp_interactive"]["interactive"]
-    assert interactive["type"] == "list"
-    ids = [r["id"] for r in interactive["action"]["sections"][0]["rows"]]
-    assert ids == ["emp:post", "emp:candidates", "emp:myjobs", "emp:wallet", "emp:buy"]
+    # nudges back to the hub: Post a Job button bubble + Menu list bubble
+    msgs = out["whatsapp_messages"]
+    assert msgs[0]["interactive"]["type"] == "button"
+    assert [b["reply"]["id"] for b in msgs[0]["interactive"]["action"]["buttons"]] == ["emp:post"]
+    assert msgs[1]["interactive"]["type"] == "list"
 
 
 async def test_registered_employer_can_view_candidates():

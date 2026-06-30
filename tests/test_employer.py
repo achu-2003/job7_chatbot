@@ -205,8 +205,9 @@ async def _coro(v):
 
 
 async def test_register_double_submit_is_idempotent(monkeypatch):
-    """A double-tap on the register submit creates ONE profile and pushes the menu
-    ONCE (no duplicate company profile)."""
+    """A double-tap on the register submit creates ONE profile and pushes the hub
+    ONCE (no duplicate company profile). The hub is two bubbles — a Post a Job button
+    + a Menu list — so a single registration sends exactly two messages."""
     import app.api.routes.employer as emp
     pushes = []
 
@@ -215,13 +216,13 @@ async def test_register_double_submit_is_idempotent(monkeypatch):
     monkeypatch.setattr("app.whatsapp.delivery.send_message", _push)
 
     mem = _FakeRegMemory()
-    # First submit → creates + pushes.
+    # First submit → creates + pushes the two hub bubbles.
     out1 = await emp.register_submit(_reg_request(mem))
     # Second (double-tap) → already exists → no re-save, no re-push.
     out2 = await emp.register_submit(_reg_request(mem))
 
     assert mem.save_calls == 1, "profile saved only once"
-    assert len(pushes) == 1, "menu pushed only once"
+    assert len(pushes) == 2, "hub pushed only once (two bubbles: Post a Job + Menu)"
     assert "created" in out1.body.decode().lower() and "created" in out2.body.decode().lower()
 
 

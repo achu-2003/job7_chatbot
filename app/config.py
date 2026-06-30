@@ -283,6 +283,10 @@ class Settings(BaseSettings):
     meta_access_token: str = Field(default="")
     meta_phone_number_id: str = Field(default="")
     whatsapp_verify_token: str = Field(default="")
+    # Meta App Secret — used to verify the X-Hub-Signature-256 HMAC on every
+    # inbound webhook POST so spoofed payloads are rejected. When empty,
+    # signature verification is SKIPPED (dev/test); set it in production.
+    meta_app_secret: str = Field(default="")
     whatsapp_graph_version: str = "v22.0"
     # When True, a single-product reply is sent as an image message with the
     # product card as its caption (no buttons). Requires p.images to hold a

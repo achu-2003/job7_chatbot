@@ -16,6 +16,8 @@ The POST handler:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 from datetime import datetime, timezone
 from typing import Any
 
@@ -35,6 +37,22 @@ from app.vector.store import VectorStore
 
 router = APIRouter()
 log = get_logger("whatsapp")
+
+
+def _verify_meta_signature(settings: Any, body: bytes, header: str | None) -> bool:
+    """True iff ``header`` (``X-Hub-Signature-256``) is Meta's genuine HMAC-SHA256
+    over the RAW request body, keyed by the App Secret. When no app secret is
+    configured, verification is skipped (returns True) so dev/test still works —
+    set ``META_APP_SECRET`` in production to enforce it."""
+    secret = settings.meta_app_secret
+    if not secret:
+        return True  # not configured → skip (enable in prod)
+    if not header or not header.startswith("sha256="):
+        return False
+    expected = "sha256=" + hmac.new(
+        secret.encode("utf-8"), body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, header)
 
 
 @router.get("/webhook", response_class=PlainTextResponse)
@@ -61,8 +79,17 @@ async def receive_webhook(
     settings = get_settings()
     request_id = request_id_var.get() or "REQ_unknown"
 
+    # Read the RAW body first — the signature is computed over the exact bytes Meta
+    # sent, so it must be verified before JSON parsing (which would re-serialize).
+    raw_body = await request.body()
+    if not _verify_meta_signature(
+        settings, raw_body, request.headers.get("X-Hub-Signature-256")
+    ):
+        log.warning("whatsapp_signature_invalid")
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
     try:
-        payload: dict[str, Any] = await request.json()
+        payload: dict[str, Any] = await request.json()  # uses the cached raw body
     except Exception:  # noqa: BLE001
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 

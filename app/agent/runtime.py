@@ -256,7 +256,8 @@ _EMP_MENU_BUTTONS = (
 # we show "what next?" so every option, incl. Credits & Wallet / Buy Credits, is
 # always reachable. Keep in sync with employer.py's _EMP_MENU_ROWS.
 _EMP_MENU_ROWS = (
-    {"id": "emp:post", "title": "Post a Job", "description": "Create a new job listing"},
+    # "Post a Job" is intentionally NOT here — it's surfaced as its own reply button
+    # on the hub (see _emp_menu); these are the rest, shown when "Menu" is tapped.
     {"id": "emp:candidates", "title": "View Candidates", "description": "Browse matching candidates"},
     {"id": "emp:myjobs", "title": "My Jobs", "description": "Your posted jobs"},
     {"id": "emp:wallet", "title": "🪪 Credits & Wallet", "description": "Manage your credits"},
@@ -267,16 +268,27 @@ _EMP_MENU_ROWS = (
 )
 
 
-def _emp_menu(body: str, *, lang: str = "en") -> dict[str, Any]:
-    """The verified-employer hub as a WhatsApp list (all options reachable). Row
-    labels / button are localized DETERMINISTICALLY from the glossary when ``lang``
-    is set (the caller then flags the reply ``localized`` to skip the LLM pass);
-    callers that leave lang='en' get the English rows translated later by the
-    outbound localizer."""
+def _emp_options_list(body: str, *, lang: str = "en") -> dict[str, Any]:
+    """The remaining hub options (everything EXCEPT Post a Job, which is its own
+    button) as a native WhatsApp LIST — one tap on *Menu* reveals all of them at once."""
     rows = [{"id": r["id"], "title": i18n.t(r["title"], lang),
              "description": i18n.t(r["description"], lang)} for r in _EMP_MENU_ROWS]
     return wa.list_message(body=body, button_text=i18n.t("Menu", lang),
                            rows=rows, section_title=i18n.t("Employer menu", lang))
+
+
+def _emp_hub_messages(lead: str, *, lang: str = "en") -> list[dict[str, Any]]:
+    """The employer hub as TWO bubbles — WhatsApp can't mix a reply button and a
+    list in one message, so *Post a Job* (a quick reply button) and *Menu* (a native
+    list that opens every other option in one tap) are sent as separate bubbles:
+      1. ``lead`` text + a single *Post a Job* reply button,
+      2. a *Menu* list with the remaining options.
+    Labels are localized deterministically from the glossary (caller flags
+    ``localized`` to skip the outbound LLM pass)."""
+    return [
+        wa.buttons_message(lead, [("emp:post", i18n.t("Post a Job", lang))]),
+        _emp_options_list(i18n.t("Choose an option", lang), lang=lang),
+    ]
 # Typed (not tapped) employer commands → the same actions as the menu buttons.
 # These match ANYWHERE in the message (re.search) and tolerate natural phrasings
 # like "list my jobs" / "i want to view my jobs", but stay specific enough not to
@@ -1431,8 +1443,7 @@ class AgentRuntime:
         # anything else (filler, junk) gets a guidance nudge instead of a literal
         # "No candidates found matching <word>" search.
         if not _is_searchable_role(q):
-            body = _EMP_SEARCH_GUIDANCE
-            return self._creator_reply(body, interactive=_emp_menu(body))
+            return self._employer_hub_reply(state, _EMP_SEARCH_GUIDANCE)
         return await self._employer_search_candidates(state, emp, q)
 
     def _employer_seeker_intent_reply(
@@ -1440,8 +1451,7 @@ class AgentRuntime:
     ) -> dict[str, Any]:
         """The user is on the EMPLOYER side but typed a job-seeker request (e.g.
         'apply job' / 'search for a job'). Explain the lane + how to switch."""
-        body = _LANE_HINT_EMPLOYER
-        return self._creator_reply(body, interactive=_emp_menu(body))
+        return self._employer_hub_reply(state, _LANE_HINT_EMPLOYER)
 
     async def _employer_action(
         self, state: AgentState, emp: dict[str, Any], action: str,
@@ -1498,21 +1508,24 @@ class AgentRuntime:
             cta="Buy Credits",
         )
 
+    def _employer_hub_reply(self, state: AgentState, lead: str) -> dict[str, Any]:
+        """The employer hub as two bubbles — a *Post a Job* button followed by a
+        *Menu* list (see _emp_hub_messages). ``lead`` is the bubble-1 text."""
+        lang = self._resolved_lang(state)
+        out = self._creator_reply(lead)
+        out["whatsapp_messages"] = _emp_hub_messages(lead, lang=lang)
+        out["localized"] = True                 # both bubbles already localized
+        return out
+
     def _employer_menu_reply(self, state: AgentState, emp: dict[str, Any]) -> dict[str, Any]:
-        """The employer hub — a list menu (reply buttons cap at 3) so all actions,
-        incl. Credits & Wallet / Buy Credits, are reachable. Returning-user
-        greeting; fires on every menu/greeting for a registered employer."""
+        """The employer hub. Returning-user greeting; fires on every menu/greeting
+        for a registered employer."""
         company = (emp.get("private_employers") or {}).get("companyName") or "your company"
         first = _first_name((state.get("customer_facts") or {}).get("full_name"))
         who = f", {first}" if first else ""
         lang = self._resolved_lang(state)
-        body = (
-            f"👋 {i18n.t('Welcome back', lang)}{who} — *{company}*\n\n"
-            f"{i18n.t('What would you like to do today?', lang)}"
-        )
-        out = self._creator_reply(body, interactive=_emp_menu(body, lang=lang))
-        out["localized"] = True                 # greeting + rows already localized
-        return out
+        lead = f"👋 {i18n.t('Welcome back', lang)}{who} — *{company}*"
+        return self._employer_hub_reply(state, lead)
 
     @staticmethod
     def _candidate_experience(c: dict[str, Any]) -> str:
@@ -1651,7 +1664,7 @@ class AgentRuntime:
                 f"No candidates found matching *{query}*. Try another skill or role "
                 "(e.g. “welder”, “sales”, “python”), or tap Menu."
             )
-            return self._creator_reply(body, interactive=_emp_menu(body))
+            return self._employer_hub_reply(state, body)
         m = i18n.t("candidates matching", lang)        # glossary-localized prefix + raw query
         return self._render_candidates(
             emp, cands, lang=lang,

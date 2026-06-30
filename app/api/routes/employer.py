@@ -78,26 +78,40 @@ async def _form_lang(identity: dict[str, Any] | None) -> str:
 router = APIRouter()
 log = get_logger("employer")
 
-# Employer menu buttons pushed after an action (reply buttons cap at 3).
-_EMP_MENU = (("emp:post", "Post a Job"), ("emp:candidates", "View Candidates"),
-             ("emp:myjobs", "My Jobs"))
-# Full hub as a LIST (up to 10 rows) so the wallet / credits options fit too.
+# The hub options shown when *Menu* is tapped (Post a Job is its own button, so it
+# is deliberately NOT a list row). Keep in sync with runtime.py's _EMP_MENU_ROWS.
 _EMP_MENU_ROWS = (
-    {"id": "emp:post", "title": "Post a Job", "description": "Create a new job listing"},
     {"id": "emp:candidates", "title": "View Candidates", "description": "Browse matching candidates"},
     {"id": "emp:myjobs", "title": "My Jobs", "description": "Your posted jobs"},
     {"id": "emp:wallet", "title": "🪪 Credits & Wallet", "description": "Manage your credits"},
     {"id": "emp:buy", "title": "💳 Buy Credits", "description": "View pricing and bundles"},
-    # "💎 Upgrade Plan" (emp:plans) intentionally hidden from the menu for now —
-    # subscription pages still reachable by typing "upgrade"/"plans"/"subscribe".
 )
 
 
+def _emp_post_button(body: str, *, lang: str = "en") -> dict[str, Any]:
+    """Bubble 1 of the hub — the message + a single *Post a Job* reply button."""
+    return wa.buttons_message(body, [("emp:post", i18n.t("Post a Job", lang))])
+
+
 def _emp_menu_list(body: str, *, lang: str = "en") -> dict[str, Any]:
+    """Bubble 2 of the hub — a native *Menu* list; one tap reveals all the remaining
+    options at once."""
     rows = [{"id": r["id"], "title": i18n.t(r["title"], lang),
              "description": i18n.t(r["description"], lang)} for r in _EMP_MENU_ROWS]
     return wa.list_message(body=body, button_text=i18n.t("Menu", lang),
                            rows=rows, section_title=i18n.t("Employer menu", lang))
+
+
+async def _push_emp_hub(settings: Any, digits: str, lead: str, *, tenant_id: str | None,
+                        lang: str = "en", localized: bool = False) -> None:
+    """Push the employer hub as TWO bubbles (WhatsApp can't mix a reply button + a
+    list in one message): (1) ``lead`` + a *Post a Job* button, then (2) a *Menu*
+    list that opens the remaining options in one tap."""
+    menu_body = i18n.t("Choose an option", lang) if localized else "Choose an option"
+    await wa_localize.send(settings, digits, _emp_post_button(lead, lang=lang),
+                           tenant_id=tenant_id, localized=localized)
+    await wa_localize.send(settings, digits, _emp_menu_list(menu_body, lang=lang),
+                           tenant_id=tenant_id, localized=localized)
 
 
 def _esc(v: Any) -> str:
@@ -284,7 +298,7 @@ async def register_submit(request: Request) -> HTMLResponse:
             "What would you like to do today?"
         )
         try:
-            await wa_localize.send(settings, digits, _emp_menu_list(body), tenant_id=tenant_id)
+            await _push_emp_hub(settings, digits, body, tenant_id=tenant_id)
         except Exception as exc:  # noqa: BLE001 — proactive push is best-effort
             log.warning("employer_register_push_failed", error=str(exc)[:200])
 
@@ -435,7 +449,7 @@ async def _notify_subscription(phone: str, body: str, *, tenant_id: str | None =
     if not digits:
         return
     try:
-        await wa_localize.send(get_settings(), digits, _emp_menu_list(body), tenant_id=tenant_id)
+        await _push_emp_hub(get_settings(), digits, body, tenant_id=tenant_id)
     except Exception as exc:  # noqa: BLE001
         log.warning("subscription_notify_failed", error=str(exc)[:200])
 
@@ -605,8 +619,8 @@ async def _finalize_job(memory, phone: str, tenant_id: str, token: str, validity
             f"{T('What next?')}"
         )
         try:
-            await wa_localize.send(settings, digits, _emp_menu_list(body, lang=lang),
-                                   tenant_id=tenant_id, localized=True)
+            await _push_emp_hub(settings, digits, body, tenant_id=tenant_id,
+                                lang=lang, localized=True)
         except Exception as exc:  # noqa: BLE001
             log.warning("employer_postjob_push_failed", error=str(exc)[:200])
     return summary
@@ -931,7 +945,7 @@ async def _activate_subscription(memory, phone: str, tenant_id: str, plan: dict[
             f"✅ *{plan.get('name')}* plan activated ({label}).{extra}\n\nWhat next?"
         )
         try:
-            await wa_localize.send(settings, digits, _emp_menu_list(body), tenant_id=tenant_id)
+            await _push_emp_hub(settings, digits, body, tenant_id=tenant_id)
         except Exception as exc:  # noqa: BLE001
             log.warning("subscribe_push_failed", error=str(exc)[:200])
 
@@ -1097,7 +1111,7 @@ async def buy_credits_verify(request: Request) -> JSONResponse:
             f"💳 Balance — 💼 {bal['job']} job · 🔓 {bal['unlock']} unlock · 🚀 {bal['boost']} boost. What next?"
         )
         try:
-            await wa_localize.send(settings, digits, _emp_menu_list(body), tenant_id=tenant_id)
+            await _push_emp_hub(settings, digits, body, tenant_id=tenant_id)
         except Exception as exc:  # noqa: BLE001
             log.warning("buy_credits_push_failed", error=str(exc)[:200])
     # Send the buyer back to the chat (success page with a 'Back to chat' button).
