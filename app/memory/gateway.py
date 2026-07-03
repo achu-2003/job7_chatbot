@@ -160,11 +160,15 @@ class MemoryGateway:
         return await self.short_term.update_employer(phone, fields, tenant_id=tenant_id)
 
     async def employer_token(
-        self, *, tenant_id: str, phone: str, conversation_id: str, name: str | None
+        self, *, tenant_id: str, phone: str, conversation_id: str, name: str | None,
+        fresh: bool = False,
     ) -> str:
-        """Get/create this employer's form token (register / KYC / post-job)."""
+        """Get/create this employer's form token (register / KYC / post-job).
+        ``fresh=True`` always mints a new token (used for post-job so each post is
+        an isolated link — see ``ensure_employer_token``)."""
         return await self.short_term.ensure_employer_token(
             phone, tenant_id=tenant_id, conversation_id=conversation_id, name=name,
+            fresh=fresh,
         )
 
     async def set_focus_product(

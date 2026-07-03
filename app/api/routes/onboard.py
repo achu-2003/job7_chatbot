@@ -36,7 +36,12 @@ from app.db.repositories import (
     LookupRepository,
 )
 from app.onboarding import build_application_record, prepare_registration
-from app.validation import MAX_RESUME_BYTES, valid_resume_filename, validate_registration
+from app.validation import (
+    MAX_RESUME_BYTES,
+    is_resume_pdf,
+    valid_resume_filename,
+    validate_registration,
+)
 from app import i18n
 from app.whatsapp import localize as wa_localize
 
@@ -101,10 +106,20 @@ async def _write_application_live(
         log.error("apply_resume_db_write_failed", error=str(exc)[:300])
 
 
+class ResumeRejected(Exception):
+    """The uploaded file was read but is NOT a resume (content check) — the caller
+    re-shows the form with ``message`` so the candidate uploads their actual CV."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
 async def _save_resume_upload(upload: Any, token: str) -> str:
     """Save a selected resume file to local storage and return its served URL.
-    Returns "" when no file was attached. Best-effort — a failure never blocks
-    the submission (the candidate can still register without a resume)."""
+    Returns "" when no file was attached / wrong type / oversized (best-effort —
+    those never block the submission). RAISES ``ResumeRejected`` when a readable
+    PDF's CONTENT isn't a resume, so the caller can prompt for the right file."""
     filename = getattr(upload, "filename", None)
     if not filename:                       # str field / None → no file selected
         return ""
@@ -118,6 +133,15 @@ async def _save_resume_upload(upload: Any, token: str) -> str:
         if len(data) > MAX_RESUME_BYTES:      # reject oversized uploads (> 5 MB)
             log.info("resume_upload_too_large", bytes=len(data))
             return ""
+        # CONTENT check (PDF only — we can't read .doc/.docx here): make sure it's
+        # actually a resume, not some other document. Fails open on unreadable PDFs.
+        if str(filename).lower().endswith(".pdf"):
+            ok, reason = is_resume_pdf(data)
+            if not ok:
+                log.info("resume_upload_not_a_resume", file=str(filename)[:60], reason=reason)
+                raise ResumeRejected(
+                    "That doesn't look like a resume. Please upload your CV/resume "
+                    "as a PDF (with your experience, education and skills).")
         clean = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[-50:].lstrip("._") or "resume"
         fname = f"{uuid.uuid4().hex[:10]}_{clean}"
         _RESUME_DIR.mkdir(parents=True, exist_ok=True)
@@ -125,7 +149,9 @@ async def _save_resume_upload(upload: Any, token: str) -> str:
         base = get_settings().public_base_url.rstrip("/")
         log.info("resume_uploaded", file=fname, bytes=len(data))
         return f"{base}/uploads/resumes/{fname}"
-    except Exception as exc:  # noqa: BLE001 — upload is best-effort
+    except ResumeRejected:
+        raise                              # a real content rejection → surface it
+    except Exception as exc:  # noqa: BLE001 — any OTHER failure is best-effort
         log.warning("resume_upload_failed", error=str(exc)[:200])
         return ""
 
@@ -214,7 +240,17 @@ async def onboarding_submit(request: Request) -> HTMLResponse:
 
     # Resume: a selected file is saved to local storage and its served URL stored;
     # a pasted link (resume_url) is honored as a fallback when no file is attached.
-    resume = await _save_resume_upload(posted.get("resume"), token) or one("resume_url")
+    # A non-resume PDF is rejected → re-show the form asking for the real CV.
+    try:
+        resume = await _save_resume_upload(posted.get("resume"), token) or one("resume_url")
+    except ResumeRejected as rej:
+        memory = get_memory(request)
+        identity = await memory.get_onboarding_identity(token)
+        opts = await _load_options()
+        nm = one("full_name") or one("name") or (identity or {}).get("name") or ""
+        phone = re.sub(r"\D", "", (identity or {}).get("customer_id") or "")
+        return HTMLResponse(
+            _form_html(token, nm, phone, opts, error=rej.message), status_code=400)
 
     name = one("full_name") or one("name")
     # Languages: each can be marked Speak and/or Write (checkboxes by language id).
@@ -389,7 +425,10 @@ async def resume_submit(request: Request) -> HTMLResponse:
         return HTMLResponse(_expired_html(), status_code=404)
     tid, conv = identity["tenant_id"], identity["conversation_id"]
 
-    resume_url = await _save_resume_upload(posted.get("resume"), token)
+    try:
+        resume_url = await _save_resume_upload(posted.get("resume"), token)
+    except ResumeRejected as rej:
+        return HTMLResponse(_resume_html(token, error=rej.message), status_code=400)
     if not resume_url:
         return HTMLResponse(
             _resume_html(token, error="Please upload a valid PDF/DOC file (under 5 MB)."),

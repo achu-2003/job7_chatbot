@@ -517,10 +517,8 @@ class AgentRuntime:
     async def _browse(self, state: AgentState) -> dict[str, Any]:
         """The tappable job-browse state machine (deterministic, 0-LLM):
 
-            category tapped/typed → list its roles (paged 10 at a time)
-            "More roles" tapped   → next page
-            a role tapped         → ask preferred location (tappable list)
-            a location tapped     → matching job cards (Apply / Save / Share)
+            category tapped/typed → job cards for its open roles (Apply/Save/Share)
+            a specific role typed → matching job cards
             an Apply/Save/Share tap → record + confirm
 
         Selection rides on the interactive ``button_id`` (so it survives WhatsApp's
@@ -660,20 +658,36 @@ class AgentRuntime:
             return "", []
         return res.get("category") or category, res["jobs"]
 
+    # Cap on how many job cards a single category tap sends (WhatsApp cards are one
+    # message each — keep the thread readable; if there are more, the header nudges
+    # the seeker to type a role to narrow).
+    _CATEGORY_CARD_LIMIT = 8
+
     async def _browse_category(
         self, state: AgentState, category_text: str, *, offset: int
     ) -> dict[str, Any]:
-        """Show the tappable role list for a category (page ``offset``)."""
+        """Category selected → show the job DETAIL cards (emoji body + Apply / Save /
+        Share) for its open roles DIRECTLY — no intermediate role-picker list. The
+        seeker sees the actual openings straight away. ``offset`` is accepted for
+        back-compat with old ``more:`` pager ids but every card is sent at once
+        (capped at ``_CATEGORY_CARD_LIMIT``)."""
         category, jobs = await self._category_jobs(state, category_text)
         if not jobs:
             return {}  # not a known category → fall through to the planner
-        lang = self._resolved_lang(state)
-        payload, fallback = jobflow.role_list_message(jobs, category=category, offset=offset, lang=lang)
-        await self._save_browse(state, {"stage": "roles", "category": category, "offset": offset})
+        limit = self._CATEGORY_CARD_LIMIT
+        cards, body = jobflow.job_cards(jobs, limit=limit)
+        n = len(jobs)
+        plural = "opening" if n == 1 else "openings"
+        header = (
+            f"*{category}* — {n} {plural} 👇" if n <= limit
+            else f"*{category}* — showing {limit} of {n} {plural} 👇 (type a role to narrow)"
+        )
+        await self._save_browse(state, {"stage": "results", "category": category})
         return {
-            "intent": "browse", "did_browse": True, "used_llm": False, "single_bubble": True,
-            "localized": True,                 # list rendered deterministically in the user's lang
-            "draft_response": fallback, "whatsapp_interactive": payload, "catalog_hits": jobs,
+            "intent": "browse", "did_browse": True, "used_llm": False,
+            "draft_response": f"{header}\n\n{body}",
+            "whatsapp_messages": [wa.text_message(header), *cards],
+            "catalog_hits": jobs,
         }
 
     async def _browse_role(self, state: AgentState, ref: str) -> dict[str, Any]:
@@ -1364,9 +1378,13 @@ class AgentRuntime:
         https; inline-link text otherwise + as the WhatsApp fallback)."""
         phone = (state.get("customer_id") or "").strip()
         facts = state.get("customer_facts") or {}
+        # Post-a-job gets a FRESH token every time so each post is an isolated link
+        # with its own staged draft — a reused token let a prior post's draft/cached
+        # page bleed into the next one (the activate step showed the OLD job).
         token = await self.gateway.employer_token(
             tenant_id=state["tenant_id"], phone=phone,
             conversation_id=state["conversation_id"], name=facts.get("full_name"),
+            fresh=(path == "post-job"),
         )
         link = f"{get_settings().public_base_url.rstrip('/')}/employer/{path}?token={token}"
         interactive = (

@@ -1143,25 +1143,24 @@ async def test_application_status_handled_deterministically():
     assert out["used_llm"] is False                          # no planner / LLM call
 
 
-async def test_category_browse_shows_tappable_role_list():
-    """A message that names a category returns a TAPPABLE role list (paged 10 at
-    a time) — deterministically, no planner, no LLM. With 18 roles the first page
-    shows 9 + a 'More roles' pager row."""
+async def test_category_browse_shows_job_cards_directly():
+    """A message that names a category shows the job DETAIL cards for its roles
+    directly (no role-picker list) — deterministically, no planner, no LLM. With
+    18 roles it sends a header bubble + the first 8 cards (capped)."""
     rt = _runtime()
     jobs = [{"job_ref": f"r{i}", "title": f"IT Role {i}", "location": "Chennai"}
             for i in range(18)]
     _stub_memory(rt, browse={"category": "Information Technology", "jobs": jobs})
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "show the IT jobs")
-    interactive = out["whatsapp_interactive"]["interactive"]
-    assert interactive["type"] == "list"
-    rows = interactive["action"]["sections"][0]["rows"]
-    assert len(rows) == 10                       # 9 roles + "More roles"
-    assert rows[0]["id"] == "job:r0"
-    assert rows[-1]["id"] == "more:Information Technology:9"
-    assert "18 Information Technology roles" in out["response"]    # text fallback
+    assert out.get("whatsapp_interactive") is None                # no role-picker list
+    msgs = out["whatsapp_messages"]
+    assert msgs[0]["type"] == "text"                              # header bubble
+    cards = msgs[1:]
+    assert len(cards) == 8                                        # capped at 8 of 18
+    assert cards[0]["interactive"]["action"]["buttons"][0]["reply"]["id"] == "apply:r0"
+    assert "Information Technology" in out["response"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
-    assert len(out["delivery_plan"]) == 1                          # single bubble
 
 
 async def test_typed_specific_role_shows_matching_job_cards():
@@ -1317,16 +1316,20 @@ _FLOW_JOBS = [
 ]
 
 
-async def test_tap_category_lists_roles_as_buttons():
-    """Tapping a category row (structured id) returns a tappable role list."""
+async def test_tap_category_shows_job_cards_directly():
+    """Tapping a category row (structured id) shows the job detail cards for its
+    roles directly — a header bubble + one Apply/Save/Share card per opening, no
+    intermediate role-picker list."""
     rt = _runtime()
     _stub_memory(rt, browse={"category": "Information Technology", "jobs": _FLOW_JOBS})
     rt.llm = _FakeLLM(plans=[], reply="(should not be called)")
     out = await _handle(rt, "Information Technology", interactive_id="category:Information Technology")
-    interactive = out["whatsapp_interactive"]["interactive"]
-    assert interactive["type"] == "list"
-    ids = [r["id"] for r in interactive["action"]["sections"][0]["rows"]]
-    assert ids == ["job:r1", "job:r2", "job:r3"]
+    assert out.get("whatsapp_interactive") is None               # no role-picker list
+    msgs = out["whatsapp_messages"]
+    assert msgs[0]["type"] == "text"                             # header bubble
+    cards = msgs[1:]
+    assert [c["interactive"]["action"]["buttons"][0]["reply"]["id"] for c in cards] == \
+        ["apply:r1", "apply:r2", "apply:r3"]
     assert rt.llm.json_calls == [] and rt.llm.chat_calls == []
 
 

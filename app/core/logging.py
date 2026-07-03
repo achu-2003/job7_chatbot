@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from contextvars import ContextVar
 from typing import Any
@@ -118,6 +119,81 @@ def _pretty_console_renderer(
 
 
 # ---------------------------------------------------------------------------
+# PII redaction
+# ---------------------------------------------------------------------------
+# Every log record is scrubbed before rendering so phone numbers, names, tokens
+# and secrets never land in the logs (or a log aggregator) in the clear. Keyed by
+# FIELD NAME (not by scanning arbitrary text) to avoid masking unrelated numbers
+# like amounts or timestamps. Recurses into nested dicts/lists (e.g. the raw Meta
+# webhook payload) up to a bounded depth.
+
+_SECRET_KEY_RX = re.compile(
+    r"(secret|password|authorization|api[_-]?key|access[_-]?token|_token$|^token$"
+    r"|signature|key_secret)",
+    re.I,
+)
+# Keys whose value is a phone number → keep country code + last 4, mask the middle.
+_PHONE_KEYS = frozenset({
+    "phone", "phone_number", "customer_number", "customer_id", "customer",
+    "customer_external_id", "from", "from_", "to", "to_number", "wa_id",
+    "msisdn", "recipient", "display_phone_number",
+})
+# Keys whose value is a person/company name → keep the first char only.
+_NAME_KEYS = frozenset({
+    "full_name", "first_name", "last_name", "company_name", "companyname",
+})
+# Masked only inside a webhook-payload subtree (the contact's "name" is PII there,
+# but a bare "name" elsewhere — a plan/category/logger name — is not).
+_DEEP_NAME_KEYS = frozenset({"name"})
+_PAYLOAD_ROOT_KEYS = frozenset({"payload"})
+# Deep enough to reach phones/names inside a Meta webhook payload
+# (payload → entry[] → changes[] → value → contacts[] → profile → name ≈ 10),
+# but bounded so a pathological structure can't recurse without end.
+_REDACT_MAX_DEPTH = 14
+
+
+def _mask_phone(v: Any) -> str:
+    digits = re.sub(r"\D", "", str(v))
+    if len(digits) < 7:
+        return "***"
+    return digits[:2] + "*" * (len(digits) - 6) + digits[-4:]
+
+
+def _mask_name(v: Any) -> str:
+    s = str(v).strip()
+    return (s[0] + "***") if s else "***"
+
+
+def _scrub(obj: Any, depth: int = 0, in_payload: bool = False) -> Any:
+    if depth >= _REDACT_MAX_DEPTH:
+        return obj
+    if isinstance(obj, dict):
+        out: dict[Any, Any] = {}
+        for k, val in obj.items():
+            kl = str(k).lower()
+            child_in_payload = in_payload or kl in _PAYLOAD_ROOT_KEYS
+            if _SECRET_KEY_RX.search(kl):
+                out[k] = "***"
+            elif kl in _PHONE_KEYS and val not in (None, ""):
+                out[k] = _mask_phone(val)
+            elif (kl in _NAME_KEYS or (child_in_payload and kl in _DEEP_NAME_KEYS)) \
+                    and isinstance(val, str) and val:
+                out[k] = _mask_name(val)
+            else:
+                out[k] = _scrub(val, depth + 1, child_in_payload)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_scrub(x, depth + 1, in_payload) for x in obj]
+    return obj
+
+
+def _redact_pii(
+    _logger: Any, _method: str, event_dict: dict[str, Any]
+) -> dict[str, Any]:
+    return _scrub(event_dict, 0)
+
+
+# ---------------------------------------------------------------------------
 # request-id middleware hook
 # ---------------------------------------------------------------------------
 
@@ -153,6 +229,7 @@ def configure_logging() -> None:
         _add_request_id,
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
+        _redact_pii,                 # scrub PII/secrets before any rendering
     ]
     if settings.json_logs:
         processors.append(structlog.processors.JSONRenderer())

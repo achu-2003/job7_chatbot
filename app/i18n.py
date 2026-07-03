@@ -135,7 +135,7 @@ _GLOSSARY: dict[str, dict[str, str]] = {
         "our team will review it and contact you shortly.":
             "எங்கள் குழு அதை ஆய்வு செய்து, விரைவில் உங்களைத் தொடர்பு கொள்ளும்.",
         "🗓 valid for 30 days": "🗓 30 நாட்களுக்கு பயன்படுத்தக்கூடியது",
-        "✅ *job submitted!*": "✅ *வேலை சமர்ப்பிக்கப்பட்டது!*", "what next?": "அடுத்தது என்ன?",
+        "✅ *job submitted successfully!*": "✅ *வேலை வெற்றிகரமாக சமர்ப்பிக்கப்பட்டது!*", "what next?": "அடுத்தது என்ன?",
         "covered by your plan · balance": "உங்கள் திட்டத்தில் சேர்க்கப்பட்டது · இருப்பு",
         "job credits": "வேலை கிரெடிட்கள்", "credit": "கிரெடிட்", "credits": "கிரெடிட்கள்",
         "used · balance": "பயன்படுத்தப்பட்டது · இருப்பு",
@@ -334,7 +334,7 @@ _GLOSSARY: dict[str, dict[str, str]] = {
         "our team will review it and contact you shortly.":
             "हमारी टीम इसकी समीक्षा करेगी और जल्द ही आपसे संपर्क करेगी।",
         "🗓 valid for 30 days": "🗓 30 दिनों के लिए मान्य",
-        "✅ *job submitted!*": "✅ *नौकरी सबमिट हो गई!*", "what next?": "आगे क्या?",
+        "✅ *job submitted successfully!*": "✅ *नौकरी सफलतापूर्वक सबमिट हो गई!*", "what next?": "आगे क्या?",
         "covered by your plan · balance": "आपकी योजना में शामिल · शेष",
         "job credits": "नौकरी क्रेडिट", "credit": "क्रेडिट", "credits": "क्रेडिट",
         "used · balance": "उपयोग किया गया · शेष",
@@ -721,6 +721,17 @@ async def _one_translate(llm: "LLMClient", text: str, to_lang: str) -> str | Non
         return None
 
 
+def _is_json_generation_error(exc: Exception) -> bool:
+    """True for a 400 where the model failed to emit valid JSON (``json_object``
+    mode — a known Groq quirk). The per-string fallback uses PLAIN TEXT (no JSON),
+    so it recovers these. A 429 or an outage is NOT this — retrying per-string there
+    only multiplies the failure, so those keep the originals instead."""
+    s = str(exc).lower()
+    if "failed to generate json" in s:
+        return True
+    return getattr(exc, "status_code", None) == 400 and "json" in s
+
+
 async def translate_many(llm: "LLMClient", texts: list[str], *, to_lang: str) -> list[str]:
     """Translate strings to ``to_lang``, returning a same-length list. No-op for
     English / unsupported lang / empty. Per-string cached. ROBUST: tries ONE batched
@@ -745,14 +756,21 @@ async def translate_many(llm: "LLMClient", texts: list[str], *, to_lang: str) ->
         else:
             todo.append((i, s))
     if todo:
+        batched: dict[int, str] = {}
         try:
             batched = await _batch_translate(llm, [s for _, s in todo], to_lang)
-        except Exception as exc:  # noqa: BLE001 — API error (e.g. 429): keep originals,
-            # do NOT fire a per-string storm (it only multiplies the rate-limit hits).
-            log.warning("translate_batch_failed", error=str(exc)[:160])
-            for i, s in todo:
-                out[i] = s
-            return [o if o is not None else texts[k] for k, o in enumerate(out)]
+        except Exception as exc:  # noqa: BLE001
+            if not _is_json_generation_error(exc):
+                # API error (e.g. 429 rate limit / outage): keep originals and do
+                # NOT fire a per-string storm — it only multiplies the failure.
+                log.warning("translate_batch_failed", error=str(exc)[:160])
+                for i, s in todo:
+                    out[i] = s
+                return [o if o is not None else texts[k] for k, o in enumerate(out)]
+            # A 400 'failed to generate JSON' is a json_object-mode quirk; the
+            # plain-text per-string fallback below avoids JSON entirely and recovers
+            # it — so fall through with an empty batch (every item → per-string).
+            log.warning("translate_batch_json_failed", error=str(exc)[:160])
         missing: list[tuple[int, str]] = []
         for k, (i, s) in enumerate(todo):
             tr = batched.get(k)

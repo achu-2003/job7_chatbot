@@ -610,9 +610,8 @@ async def _finalize_job(memory, phone: str, tenant_id: str, token: str, validity
             f"💳 {need} {T('credit' if need == 1 else 'credits')} {T('used · balance')} {bal}"
         )
         body = (
-            f"{T('✅ *Job submitted!*')}\n\n"
+            f"{T('✅ *Job submitted successfully!*')}\n\n"
             f"📋 *{title}*\n"
-            f"🔖 {job['ref']}\n"
             f"{T('🗓 Valid for 30 days')}\n"
             f"{cost_line}\n\n"
             f"{T('Our team will review it and contact you shortly.')}\n"
@@ -634,7 +633,7 @@ def _job_activated_html(summary: dict | None) -> HTMLResponse:
     need = s.get("need") or 0
     number = re.sub(r"\D", "", get_settings().whatsapp_business_number or "")
     return HTMLResponse(_success_html(
-        "Job submitted!", f"“{title}” has been submitted for {days} days ({ref}). "
+        "Job submitted successfully!", f"“{title}” has been submitted for {days} days ({ref}). "
         f"{need} credit{'s' if need != 1 else ''} used. Our team will review it and "
         "contact you shortly. Head back to WhatsApp to continue.",
         business_number=number,

@@ -54,6 +54,11 @@ httpx==0.28.1
 tenacity==9.0.0
 orjson==3.10.12
 
+# --- resume content verification (PDF text extraction) ---
+# Used to check an uploaded PDF is actually a resume/CV, not some other document.
+# Pure-Python, no system deps. If absent the check fails open (accepts).
+pypdf==5.1.0
+
 # --- testing UI ---
 # Pinned: streamlit >= 1.50 requires starlette >= 0.46, which conflicts with FastAPI 0.115.
 streamlit==1.40.2

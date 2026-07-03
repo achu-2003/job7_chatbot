@@ -10,7 +10,7 @@ from starlette.responses import Response
 
 from app import i18n
 from app.api.routes import admin, chat, employer, health, onboard, whatsapp
-from app.config import get_settings
+from app.config import get_settings, validate_runtime_config
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RequestContextMiddleware
 from app.db.session import close_engine, init_engine
@@ -45,6 +45,22 @@ async def lifespan(app: FastAPI):
         vector_mode=settings.vector_mode,
         worker_in_api=settings.run_worker_in_api,
     )
+    # Production-readiness guard — opt-in via ENFORCE_PROD_CONFIG. Off by default
+    # so local dev/test boots untouched; on the real server it surfaces warnings
+    # and REFUSES to boot on a critical misconfig (test keys / test DB / missing
+    # webhook app secret / non-https base url).
+    if settings.enforce_prod_config:
+        criticals, warnings = validate_runtime_config(settings)
+        for issue in warnings:
+            log.warning("config_warning", issue=issue)
+        if criticals:
+            for issue in criticals:
+                log.error("config_error", issue=issue)
+            raise RuntimeError(
+                "Refusing to start: production config invalid — "
+                + "; ".join(criticals)
+            )
+        log.info("prod_config_validated", warnings=len(warnings))
     if _base_url_unreachable(settings.public_base_url):
         log.warning(
             "public_base_url_not_reachable",

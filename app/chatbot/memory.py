@@ -756,11 +756,18 @@ class ConversationMemory:
         return rec
 
     async def ensure_employer_token(
-        self, phone: str, *, tenant_id: str, conversation_id: str, name: str | None
+        self, phone: str, *, tenant_id: str, conversation_id: str, name: str | None,
+        fresh: bool = False,
     ) -> str:
         """Return this employer's form token (for register / KYC / post-job),
         minting one (and the reverse token→identity map) on first use. Reused
-        across turns + forms; TTL/identity refreshed each call."""
+        across turns + forms; TTL/identity refreshed each call.
+
+        ``fresh=True`` ALWAYS mints a brand-new token (and repoints the forward
+        key to it). Used for *post-job*: each "Post a Job" tap must get its own
+        token so every post is a distinct link with its OWN staged draft — a
+        reused token would let a previous post's draft/cached page bleed into the
+        next one (wrong job at the activate step)."""
         assert self._redis is not None
         ttl = get_settings().onboarding_ttl_seconds
         identity = json.dumps({
@@ -768,7 +775,7 @@ class ConversationMemory:
             "conversation_id": conversation_id, "name": name or "",
         })
         fwd = self._employer_token_fwd_key(phone, tenant_id=tenant_id)
-        token = await self._redis.get(fwd)
+        token = None if fresh else await self._redis.get(fwd)
         if not token:
             token = uuid.uuid4().hex
             await self._redis.setex(fwd, ttl, token)

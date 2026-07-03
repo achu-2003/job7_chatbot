@@ -335,3 +335,26 @@ async def test_translate_many_no_perstring_storm_on_api_error():
     out = await i18n.translate_many(llm, texts, to_lang="ta")
     assert out == texts                                  # originals kept
     assert llm.batch == 1 and llm.singles == 0           # no per-string amplification
+
+
+async def test_translate_many_json_400_recovers_via_per_string():
+    """A 400 'failed to generate JSON' (Groq json_object quirk) is NOT a rate limit:
+    the plain-text per-string fallback avoids JSON entirely, so those strings should
+    still get translated instead of silently staying English."""
+    class _JsonModeFails:
+        def __init__(self): self.batch = 0; self.singles = 0
+        async def chat(self, *, purpose, messages, **kw):
+            if purpose == "translate_out":
+                self.batch += 1
+                raise RuntimeError(
+                    "Error code: 400 - {'error': {'message': 'Failed to generate JSON. "
+                    "Please adjust your prompt.'}}")
+            self.singles += 1
+            return "TA::" + messages[-1]["content"], {}   # plain-text single succeeds
+
+    i18n._CACHE.clear()
+    llm = _JsonModeFails()
+    texts = ["Welcome to the team", "How can I help you today"]
+    out = await i18n.translate_many(llm, texts, to_lang="ta")
+    assert out == ["TA::Welcome to the team", "TA::How can I help you today"]
+    assert llm.batch == 1 and llm.singles == 2           # batch failed → per-string recovered

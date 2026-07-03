@@ -99,6 +99,102 @@ def valid_resume_filename(name: Any) -> bool:
     return any(n.endswith(ext) for ext in _RESUME_EXTS)
 
 
+# --- resume CONTENT verification (is this PDF actually a CV, not some other doc?) --
+# Optional: needs ``pypdf`` for PDF text extraction. When it's not installed the
+# check FAILS OPEN (accepts) so uploads keep working until the dep is added.
+try:  # pragma: no cover - import guard
+    from pypdf import PdfReader as _PdfReader
+except Exception:  # noqa: BLE001
+    _PdfReader = None
+
+# Section headers / markers a real resume almost always has; a random PDF (invoice,
+# certificate, ID, receipt) almost never has two of these together.
+_RESUME_SIGNAL_WORDS = (
+    "experience", "education", "skills", "projects", "objective", "summary",
+    "profile", "employment", "qualification", "qualifications", "achievements",
+    "certification", "certifications", "work history", "career", "references",
+    "internship", "curriculum vitae", "resume", "declaration", "strengths",
+    "hobbies", "languages known", "professional summary", "academic",
+    "extra-curricular", "personal details",
+)
+_EMAIL_RX = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+_PHONE_RX = re.compile(r"\+?\d[\d\s()-]{7,}\d")
+# Below this many extracted chars we can't judge (image-only / scanned / encrypted
+# PDF) → accept, so a legit CV is never wrongly blocked.
+_RESUME_MIN_TEXT = 200
+
+# NEGATIVE markers — phrases that identify a specific NON-resume document (ID cards,
+# invoices, bank/marks statements). These reject even a SHORT doc (a PAN/Aadhaar
+# scan often has little text), and are chosen NOT to occur in a normal CV — e.g.
+# "certifications" is a resume section, so only very specific phrases are listed.
+_NON_RESUME_MARKERS = (
+    # PAN card
+    "permanent account number", "income tax department", "आयकर विभाग",
+    # Aadhaar
+    "aadhaar", "unique identification authority", "आधार", "enrolment no",
+    "your aadhaar no",
+    # Invoice / bill
+    "tax invoice", "invoice no", "invoice number", "gstin", "bill to",
+    "amount due", "total amount payable",
+    # Bank statement
+    "statement of account", "account statement", "ifsc code", "available balance",
+    # Govt / other ID
+    "driving licence", "driving license", "election commission", "voter id",
+    "passport no", "date of issue",
+    # Marks / hall ticket
+    "marks obtained", "grade sheet", "hall ticket", "admit card",
+)
+# PAN (ABCDE1234F) and Aadhaar (1234 5678 9012) formats — backstop when the label
+# text didn't extract but the number did.
+_PAN_RX = re.compile(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b")
+_AADHAAR_RX = re.compile(r"\b\d{4}\s\d{4}\s\d{4}\b")
+
+
+def extract_pdf_text(data: bytes, *, max_pages: int = 3, max_chars: int = 20000) -> str:
+    """Best-effort text from a PDF's first pages. Returns '' when pypdf is missing
+    or the PDF can't be read (encrypted / image-only / corrupt)."""
+    if _PdfReader is None or not data:
+        return ""
+    try:
+        import io
+        reader = _PdfReader(io.BytesIO(data))
+        parts: list[str] = []
+        for page in reader.pages[:max_pages]:
+            parts.append(page.extract_text() or "")
+            if sum(len(p) for p in parts) >= max_chars:
+                break
+        return "\n".join(parts)[:max_chars]
+    except Exception:  # noqa: BLE001 — any parse failure → no text (caller fails open)
+        return ""
+
+
+def resume_text_verdict(text: str) -> tuple[bool, str]:
+    """Heuristic: does this extracted text read like a resume/CV? Returns
+    ``(accept, reason)``. FAILS OPEN on too-little text (can't judge). Pure +
+    testable — the PDF extraction is separate (``extract_pdf_text``)."""
+    stripped = (text or "").strip()
+    low = stripped.lower()
+    # NEGATIVE markers first — a recognised ID/invoice/statement is rejected even
+    # when it's short (a PAN/Aadhaar scan carries little text but a clear label).
+    if any(m in low for m in _NON_RESUME_MARKERS) or _PAN_RX.search(text) or \
+            _AADHAAR_RX.search(text):
+        return False, "non_resume_document"
+    if len(stripped) < _RESUME_MIN_TEXT:
+        return True, "too_little_text"          # unreadable/scanned → accept
+    signals = sum(1 for w in _RESUME_SIGNAL_WORDS if w in low)
+    has_contact = bool(_EMAIL_RX.search(text) or _PHONE_RX.search(text))
+    if signals >= 2 or (signals >= 1 and has_contact):
+        return True, f"resume(signals={signals},contact={has_contact})"
+    return False, "not_a_resume"
+
+
+def is_resume_pdf(data: bytes) -> tuple[bool, str]:
+    """Content check for an uploaded PDF: ``(accept, reason)``. FAILS OPEN when
+    pypdf isn't installed or the text can't be extracted — only a PDF with clear,
+    readable text that lacks resume markers is rejected."""
+    return resume_text_verdict(extract_pdf_text(data))
+
+
 def valid_phone(value: Any) -> bool:
     """A 10-digit Indian mobile (6-9 start), with or without a country code."""
     d = re.sub(r"\D", "", _s(value))

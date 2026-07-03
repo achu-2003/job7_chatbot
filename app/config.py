@@ -15,6 +15,12 @@ class Settings(BaseSettings):
 
     # ---- app ----
     app_env: Literal["development", "staging", "production"] = "production"
+    # Opt-in production-readiness guard. When True, startup runs
+    # ``validate_runtime_config`` and REFUSES to boot on a critical misconfig
+    # (test keys / test DB / missing app secret / non-https base url). Default
+    # False so local dev/test is never blocked — set ENFORCE_PROD_CONFIG=true
+    # only on the real production server.
+    enforce_prod_config: bool = False
     app_name: str = "ecom-crm-chatbot"
     app_host: str = "0.0.0.0"
     app_port: int = 8000
@@ -312,3 +318,58 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()  # type: ignore[call-arg]
+
+
+def validate_runtime_config(settings: Settings) -> tuple[list[str], list[str]]:
+    """Inspect ``settings`` for production-readiness. Returns ``(criticals,
+    warnings)``: *criticals* are unsafe-to-go-live misconfigs (insecure or
+    pointed at test infra) that should block boot; *warnings* are likely-wrong
+    settings worth surfacing but not fatal. Pure + side-effect-free so it's easy
+    to unit-test; the startup hook decides whether to raise."""
+    criticals: list[str] = []
+    warnings: list[str] = []
+
+    # --- security / wrong-environment (block) ---
+    if not settings.meta_app_secret:
+        criticals.append(
+            "META_APP_SECRET is empty — inbound webhooks are NOT signature-verified.")
+    if not settings.whatsapp_verify_token:
+        criticals.append("WHATSAPP_VERIFY_TOKEN is empty.")
+    if not settings.meta_access_token:
+        criticals.append("META_ACCESS_TOKEN is empty — cannot send WhatsApp replies.")
+    if not settings.public_base_url.lower().startswith("https://"):
+        criticals.append(
+            f"PUBLIC_BASE_URL must be a public https:// URL (got '{settings.public_base_url}').")
+    if settings.razorpay_enabled and settings.razorpay_test_mode:
+        criticals.append(
+            "Razorpay is in TEST mode (rzp_test_…) — switch to live keys before go-live.")
+    if "jobs7uat" in settings.database_url.lower():
+        criticals.append("DATABASE_URL points at the jobs7uat TEST database.")
+    if settings.llm_enabled and not settings.llm_api_key:
+        criticals.append("LLM_ENABLED is true but LLM_API_KEY is empty.")
+
+    # --- likely-wrong (warn) ---
+    flag_map = {
+        "REGISTER_IN_DB": settings.register_in_db,
+        "EMPLOYER_REGISTER_IN_DB": settings.employer_register_in_db,
+        "JOB_POST_IN_DB": settings.job_post_in_db,
+        "CREDITS_PURCHASE_IN_DB": settings.credits_purchase_in_db,
+        "PAYMENTS_IN_DB": settings.payments_in_db,
+        "SUBSCRIPTIONS_IN_DB": settings.subscriptions_in_db,
+        "SAVED_JOBS_IN_DB": settings.saved_jobs_in_db,
+    }
+    off = [name for name, on in flag_map.items() if not on]
+    if off:
+        warnings.append(
+            "Persistence flags OFF (data won't be written to the DB): " + ", ".join(off))
+    if not settings.multilang_enabled:
+        warnings.append("MULTILANG_ENABLED is off — Tamil/Hindi replies disabled.")
+    if settings.employer_kyc_auto_verify:
+        warnings.append(
+            "EMPLOYER_KYC_AUTO_VERIFY is on — every employer is auto-approved with no vetting.")
+    if not settings.razorpay_enabled:
+        warnings.append("Razorpay is not configured — payments/credits will fail.")
+    if not settings.qdrant_api_key:
+        warnings.append("QDRANT_API_KEY is empty — the vector store is unauthenticated.")
+
+    return criticals, warnings
